@@ -1,0 +1,66 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap');
+
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  /* Surfaces */
+  --bg:        #F8FAFC;
+  --panel:     #FFFFFF;
+  --card:      #FFFFFF;
+  --inset:     #F1F5F9;
+  --inset2:    #F8FAFC;
+
+  /* Borders */
+  --border:    #E2E8F0;
+  --border-lt: #EEF2F6;
+
+  /* Brand — indigo */
+  --primary:      #4F46E5;
+  --primary-hover:#4338CA;
+  --primary-soft: #EEF2FF;
+  --primary-ring: rgba(79,70,229,0.16);
+
+  /* Semantic */
+  --success: #10B981;
+  --success-soft: #ECFDF5;
+  --warning: #F59E0B;
+  --danger:  #EF4444;
+
+  /* Text */
+  --text:       #0F172A;
+  --text-soft:  #475569;
+  --text-muted: #64748B;
+  --text-faint: #94A3B8;
+
+  /* Radius */
+  --r-lg: 16px;
+  --r:    12px;
+  --r-sm: 9px;
+
+  /* Shadows — soft, layered */
+  --sh-sm: 0 1px 2px rgba(15,23,42,0.04), 0 1px 3px rgba(15,23,42,0.06);
+  --sh:    0 1px 3px rgba(15,23,42,0.04), 0 4px 12px rgba(15,23,42,0.06);
+  --sh-md: 0 4px 16px rgba(15,23,42,0.08), 0 12px 32px rgba(15,23,42,0.08);
+  --sh-lg: 0 12px 40px rgba(15,23,42,0.14);
+}
+
+html, body, #root {
+  height: 100%;
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  color: var(--text);
+  font-size: 14px;
+  line-height: 1.55;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+body { background: var(--bg); }
+
+::selection { background: var(--primary-ring); color: var(--primary-hover); }
+
+::-webkit-scrollbar { width: 9px; height: 9px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: #CBD5E1; border-radius: 5px; border: 2px solid transparent; background-clip: padding-box; }
+::-webkit-scrollbar-thumb:hover { background: #94A3B8; background-clip: padding-box; }
+
+input { font-family: inherit; }

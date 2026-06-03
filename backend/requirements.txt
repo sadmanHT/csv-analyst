@@ -1,0 +1,11 @@
+fastapi
+uvicorn
+pandas
+numpy
+matplotlib
+google-genai
+python-dotenv
+python-multipart
+httpx
+pytest
+pytest-asyncio
