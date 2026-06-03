@@ -75,6 +75,7 @@ dataframes: dict[str, pd.DataFrame] = {}
 class QueryRequest(BaseModel):
     session_id: str
     question: str
+    category: str = "general"
 
 
 def _num(x) -> float | None:
@@ -152,7 +153,55 @@ Rules:
 - Always assign a string to `result` with a plain-English answer or summary
 - Always set `chart_b64 = None` unless you create a chart
 - If the result is a DataFrame, convert it: result = df_result.to_string()
+- ROBUSTNESS: for correlations or numeric aggregations across columns, use numeric
+  columns only — e.g. df.select_dtypes(include='number') or pass numeric_only=True.
+  Never run numeric operations on text/identifier columns (names, IDs). Coerce with
+  pd.to_numeric(..., errors='coerce') when a column may be mixed.
 - Output ONLY valid Python code — no markdown fences, no explanation"""
+
+
+# Domain lenses — the selected category turns the agent into a domain expert,
+# shaping which computations it prefers and how it narrates the result.
+CATEGORY_PERSONAS = {
+    "general": (
+        "ANALYSIS LENS: General. You are a meticulous general-purpose data analyst. "
+        "Provide clear, neutral, statistically sound insights."
+    ),
+    "financial": (
+        "ANALYSIS LENS: Financial. You are a senior FINANCIAL analyst. Interpret the data "
+        "through a financial lens — revenue, costs, margins, growth rates (YoY/MoM), volatility "
+        "and risk, and key ratios. Prefer computations like growth %, cumulative totals, moving "
+        "averages, and standard deviation as a risk proxy. Format money clearly and, in the "
+        "written answer, call out financial implications, risks, and opportunities."
+    ),
+    "medical": (
+        "ANALYSIS LENS: Medical. You are a clinical / healthcare data analyst. Interpret the data "
+        "through a medical lens — prevalence, risk factors, patient cohorts, and distributions of "
+        "clinical measurements. Prefer group-wise comparisons (outcome vs. non-outcome), "
+        "correlation of features with the outcome, and distribution analysis. ALWAYS describe "
+        "relationships as associations, NOT causation. Flag clinically meaningful or at-risk groups."
+    ),
+    "retail": (
+        "ANALYSIS LENS: Retail. You are a retail & e-commerce analyst. Interpret the data through "
+        "a commerce lens — sales and revenue by product/category/region, order volume, basket "
+        "size, ratings, and customer behavior. Prefer top-N rankings, revenue breakdowns, and trends."
+    ),
+    "marketing": (
+        "ANALYSIS LENS: Marketing. You are a marketing & growth analyst. Interpret the data through "
+        "a marketing lens — acquisition, conversion, retention, segmentation, channels, and campaign "
+        "performance. Prefer funnel/segment breakdowns, rates, and cohort-style comparisons."
+    ),
+    "hr": (
+        "ANALYSIS LENS: HR. You are an HR / people-analytics specialist. Interpret the data through "
+        "a workforce lens — headcount, attrition/turnover, tenure, demographics, performance, and "
+        "compensation equity. Prefer group comparisons and distribution analysis; be sensitive about fairness."
+    ),
+}
+
+
+def system_prompt_for(category: str) -> str:
+    persona = CATEGORY_PERSONAS.get(category, CATEGORY_PERSONAS["general"])
+    return f"{persona}\n\n{SYSTEM_PROMPT}"
 
 
 # Modules the generated analysis code is allowed to import.
@@ -239,33 +288,53 @@ async def query_csv(req: QueryRequest) -> StreamingResponse:
 
         yield emit({"step": "thinking", "message": "Agent is writing pandas code..."})
 
-        try:
-            response = client.models.generate_content(
+        def generate(user_text: str) -> str:
+            resp = client.models.generate_content(
                 model=GEMINI_MODEL,
-                contents=f"DataFrame schema:\n{schema}\n\nQuestion: {req.question}",
+                contents=user_text,
                 config=types.GenerateContentConfig(
-                    system_instruction=SYSTEM_PROMPT,
+                    system_instruction=system_prompt_for(req.category),
                     temperature=0,
                 ),
             )
-            code = (response.text or "").strip()
-            if code.startswith("```"):
-                code = code.split("\n", 1)[1]
-            if "```" in code:
-                code = code.rsplit("```", 1)[0]
-            code = code.strip()
-        except Exception as e:
-            yield emit({"step": "error", "message": f"Gemini error: {e}"})
-            return
+            text = (resp.text or "").strip()
+            if text.startswith("```"):
+                text = text.split("\n", 1)[1]
+            if "```" in text:
+                text = text.rsplit("```", 1)[0]
+            return text.strip()
 
-        yield emit({"step": "code", "message": "Code generated", "code": code})
-        yield emit({"step": "executing", "message": "Executing code on your data..."})
+        base_prompt = f"DataFrame schema:\n{schema}\n\nQuestion: {req.question}"
 
         try:
-            result, chart_b64 = execute_code(code, df)
-            yield emit({"step": "done", "message": "Analysis complete", "result": result, "chart": chart_b64})
-        except Exception:
-            err = traceback.format_exc().strip().splitlines()[-1]
-            yield emit({"step": "error", "message": f"Execution error: {err}"})
+            code = generate(base_prompt)
+        except Exception as e:
+            yield emit({"step": "error", "message": f"Model error: {e}"})
+            return
+
+        # Execute, with one self-correcting repair attempt on failure.
+        for attempt in range(2):
+            yield emit({"step": "code", "message": "Code generated", "code": code})
+            yield emit({"step": "executing", "message": "Executing code on your data..."})
+            try:
+                result, chart_b64 = execute_code(code, df)
+                yield emit({"step": "done", "message": "Analysis complete", "result": result, "chart": chart_b64})
+                return
+            except Exception:
+                err = traceback.format_exc().strip().splitlines()[-1]
+                if attempt == 0:
+                    yield emit({"step": "thinking", "message": f"Hit an error — agent is fixing the code… ({err})"})
+                    try:
+                        code = generate(
+                            f"{base_prompt}\n\nYou previously wrote this code:\n{code}\n\n"
+                            f"It failed with this error:\n{err}\n\n"
+                            "Fix the code so it runs correctly. Output ONLY the corrected Python code."
+                        )
+                        continue
+                    except Exception as e:
+                        yield emit({"step": "error", "message": f"Model error during repair: {e}"})
+                        return
+                yield emit({"step": "error", "message": f"Execution error: {err}"})
+                return
 
     return StreamingResponse(stream(), media_type="text/event-stream")

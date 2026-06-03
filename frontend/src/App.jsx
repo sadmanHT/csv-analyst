@@ -3,21 +3,111 @@ import './App.css'
 import {
   Logo, Sparkles, FileIcon, Search, Send, Paperclip, Check, X,
   Rows, Columns, AlertDot, Activity, Layers, Code, ChartUp, Brain,
+  DollarSign, HeartPulse, ShoppingCart, Megaphone, Users,
 } from './icons.jsx'
 
-const EXAMPLE_PROMPTS = [
-  { icon: ChartUp,  text: 'Show a bar chart of revenue by category' },
-  { icon: Activity, text: 'What is the distribution of customer age?' },
-  { icon: Layers,   text: 'Which region has the highest total revenue?' },
-  { icon: Brain,    text: 'Show a correlation heatmap of numeric columns' },
+// ─── Domain categories (the differentiator) ────────────────────────────────────
+
+const CATEGORIES = [
+  {
+    key: 'general', label: 'General', icon: ChartUp,
+    blurb: 'Neutral statistical analysis',
+    examples: [
+      'Summarize the key statistics of this dataset',
+      'What is the distribution of the first numeric column?',
+      'Show a correlation heatmap of numeric columns',
+      'Show a bar chart of the top categories by count',
+    ],
+    suggested: [
+      { label: 'Correlation Analysis', q: 'Show a correlation heatmap of all numeric columns' },
+      { label: 'Distribution',         q: 'Plot the distribution of the first numeric column' },
+      { label: 'Top Categories',       q: 'Show a bar chart of the top categories by count' },
+      { label: 'Outlier Detection',    q: 'Show a box plot to detect outliers in numeric columns' },
+    ],
+  },
+  {
+    key: 'financial', label: 'Financial', icon: DollarSign,
+    blurb: 'Revenue, growth, risk & ratios',
+    examples: [
+      'Plot total revenue over time as a line chart',
+      'Which category generates the most revenue?',
+      'Calculate the period-over-period growth rate',
+      'Show the volatility (std dev) of the key numeric columns',
+    ],
+    suggested: [
+      { label: 'Revenue Trend',        q: 'Plot total revenue over time as a line chart' },
+      { label: 'Growth Rate',          q: 'Calculate and chart the period-over-period growth rate' },
+      { label: 'Top Revenue Drivers',  q: 'Show a bar chart of total revenue by category' },
+      { label: 'Risk / Volatility',    q: 'Show the standard deviation of the main numeric columns as a risk measure' },
+    ],
+  },
+  {
+    key: 'medical', label: 'Medical', icon: HeartPulse,
+    blurb: 'Risk factors & patient cohorts',
+    examples: [
+      'Which features correlate most with the outcome?',
+      'Compare the mean of each numeric feature between outcome groups',
+      'Show the distribution of age split by outcome',
+      'Show a correlation heatmap of clinical measurements',
+    ],
+    suggested: [
+      { label: 'Risk Factors',         q: 'Which features correlate most with the outcome variable?' },
+      { label: 'Cohort Comparison',    q: 'Compare the mean of each numeric feature between the outcome groups' },
+      { label: 'Distribution by Group',q: 'Plot the distribution of the first numeric feature split by outcome' },
+      { label: 'Correlation Heatmap',  q: 'Show a correlation heatmap of all numeric columns' },
+    ],
+  },
+  {
+    key: 'retail', label: 'Retail', icon: ShoppingCart,
+    blurb: 'Sales, products & customers',
+    examples: [
+      'Show a bar chart of revenue by product category',
+      'Which region has the highest total sales?',
+      'What is the average order value?',
+      'Show the relationship between rating and revenue',
+    ],
+    suggested: [
+      { label: 'Sales by Category',    q: 'Show a bar chart of total revenue by category' },
+      { label: 'Top Regions',          q: 'Which region has the highest total revenue? Show a bar chart' },
+      { label: 'Basket Size',          q: 'What is the average quantity and revenue per order?' },
+      { label: 'Ratings vs Revenue',   q: 'Show a scatter plot of rating versus revenue' },
+    ],
+  },
+  {
+    key: 'marketing', label: 'Marketing', icon: Megaphone,
+    blurb: 'Conversion, segments & channels',
+    examples: [
+      'Break down the data by segment',
+      'Which channel or category performs best?',
+      'Show conversion rates across groups',
+      'Compare performance between segments',
+    ],
+    suggested: [
+      { label: 'Segment Breakdown',    q: 'Break down totals by each categorical column' },
+      { label: 'Best Performing',      q: 'Which category has the highest total? Show a ranked bar chart' },
+      { label: 'Rate Analysis',        q: 'Show rates or proportions across the main categorical column' },
+      { label: 'Segment Comparison',   q: 'Compare the mean numeric values across segments' },
+    ],
+  },
+  {
+    key: 'hr', label: 'HR', icon: Users,
+    blurb: 'Attrition, tenure & demographics',
+    examples: [
+      'Show the distribution of age across the workforce',
+      'Compare numeric features between groups',
+      'What is the headcount by department or category?',
+      'Show a correlation heatmap of the numeric columns',
+    ],
+    suggested: [
+      { label: 'Headcount',            q: 'Show a bar chart of counts by the main categorical column' },
+      { label: 'Demographics',         q: 'Plot the distribution of age across the dataset' },
+      { label: 'Group Comparison',     q: 'Compare the mean of each numeric feature between groups' },
+      { label: 'Pay / Value Equity',   q: 'Compare the average of the main numeric column across groups' },
+    ],
+  },
 ]
 
-const SUGGESTED = [
-  { label: 'Correlation Analysis', q: 'Show a correlation heatmap of all numeric columns' },
-  { label: 'Distribution',         q: 'Plot the distribution of the first numeric column' },
-  { label: 'Top Categories',       q: 'Show a bar chart of the top categories by count' },
-  { label: 'Outlier Detection',    q: 'Show a box plot to detect outliers in numeric columns' },
-]
+const catByKey = (key) => CATEGORIES.find((c) => c.key === key) || CATEGORIES[0]
 
 const STEP_META = {
   analyzing: { icon: '🔍', color: '#4F46E5' },
@@ -30,7 +120,8 @@ const STEP_META = {
 
 // ─── Top Navigation ────────────────────────────────────────────────────────────
 
-function TopNav({ upload }) {
+function TopNav({ upload, category }) {
+  const cat = catByKey(category)
   return (
     <header className="topnav">
       <div className="nav-left">
@@ -50,6 +141,7 @@ function TopNav({ upload }) {
       <div className="nav-right">
         {upload ? (
           <div className="stat-pills">
+            <span className="lens-badge"><cat.icon width={13} height={13} /> {cat.label} lens</span>
             <span className="stat-pill"><Rows width={13} height={13} /> {upload.rows.toLocaleString()} <em>rows</em></span>
             <span className="stat-pill"><Columns width={13} height={13} /> {upload.columns.length} <em>cols</em></span>
             <span className={`stat-pill ${upload.missing_pct > 0 ? 'warn' : 'ok'}`}>
@@ -57,16 +149,16 @@ function TopNav({ upload }) {
             </span>
           </div>
         ) : (
-          <span className="nav-tag">AI-powered data analysis</span>
+          <span className="nav-tag">Domain-aware data analysis</span>
         )}
       </div>
     </header>
   )
 }
 
-// ─── Upload Screen ─────────────────────────────────────────────────────────────
+// ─── Upload Screen (with category selector) ────────────────────────────────────
 
-function UploadScreen({ onUpload, uploading, setUploading }) {
+function UploadScreen({ onUpload, uploading, setUploading, category, setCategory }) {
   const [dragging, setDragging] = useState(false)
   const inputRef = useRef()
 
@@ -90,31 +182,45 @@ function UploadScreen({ onUpload, uploading, setUploading }) {
   return (
     <div className="upload-screen">
       <div className="upload-hero">
-        <div className="hero-badge"><Sparkles width={14} height={14} /> AI Data Analyst</div>
-        <h1 className="hero-title">Analyze your data with natural language</h1>
+        <div className="hero-badge"><Sparkles width={14} height={14} /> Domain-aware AI Data Analyst</div>
+        <h1 className="hero-title">Analysis tuned to your domain</h1>
         <p className="hero-sub">
-          Upload a CSV and ask questions in plain English. The agent writes the code,
-          runs it on your data, and returns charts and insights instantly.
+          Pick an analysis lens, upload a CSV, and ask in plain English. The agent reasons like a
+          domain expert — financial, medical, retail and more — not a generic chatbot.
         </p>
       </div>
 
-      <div
-        className={`dropzone ${dragging ? 'drag-over' : ''} ${uploading ? 'uploading' : ''}`}
-        onClick={() => !uploading && inputRef.current.click()}
-        onDragOver={(e) => { e.preventDefault(); setDragging(true) }}
-        onDragLeave={() => setDragging(false)}
-        onDrop={(e) => { e.preventDefault(); setDragging(false); handleFile(e.dataTransfer.files[0]) }}
-      >
-        <input ref={inputRef} type="file" accept=".csv" hidden onChange={(e) => handleFile(e.target.files[0])} />
-        <div className="dropzone-icon">{uploading ? <span className="spinner big" /> : <FileIcon width={26} height={26} />}</div>
-        <p className="dropzone-title">{uploading ? 'Analyzing your dataset…' : 'Drop a CSV file here'}</p>
-        <p className="dropzone-sub">{uploading ? 'Building data profile' : 'or click to browse · .csv up to 50MB'}</p>
+      <div className="category-picker">
+        <div className="cp-label">1 · Choose an analysis lens</div>
+        <div className="category-grid">
+          {CATEGORIES.map((c) => (
+            <button
+              key={c.key}
+              className={`category-card ${category === c.key ? 'active' : ''}`}
+              onClick={() => setCategory(c.key)}
+            >
+              <span className="cc-icon"><c.icon width={18} height={18} /></span>
+              <span className="cc-label">{c.label}</span>
+              <span className="cc-blurb">{c.blurb}</span>
+            </button>
+          ))}
+        </div>
       </div>
 
-      <div className="trust-row">
-        <span><Check width={13} height={13} /> Code is sandboxed</span>
-        <span><Check width={13} height={13} /> Runs on your data</span>
-        <span><Check width={13} height={13} /> Inspectable output</span>
+      <div className="upload-step">
+        <div className="cp-label">2 · Upload your dataset</div>
+        <div
+          className={`dropzone ${dragging ? 'drag-over' : ''} ${uploading ? 'uploading' : ''}`}
+          onClick={() => !uploading && inputRef.current.click()}
+          onDragOver={(e) => { e.preventDefault(); setDragging(true) }}
+          onDragLeave={() => setDragging(false)}
+          onDrop={(e) => { e.preventDefault(); setDragging(false); handleFile(e.dataTransfer.files[0]) }}
+        >
+          <input ref={inputRef} type="file" accept=".csv" hidden onChange={(e) => handleFile(e.target.files[0])} />
+          <div className="dropzone-icon">{uploading ? <span className="spinner big" /> : <FileIcon width={26} height={26} />}</div>
+          <p className="dropzone-title">{uploading ? 'Analyzing your dataset…' : 'Drop a CSV file here'}</p>
+          <p className="dropzone-sub">{uploading ? 'Building data profile' : 'or click to browse · .csv up to 50MB'}</p>
+        </div>
       </div>
     </div>
   )
@@ -122,7 +228,7 @@ function UploadScreen({ onUpload, uploading, setUploading }) {
 
 // ─── Sidebar ───────────────────────────────────────────────────────────────────
 
-function Sidebar({ upload, onReset }) {
+function Sidebar({ upload, category, setCategory, onReset }) {
   const [q, setQ] = useState('')
   const filtered = useMemo(
     () => upload.columns.filter((c) => c.toLowerCase().includes(q.toLowerCase())),
@@ -155,6 +261,23 @@ function Sidebar({ upload, onReset }) {
           <span className="ds-tag">{upload.numeric_features} numeric</span>
           <span className="ds-tag">{upload.columns.length - upload.numeric_features} categorical</span>
           {ts && <span className="ds-tag muted">Uploaded {ts}</span>}
+        </div>
+      </div>
+
+      <div className="panel-section">
+        <div className="panel-head">Analysis Lens</div>
+        <div className="lens-chips">
+          {CATEGORIES.map((c) => (
+            <button
+              key={c.key}
+              className={`lens-chip ${category === c.key ? 'active' : ''}`}
+              onClick={() => setCategory(c.key)}
+              title={c.blurb}
+            >
+              <c.icon width={14} height={14} />
+              {c.label}
+            </button>
+          ))}
         </div>
       </div>
 
@@ -198,7 +321,8 @@ function Sidebar({ upload, onReset }) {
 
 // ─── Insights Panel ────────────────────────────────────────────────────────────
 
-function InsightsPanel({ upload, onAsk, loading }) {
+function InsightsPanel({ upload, category, onAsk, loading }) {
+  const cat = catByKey(category)
   const numericCols = Object.keys(upload.numeric_stats || {})
   const [statCol, setStatCol] = useState(numericCols[0] || '')
   const stats = upload.numeric_stats?.[statCol]
@@ -221,9 +345,7 @@ function InsightsPanel({ upload, onAsk, loading }) {
       <div className="insight-card health">
         <div className="ic-head"><Activity width={15} height={15} /> Dataset Health</div>
         <div className="health-score">
-          <div className="ring" style={{ '--score': healthScore }}>
-            <span>{healthScore}</span>
-          </div>
+          <div className="ring" style={{ '--score': healthScore }}><span>{healthScore}</span></div>
           <div className="health-list">
             {healthItems.map((h) => (
               <div key={h.label} className="health-item">
@@ -258,9 +380,9 @@ function InsightsPanel({ upload, onAsk, loading }) {
       )}
 
       <div className="insight-card">
-        <div className="ic-head"><Sparkles width={15} height={15} /> Suggested Analyses</div>
+        <div className="ic-head"><cat.icon width={15} height={15} /> {cat.label} Analyses</div>
         <div className="suggest-list">
-          {SUGGESTED.map((s) => (
+          {cat.suggested.map((s) => (
             <button key={s.label} className="suggest-btn" disabled={loading} onClick={() => onAsk(s.q)}>
               <span>{s.label}</span>
               <span className="suggest-arrow">→</span>
@@ -297,13 +419,17 @@ function ChatMessage({ msg }) {
   const [showCode, setShowCode] = useState(false)
   const isDone = msg.steps.some((s) => s.step === 'done')
   const isError = msg.steps.some((s) => s.step === 'error')
+  const cat = catByKey(msg.category)
 
   return (
     <div className="chat-msg">
       <div className="bubble-user"><p>{msg.question}</p></div>
 
       <div className={`bubble-agent ${isError ? 'is-error' : isDone ? 'is-done' : 'is-loading'}`}>
-        <div className="agent-head"><Sparkles width={14} height={14} /> Analyst Agent</div>
+        <div className="agent-head">
+          <Sparkles width={14} height={14} /> Analyst Agent
+          <span className="agent-lens"><cat.icon width={11} height={11} /> {cat.label}</span>
+        </div>
 
         <div className="steps-track">
           {msg.steps.map((s, i) => <AgentStep key={i} step={s} />)}
@@ -330,7 +456,8 @@ function ChatMessage({ msg }) {
   )
 }
 
-function ChatArea({ upload, messages, onAsk, loading, question, setQuestion, inputRef }) {
+function ChatArea({ upload, category, messages, onAsk, loading, question, setQuestion, inputRef }) {
+  const cat = catByKey(category)
   const bottomRef = useRef()
   useEffect(() => { bottomRef.current?.scrollIntoView({ behavior: 'smooth' }) }, [messages])
 
@@ -338,14 +465,14 @@ function ChatArea({ upload, messages, onAsk, loading, question, setQuestion, inp
     <main className="chat-area">
       {messages.length === 0 ? (
         <div className="chat-empty">
-          <div className="empty-icon"><Sparkles width={30} height={30} /></div>
-          <h2>Analyze your data with natural language</h2>
-          <p>Ask questions, create charts, discover patterns, and generate insights instantly.</p>
+          <div className="empty-icon"><cat.icon width={30} height={30} /></div>
+          <h2>{cat.label} analysis with natural language</h2>
+          <p>{cat.blurb} — ask questions, create charts, and get a domain-expert read on your data.</p>
           <div className="example-grid">
-            {EXAMPLE_PROMPTS.map((ex) => (
-              <button key={ex.text} className="example-card" disabled={loading} onClick={() => onAsk(ex.text)}>
-                <span className="ex-icon"><ex.icon width={16} height={16} /></span>
-                <span>{ex.text}</span>
+            {cat.examples.map((text) => (
+              <button key={text} className="example-card" disabled={loading} onClick={() => onAsk(text)}>
+                <span className="ex-icon"><Sparkles width={15} height={15} /></span>
+                <span>{text}</span>
               </button>
             ))}
           </div>
@@ -365,7 +492,7 @@ function ChatArea({ upload, messages, onAsk, loading, question, setQuestion, inp
           <input
             ref={inputRef}
             className="composer-input"
-            placeholder={`Ask anything about ${upload.filename}…`}
+            placeholder={`Ask a ${cat.label.toLowerCase()} question about ${upload.filename}…`}
             value={question}
             onChange={(e) => setQuestion(e.target.value)}
             onKeyDown={(e) => e.key === 'Enter' && !e.shiftKey && onAsk()}
@@ -376,7 +503,7 @@ function ChatArea({ upload, messages, onAsk, loading, question, setQuestion, inp
             {loading ? <span className="spinner" /> : <Send width={17} height={17} />}
           </button>
         </div>
-        <div className="composer-hint">AI can make mistakes — generated code is shown for every answer.</div>
+        <div className="composer-hint">Analyzing through the <strong>{cat.label}</strong> lens · generated code shown for every answer</div>
       </div>
     </main>
   )
@@ -387,6 +514,7 @@ function ChatArea({ upload, messages, onAsk, loading, question, setQuestion, inp
 export default function App() {
   const [upload, setUpload] = useState(null)
   const [uploading, setUploading] = useState(false)
+  const [category, setCategory] = useState('general')
   const [messages, setMessages] = useState([])
   const [question, setQuestion] = useState('')
   const [loading, setLoading] = useState(false)
@@ -399,13 +527,13 @@ export default function App() {
     setLoading(true)
 
     const msgId = Date.now()
-    setMessages((prev) => [...prev, { id: msgId, question: text, steps: [], code: null, result: null, chart: null }])
+    setMessages((prev) => [...prev, { id: msgId, question: text, category, steps: [], code: null, result: null, chart: null }])
 
     try {
       const res = await fetch('/query', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ session_id: upload.session_id, question: text }),
+        body: JSON.stringify({ session_id: upload.session_id, question: text, category }),
       })
       if (!res.ok) {
         const err = await res.json()
@@ -438,18 +566,30 @@ export default function App() {
       setLoading(false)
       setTimeout(() => inputRef.current?.focus(), 50)
     }
-  }, [question, upload, loading])
+  }, [question, upload, loading, category])
 
   return (
     <div className="app">
-      <TopNav upload={upload} />
+      <TopNav upload={upload} category={category} />
       {!upload ? (
-        <UploadScreen onUpload={setUpload} uploading={uploading} setUploading={setUploading} />
+        <UploadScreen
+          onUpload={setUpload}
+          uploading={uploading}
+          setUploading={setUploading}
+          category={category}
+          setCategory={setCategory}
+        />
       ) : (
         <div className="workspace">
-          <Sidebar upload={upload} onReset={() => { setUpload(null); setMessages([]) }} />
+          <Sidebar
+            upload={upload}
+            category={category}
+            setCategory={setCategory}
+            onReset={() => { setUpload(null); setMessages([]) }}
+          />
           <ChatArea
             upload={upload}
+            category={category}
             messages={messages}
             onAsk={ask}
             loading={loading}
@@ -457,7 +597,7 @@ export default function App() {
             setQuestion={setQuestion}
             inputRef={inputRef}
           />
-          <InsightsPanel upload={upload} onAsk={ask} loading={loading} />
+          <InsightsPanel upload={upload} category={category} onAsk={ask} loading={loading} />
         </div>
       )}
     </div>

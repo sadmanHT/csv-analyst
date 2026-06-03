@@ -111,3 +111,40 @@ export const Brain = (p) => (
     <path d="M12 5v15" />
   </svg>
 )
+
+export const DollarSign = (p) => (
+  <svg {...base} {...p}>
+    <path d="M12 1v22" />
+    <path d="M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6" />
+  </svg>
+)
+
+export const HeartPulse = (p) => (
+  <svg {...base} {...p}>
+    <path d="M19 14c1.5-1.5 3-3.2 3-5.5A5.5 5.5 0 0 0 16.5 3 5.5 5.5 0 0 0 12 5.4 5.5 5.5 0 0 0 7.5 3 5.5 5.5 0 0 0 2 8.5c0 2.3 1.5 4 3 5.5l7 7z" />
+    <path d="M3.2 12H8l1.5-3 3 6 1.5-3h3.8" />
+  </svg>
+)
+
+export const ShoppingCart = (p) => (
+  <svg {...base} {...p}>
+    <circle cx="9" cy="21" r="1.5" />
+    <circle cx="19" cy="21" r="1.5" />
+    <path d="M2 3h2.5l2.2 12.4a2 2 0 0 0 2 1.6h8.7a2 2 0 0 0 2-1.6L23 7H6" />
+  </svg>
+)
+
+export const Megaphone = (p) => (
+  <svg {...base} {...p}>
+    <path d="M3 11v2a1 1 0 0 0 1 1h2l4 4V6L6 10H4a1 1 0 0 0-1 1z" />
+    <path d="M14 7.5a5 5 0 0 1 0 9" />
+  </svg>
+)
+
+export const Users = (p) => (
+  <svg {...base} {...p}>
+    <path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2" />
+    <circle cx="9" cy="7" r="4" />
+    <path d="M22 21v-2a4 4 0 0 0-3-3.87M16 3.13A4 4 0 0 1 16 11" />
+  </svg>
+)

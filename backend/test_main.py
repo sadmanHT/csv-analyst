@@ -57,6 +57,26 @@ def test_query_unknown_session():
     assert res.status_code == 404
 
 
+def test_query_accepts_category():
+    """The /query schema must accept an optional analysis category."""
+    res = client.post(
+        "/query",
+        json={"session_id": "nonexistent-id", "question": "How many rows?", "category": "financial"},
+    )
+    # category is valid -> not a 422; session is fake -> 404
+    assert res.status_code == 404
+
+
+def test_system_prompt_for_categories():
+    from main import system_prompt_for, SYSTEM_PROMPT
+    fin = system_prompt_for("financial")
+    med = system_prompt_for("medical")
+    assert "FINANCIAL" in fin and SYSTEM_PROMPT in fin
+    assert "clinical" in med.lower() and "association" in med.lower()
+    # unknown category falls back to general, still valid
+    assert SYSTEM_PROMPT in system_prompt_for("does-not-exist")
+
+
 def test_upload_returns_dtypes_and_preview():
     res = client.post(
         "/upload",
