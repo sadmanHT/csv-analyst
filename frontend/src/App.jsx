@@ -14,15 +14,17 @@ const CATEGORIES = [
     blurb: 'Neutral statistical analysis',
     examples: [
       'Summarize the key statistics of this dataset',
-      'What is the distribution of the first numeric column?',
       'Show a correlation heatmap of numeric columns',
+      'Plot the distribution of each numeric column',
       'Show a bar chart of the top categories by count',
     ],
     suggested: [
-      { label: 'Correlation Analysis', q: 'Show a correlation heatmap of all numeric columns' },
-      { label: 'Distribution',         q: 'Plot the distribution of the first numeric column' },
+      { label: 'Correlation Heatmap',  q: 'Show an annotated correlation heatmap of all numeric columns' },
+      { label: 'Distributions',        q: 'Plot histograms of the distribution of each numeric column' },
       { label: 'Top Categories',       q: 'Show a bar chart of the top categories by count' },
-      { label: 'Outlier Detection',    q: 'Show a box plot to detect outliers in numeric columns' },
+      { label: 'Outlier Detection',    q: 'Show box plots to detect outliers in the numeric columns' },
+      { label: 'Summary Statistics',   q: 'Give me a full summary statistics table for every column' },
+      { label: 'Missing Values',       q: 'Show a bar chart of the percentage of missing values per column' },
     ],
   },
   {
@@ -30,14 +32,16 @@ const CATEGORIES = [
     blurb: 'Revenue, growth, risk & ratios',
     examples: [
       'Plot total revenue over time as a line chart',
-      'Which category generates the most revenue?',
+      'Show a bar chart of total revenue by category',
       'Calculate the period-over-period growth rate',
-      'Show the volatility (std dev) of the key numeric columns',
+      'Show the volatility of the key numeric columns',
     ],
     suggested: [
       { label: 'Revenue Trend',        q: 'Plot total revenue over time as a line chart' },
       { label: 'Growth Rate',          q: 'Calculate and chart the period-over-period growth rate' },
-      { label: 'Top Revenue Drivers',  q: 'Show a bar chart of total revenue by category' },
+      { label: 'Revenue by Category',  q: 'Show a bar chart of total revenue by category, sorted descending' },
+      { label: 'Revenue by Region',    q: 'Show a bar chart of total revenue by region, sorted descending' },
+      { label: 'Top Contributors',     q: 'Show a Pareto chart of the top revenue contributors' },
       { label: 'Risk / Volatility',    q: 'Show the standard deviation of the main numeric columns as a risk measure' },
     ],
   },
@@ -46,15 +50,17 @@ const CATEGORIES = [
     blurb: 'Risk factors & patient cohorts',
     examples: [
       'Which features correlate most with the outcome?',
-      'Compare the mean of each numeric feature between outcome groups',
-      'Show the distribution of age split by outcome',
+      'Show the age distribution split by outcome',
+      'Compare each numeric feature between outcome groups',
       'Show a correlation heatmap of clinical measurements',
     ],
     suggested: [
-      { label: 'Risk Factors',         q: 'Which features correlate most with the outcome variable?' },
-      { label: 'Cohort Comparison',    q: 'Compare the mean of each numeric feature between the outcome groups' },
-      { label: 'Distribution by Group',q: 'Plot the distribution of the first numeric feature split by outcome' },
-      { label: 'Correlation Heatmap',  q: 'Show a correlation heatmap of all numeric columns' },
+      { label: 'Risk Factors',         q: 'Show a bar chart of how strongly each feature correlates with the outcome' },
+      { label: 'Correlation Heatmap',  q: 'Show an annotated correlation heatmap of all numeric columns' },
+      { label: 'Outcome Prevalence',   q: 'Show a count plot of the outcome variable (how many in each group)' },
+      { label: 'Age by Outcome',       q: 'Show a violin plot of age split by outcome group' },
+      { label: 'Cohort Comparison',    q: 'Compare the mean of each numeric feature between outcome groups with a grouped bar chart' },
+      { label: 'Feature Distributions',q: 'Plot the distribution of each clinical measurement split by outcome' },
     ],
   },
   {
@@ -63,46 +69,52 @@ const CATEGORIES = [
     examples: [
       'Show a bar chart of revenue by product category',
       'Which region has the highest total sales?',
-      'What is the average order value?',
       'Show the relationship between rating and revenue',
+      'What is the average order value?',
     ],
     suggested: [
-      { label: 'Sales by Category',    q: 'Show a bar chart of total revenue by category' },
-      { label: 'Top Regions',          q: 'Which region has the highest total revenue? Show a bar chart' },
-      { label: 'Basket Size',          q: 'What is the average quantity and revenue per order?' },
+      { label: 'Sales by Category',    q: 'Show a bar chart of total revenue by category, sorted descending' },
+      { label: 'Top Regions',          q: 'Show a bar chart of total revenue by region, sorted descending' },
+      { label: 'Best-Selling Products',q: 'Show a bar chart of the top 10 products by revenue' },
+      { label: 'Sales Trend',          q: 'Plot total revenue over time as a line chart' },
       { label: 'Ratings vs Revenue',   q: 'Show a scatter plot of rating versus revenue' },
+      { label: 'Avg Order Value',      q: 'What is the average quantity and revenue per order? Show a chart' },
     ],
   },
   {
     key: 'marketing', label: 'Marketing', icon: Megaphone,
     blurb: 'Conversion, segments & channels',
     examples: [
-      'Break down the data by segment',
+      'Break down totals by each segment',
       'Which channel or category performs best?',
-      'Show conversion rates across groups',
       'Compare performance between segments',
+      'Show the share of each category as a chart',
     ],
     suggested: [
-      { label: 'Segment Breakdown',    q: 'Break down totals by each categorical column' },
-      { label: 'Best Performing',      q: 'Which category has the highest total? Show a ranked bar chart' },
+      { label: 'Segment Breakdown',    q: 'Show a bar chart breaking down totals by the main categorical column' },
+      { label: 'Best Performing',      q: 'Show a ranked bar chart of which category has the highest total' },
+      { label: 'Channel Share',        q: 'Show the share/proportion of each category as a chart' },
       { label: 'Rate Analysis',        q: 'Show rates or proportions across the main categorical column' },
-      { label: 'Segment Comparison',   q: 'Compare the mean numeric values across segments' },
+      { label: 'Segment Comparison',   q: 'Compare the mean numeric values across segments with a grouped bar chart' },
+      { label: 'Trend Over Time',      q: 'Plot the trend of the main metric over time by segment' },
     ],
   },
   {
     key: 'hr', label: 'HR', icon: Users,
     blurb: 'Attrition, tenure & demographics',
     examples: [
-      'Show the distribution of age across the workforce',
+      'Show the headcount by department or category',
+      'Plot the age distribution across the workforce',
       'Compare numeric features between groups',
-      'What is the headcount by department or category?',
       'Show a correlation heatmap of the numeric columns',
     ],
     suggested: [
       { label: 'Headcount',            q: 'Show a bar chart of counts by the main categorical column' },
-      { label: 'Demographics',         q: 'Plot the distribution of age across the dataset' },
-      { label: 'Group Comparison',     q: 'Compare the mean of each numeric feature between groups' },
-      { label: 'Pay / Value Equity',   q: 'Compare the average of the main numeric column across groups' },
+      { label: 'Demographics',         q: 'Plot the age distribution across the workforce as a histogram' },
+      { label: 'Attrition Analysis',   q: 'Show a count plot of attrition/turnover by group' },
+      { label: 'Tenure Distribution',  q: 'Plot the distribution of tenure or years across the dataset' },
+      { label: 'Group Comparison',     q: 'Compare the mean of each numeric feature between groups with a box plot' },
+      { label: 'Pay / Value Equity',   q: 'Compare the average of the main numeric column across groups with a bar chart' },
     ],
   },
 ]
@@ -158,7 +170,42 @@ function TopNav({ upload, category }) {
 
 // ─── Upload Screen (with category selector) ────────────────────────────────────
 
-function UploadScreen({ onUpload, uploading, setUploading, category, setCategory }) {
+function PasteModal({ uploading, onClose, onSubmit }) {
+  const [pasteText, setPasteText] = useState('')
+  const [hasHeader, setHasHeader] = useState(true)
+
+  return (
+    <div className="modal-overlay" onClick={() => !uploading && onClose()}>
+      <div className="modal" onClick={(e) => e.stopPropagation()}>
+        <div className="modal-head">
+          <div>
+            <h3>Paste your data</h3>
+            <p>Paste rows copied from Excel, Google Sheets or a CSV — commas or tabs both work.</p>
+          </div>
+          <button className="icon-btn" onClick={onClose}><X width={16} height={16} /></button>
+        </div>
+        <textarea
+          className="paste-area"
+          placeholder={"date\tdepartment\trevenue\tprofit\n2025-01-01\tSoftware\t88956.3\t33440.91\n2025-02-01\tSoftware\t87270.5\t31980.20"}
+          value={pasteText}
+          onChange={(e) => setPasteText(e.target.value)}
+          autoFocus
+        />
+        <div className="modal-foot">
+          <label className="header-toggle">
+            <input type="checkbox" checked={hasHeader} onChange={(e) => setHasHeader(e.target.checked)} />
+            First row is a header
+          </label>
+          <button className="paste-submit" onClick={() => onSubmit(pasteText, hasHeader)} disabled={uploading || !pasteText.trim()}>
+            {uploading ? <span className="spinner" /> : <>Analyze data →</>}
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function UploadScreen({ onUpload, uploading, setUploading, category, setCategory, onOpenPaste }) {
   const [dragging, setDragging] = useState(false)
   const inputRef = useRef()
 
@@ -221,6 +268,10 @@ function UploadScreen({ onUpload, uploading, setUploading, category, setCategory
           <p className="dropzone-title">{uploading ? 'Analyzing your dataset…' : 'Drop a CSV file here'}</p>
           <p className="dropzone-sub">{uploading ? 'Building data profile' : 'or click to browse · .csv up to 50MB'}</p>
         </div>
+        <div className="paste-divider"><span>or</span></div>
+        <button className="paste-trigger" onClick={onOpenPaste} disabled={uploading}>
+          <Code width={15} height={15} /> Paste data / rows instead
+        </button>
       </div>
     </div>
   )
@@ -294,7 +345,7 @@ function Sidebar({ upload, category, setCategory, onReset }) {
               <span className="sp-type">{niceType(upload.dtypes[col])}</span>
             </div>
           ))}
-          {filtered.length === 0 && <div className="schema-empty">No columns match “{q}”</div>}
+          {filtered.length === 0 && <div className="schema-empty">No columns match "{q}"</div>}
         </div>
       </div>
 
@@ -321,11 +372,89 @@ function Sidebar({ upload, category, setCategory, onReset }) {
 
 // ─── Insights Panel ────────────────────────────────────────────────────────────
 
-function InsightsPanel({ upload, category, onAsk, loading }) {
+function PredictInputCard({ sessionId, modelInfo }) {
+  const features = modelInfo.features
+  const [values, setValues] = useState(() =>
+    Object.fromEntries(features.map((f) => [f.name, f.default ?? ''])))
+  const [result, setResult] = useState(null)
+  const [busy, setBusy] = useState(false)
+
+  const setVal = (name, v) => setValues((prev) => ({ ...prev, [name]: v }))
+
+  const fillFromPaste = (text) => {
+    const parts = text.split(/[\t,]/).map((s) => s.trim())
+    if (parts.length < 2) return
+    setValues((prev) => {
+      const next = { ...prev }
+      features.forEach((f, i) => { if (parts[i] !== undefined && parts[i] !== '') next[f.name] = parts[i] })
+      return next
+    })
+  }
+
+  const run = async () => {
+    setBusy(true); setResult(null)
+    try {
+      const res = await fetch('/predict_input', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ session_id: sessionId, values }),
+      })
+      const data = await res.json()
+      if (!res.ok) throw new Error(data.detail || 'Prediction failed')
+      setResult(data)
+    } catch (e) {
+      alert(e.message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <div className="insight-card infer-card">
+      <div className="ic-head"><Sparkles width={15} height={15} /> Predict a New Case</div>
+      <p className="predict-hint">Enter a new record to predict <strong>{modelInfo.target}</strong> with the trained model.</p>
+      <input
+        className="paste-row-input"
+        placeholder="Paste a row (comma/tab) to autofill…"
+        onChange={(e) => fillFromPaste(e.target.value)}
+      />
+      <div className="infer-fields">
+        {features.map((f) => (
+          <label key={f.name} className="infer-field">
+            <span className="if-name">{f.name}</span>
+            {f.type === 'category' ? (
+              <select value={values[f.name]} onChange={(e) => setVal(f.name, e.target.value)}>
+                {f.options.map((o) => <option key={o} value={o}>{o}</option>)}
+              </select>
+            ) : (
+              <input type="number" step="any" value={values[f.name]} onChange={(e) => setVal(f.name, e.target.value)} />
+            )}
+          </label>
+        ))}
+      </div>
+      <button className="predict-btn" disabled={busy} onClick={run}>
+        {busy ? <span className="spinner" /> : <>🔮 Predict {modelInfo.target}</>}
+      </button>
+      {result && (
+        <div className="infer-result">
+          <div className="ir-label">Predicted {result.target}</div>
+          <div className="ir-value">{String(result.prediction)}</div>
+          {result.confidence != null && (
+            <div className="ir-conf">{Math.round(result.confidence * 100)}% confidence</div>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
+function InsightsPanel({ upload, category, onAsk, onPredict, onOpenPaste, modelInfo, loading }) {
   const cat = catByKey(category)
   const numericCols = Object.keys(upload.numeric_stats || {})
   const [statCol, setStatCol] = useState(numericCols[0] || '')
   const stats = upload.numeric_stats?.[statCol]
+  // default the prediction target to the last column (commonly the outcome/target)
+  const [target, setTarget] = useState(upload.columns[upload.columns.length - 1] || '')
 
   const healthScore = useMemo(() => {
     let score = 100
@@ -377,6 +506,32 @@ function InsightsPanel({ upload, category, onAsk, loading }) {
             </div>
           )}
         </div>
+      )}
+
+      <div className="insight-card custom-card">
+        <div className="ic-head"><Code width={15} height={15} /> Custom Data</div>
+        <p className="predict-hint">Paste your own rows or values to analyze them on the fly.</p>
+        <button className="custom-btn" disabled={loading} onClick={onOpenPaste}>
+          <Code width={14} height={14} /> Paste / input data
+        </button>
+      </div>
+
+      <div className="insight-card predict-card">
+        <div className="ic-head"><Brain width={15} height={15} /> Predictive Model</div>
+        <p className="predict-hint">Train a model to predict a column and see what drives it.</p>
+        <div className="predict-row">
+          <span className="predict-label">Predict</span>
+          <select className="predict-select" value={target} onChange={(e) => setTarget(e.target.value)}>
+            {upload.columns.map((c) => <option key={c} value={c}>{c}</option>)}
+          </select>
+        </div>
+        <button className="predict-btn" disabled={loading || !target} onClick={() => onPredict(target)}>
+          {loading ? <span className="spinner" /> : <>🔮 Train &amp; Predict</>}
+        </button>
+      </div>
+
+      {modelInfo?.trained && (
+        <PredictInputCard sessionId={upload.session_id} modelInfo={modelInfo} />
       )}
 
       <div className="insight-card">
@@ -464,19 +619,51 @@ function ChatArea({ upload, category, messages, onAsk, loading, question, setQue
   return (
     <main className="chat-area">
       {messages.length === 0 ? (
-        <div className="chat-empty">
-          <div className="empty-icon"><cat.icon width={30} height={30} /></div>
-          <h2>{cat.label} analysis with natural language</h2>
-          <p>{cat.blurb} — ask questions, create charts, and get a domain-expert read on your data.</p>
-          <div className="example-grid">
-            {cat.examples.map((text) => (
-              <button key={text} className="example-card" disabled={loading} onClick={() => onAsk(text)}>
-                <span className="ex-icon"><Sparkles width={15} height={15} /></span>
-                <span>{text}</span>
-              </button>
-            ))}
+        (upload.overview && upload.overview.length > 0) ? (
+          <div className="overview-scroll">
+            <div className="overview-header">
+              <div className="empty-icon sm"><cat.icon width={22} height={22} /></div>
+              <div>
+                <h2>Instant overview of {upload.filename}</h2>
+                <p>Auto-generated the moment your data loaded · ask a question below for a deeper dive.</p>
+              </div>
+            </div>
+
+            <div className="overview-grid">
+              {upload.overview.map((oc) => (
+                <figure key={oc.title} className="overview-card">
+                  <img src={`data:image/png;base64,${oc.chart}`} alt={oc.title} />
+                  <figcaption>{oc.title}</figcaption>
+                </figure>
+              ))}
+            </div>
+
+            <div className="overview-examples">
+              <div className="oe-label">Try a {cat.label} question</div>
+              <div className="oe-chips">
+                {cat.examples.map((text) => (
+                  <button key={text} className="oe-chip" disabled={loading} onClick={() => onAsk(text)}>
+                    <Sparkles width={13} height={13} /> {text}
+                  </button>
+                ))}
+              </div>
+            </div>
           </div>
-        </div>
+        ) : (
+          <div className="chat-empty">
+            <div className="empty-icon"><cat.icon width={30} height={30} /></div>
+            <h2>{cat.label} analysis with natural language</h2>
+            <p>{cat.blurb} — ask questions, create charts, and get a domain-expert read on your data.</p>
+            <div className="example-grid">
+              {cat.examples.map((text) => (
+                <button key={text} className="example-card" disabled={loading} onClick={() => onAsk(text)}>
+                  <span className="ex-icon"><Sparkles width={15} height={15} /></span>
+                  <span>{text}</span>
+                </button>
+              ))}
+            </div>
+          </div>
+        )
       ) : (
         <div className="message-list">
           {messages.map((m) => <ChatMessage key={m.id} msg={m} />)}
@@ -518,47 +705,80 @@ export default function App() {
   const [messages, setMessages] = useState([])
   const [question, setQuestion] = useState('')
   const [loading, setLoading] = useState(false)
+  const [showPaste, setShowPaste] = useState(false)
+  const [modelInfo, setModelInfo] = useState(null)
   const inputRef = useRef()
 
-  const ask = useCallback(async (q) => {
-    const text = (typeof q === 'string' ? q : question).trim()
-    if (!text || !upload || loading) return
-    setQuestion('')
-    setLoading(true)
-
-    const msgId = Date.now()
-    setMessages((prev) => [...prev, { id: msgId, question: text, category, steps: [], code: null, result: null, chart: null }])
-
+  const handlePasteSubmit = useCallback(async (text, hasHeader) => {
+    if (!text.trim()) return
+    setUploading(true)
     try {
-      const res = await fetch('/query', {
+      const res = await fetch('/upload_text', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ session_id: upload.session_id, question: text, category }),
+        body: JSON.stringify({ text, has_header: hasHeader, filename: 'pasted_data.csv' }),
+      })
+      const data = await res.json()
+      if (!res.ok) throw new Error(data.detail || 'Could not parse the data')
+      setShowPaste(false)
+      setMessages([])
+      setModelInfo(null)
+      setUpload({ ...data, uploadedAt: new Date() })
+    } catch (e) {
+      alert(e.message)
+    } finally {
+      setUploading(false)
+    }
+  }, [])
+
+  // Shared SSE consumer used by both /query and /predict.
+  const streamInto = useCallback(async (url, body, label) => {
+    if (!upload || loading) return
+    setLoading(true)
+    const msgId = Date.now()
+    setMessages((prev) => [...prev, { id: msgId, question: label, category, steps: [], code: null, result: null, chart: null }])
+
+    try {
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
       })
       if (!res.ok) {
         const err = await res.json()
-        throw new Error(err.detail || 'Query failed')
+        throw new Error(err.detail || 'Request failed')
       }
 
       const reader = res.body.getReader()
       const decoder = new TextDecoder()
+      let buffer = ''
+
+      const handleEvent = (block) => {
+        const line = block.split('\n').find((l) => l.startsWith('data: '))
+        if (!line) return
+        try {
+          const event = JSON.parse(line.slice(6))
+          setMessages((prev) => prev.map((m) => m.id !== msgId ? m : {
+            ...m,
+            steps: [...m.steps, event],
+            code: event.code ?? m.code,
+            result: event.result ?? m.result,
+            chart: event.chart ?? m.chart,
+          }))
+        } catch (_) {}
+      }
+
       while (true) {
         const { done, value } = await reader.read()
         if (done) break
-        const lines = decoder.decode(value).split('\n').filter((l) => l.startsWith('data: '))
-        for (const line of lines) {
-          try {
-            const event = JSON.parse(line.slice(6))
-            setMessages((prev) => prev.map((m) => m.id !== msgId ? m : {
-              ...m,
-              steps: [...m.steps, event],
-              code: event.code ?? m.code,
-              result: event.result ?? m.result,
-              chart: event.chart ?? m.chart,
-            }))
-          } catch (_) {}
-        }
+        // Buffer chunks; only parse complete SSE events (separated by a blank line).
+        // Large payloads (e.g. a 90KB chart) span multiple chunks.
+        buffer += decoder.decode(value, { stream: true })
+        const blocks = buffer.split('\n\n')
+        buffer = blocks.pop() ?? ''
+        for (const block of blocks) handleEvent(block)
       }
+      if (buffer.trim()) handleEvent(buffer)
     } catch (e) {
       setMessages((prev) => prev.map((m) => m.id === msgId
         ? { ...m, steps: [...m.steps, { step: 'error', message: e.message }] } : m))
@@ -566,7 +786,27 @@ export default function App() {
       setLoading(false)
       setTimeout(() => inputRef.current?.focus(), 50)
     }
-  }, [question, upload, loading, category])
+  }, [upload, loading, category])
+
+  const ask = useCallback((q) => {
+    const text = (typeof q === 'string' ? q : question).trim()
+    if (!text) return
+    setQuestion('')
+    return streamInto('/query', { session_id: upload.session_id, question: text, category }, text)
+  }, [question, upload, category, streamInto])
+
+  const predict = useCallback(async (target) => {
+    if (!target) return
+    await streamInto('/predict', { session_id: upload.session_id, target, category }, `🔮 Predict "${target}"`)
+    // Load the trained-model metadata so the user can predict new cases.
+    try {
+      const res = await fetch(`/model_info/${upload.session_id}`)
+      if (res.ok) {
+        const info = await res.json()
+        if (info.trained) setModelInfo(info)
+      }
+    } catch (_) {}
+  }, [upload, category, streamInto])
 
   return (
     <div className="app">
@@ -578,6 +818,7 @@ export default function App() {
           setUploading={setUploading}
           category={category}
           setCategory={setCategory}
+          onOpenPaste={() => setShowPaste(true)}
         />
       ) : (
         <div className="workspace">
@@ -585,7 +826,7 @@ export default function App() {
             upload={upload}
             category={category}
             setCategory={setCategory}
-            onReset={() => { setUpload(null); setMessages([]) }}
+            onReset={() => { setUpload(null); setMessages([]); setModelInfo(null) }}
           />
           <ChatArea
             upload={upload}
@@ -597,8 +838,20 @@ export default function App() {
             setQuestion={setQuestion}
             inputRef={inputRef}
           />
-          <InsightsPanel upload={upload} category={category} onAsk={ask} loading={loading} />
+          <InsightsPanel
+            upload={upload}
+            category={category}
+            onAsk={ask}
+            onPredict={predict}
+            onOpenPaste={() => setShowPaste(true)}
+            modelInfo={modelInfo}
+            loading={loading}
+          />
         </div>
+      )}
+
+      {showPaste && (
+        <PasteModal uploading={uploading} onClose={() => setShowPaste(false)} onSubmit={handlePasteSubmit} />
       )}
     </div>
   )
