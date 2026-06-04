@@ -122,12 +122,19 @@ const CATEGORIES = [
 const catByKey = (key) => CATEGORIES.find((c) => c.key === key) || CATEGORIES[0]
 
 const STEP_META = {
-  analyzing: { icon: '🔍', color: '#4F46E5' },
-  thinking:  { icon: '🧠', color: '#8B5CF6' },
-  code:      { icon: '💻', color: '#06B6D4' },
-  executing: { icon: '⚡', color: '#F59E0B' },
-  done:      { icon: '✅', color: '#10B981' },
-  error:     { icon: '⚠️', color: '#EF4444' },
+  analyzing:   { icon: '🔍', color: '#4F46E5' },
+  planning:    { icon: '🗺️', color: '#7C3AED' },
+  plan:        { icon: '📋', color: '#7C3AED' },
+  analyst:     { icon: '🔬', color: '#0EA5E9' },
+  thinking:    { icon: '🧠', color: '#8B5CF6' },
+  code:        { icon: '💻', color: '#06B6D4' },
+  executing:   { icon: '⚡', color: '#F59E0B' },
+  visualizing: { icon: '📊', color: '#EC4899' },
+  critiquing:  { icon: '🔎', color: '#64748B' },
+  critique:    { icon: '🧾', color: '#64748B' },
+  reporting:   { icon: '📝', color: '#10B981' },
+  done:        { icon: '✅', color: '#10B981' },
+  error:       { icon: '⚠️', color: '#EF4444' },
 }
 
 // ─── Top Navigation ────────────────────────────────────────────────────────────
@@ -570,11 +577,68 @@ function AgentStep({ step }) {
   )
 }
 
+const VERDICT_META = {
+  pass: { color: '#10B981', bg: '#F0FDF4', border: '#BBF7D0', label: 'PASS' },
+  warn: { color: '#F59E0B', bg: '#FFFBEB', border: '#FDE68A', label: 'WARN' },
+  fail: { color: '#EF4444', bg: '#FEF2F2', border: '#FECACA', label: 'FAIL' },
+}
+
+function CritiqueBadge({ critique }) {
+  const v = VERDICT_META[critique.verdict] || VERDICT_META.pass
+  const conf = critique.confidence != null ? `${Math.round(critique.confidence * 100)}%` : null
+  return (
+    <div className="critique-badge" style={{ '--vcolor': v.color, '--vbg': v.bg, '--vborder': v.border }}>
+      <div className="cb-verdict">{v.label}{conf && <span className="cb-conf">{conf} confidence</span>}</div>
+      {critique.issues?.length > 0 && (
+        <ul className="cb-list cb-issues">
+          {critique.issues.map((i, idx) => <li key={idx}>{i}</li>)}
+        </ul>
+      )}
+      {critique.strengths?.length > 0 && (
+        <ul className="cb-list cb-strengths">
+          {critique.strengths.map((s, idx) => <li key={idx}>{s}</li>)}
+        </ul>
+      )}
+      {critique.suggestion && <p className="cb-suggestion">💡 {critique.suggestion}</p>}
+    </div>
+  )
+}
+
+function PlanBadge({ plan }) {
+  const [open, setOpen] = useState(false)
+  if (!plan?.strategy) return null
+  return (
+    <div className="plan-badge">
+      <button className="plan-toggle" onClick={() => setOpen(v => !v)}>
+        🗺️ Strategy: {plan.strategy}
+        <span className="plan-arrow">{open ? '▲' : '▼'}</span>
+      </button>
+      {open && (
+        <div className="plan-detail">
+          {plan.analysis_steps?.length > 0 && (
+            <ol className="plan-steps">
+              {plan.analysis_steps.map((s, i) => <li key={i}>{s}</li>)}
+            </ol>
+          )}
+          {plan.relevant_columns?.length > 0 && (
+            <div className="plan-cols">
+              Columns: {plan.relevant_columns.map(c => <span key={c} className="plan-col">{c}</span>)}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
 function ChatMessage({ msg }) {
   const [showCode, setShowCode] = useState(false)
   const isDone = msg.steps.some((s) => s.step === 'done')
   const isError = msg.steps.some((s) => s.step === 'error')
   const cat = catByKey(msg.category)
+
+  // Filter display steps — hide internal plan/critique/code steps from the track
+  const displaySteps = msg.steps.filter(s => !['plan', 'critique', 'code'].includes(s.step))
 
   return (
     <div className="chat-msg">
@@ -582,13 +646,15 @@ function ChatMessage({ msg }) {
 
       <div className={`bubble-agent ${isError ? 'is-error' : isDone ? 'is-done' : 'is-loading'}`}>
         <div className="agent-head">
-          <Sparkles width={14} height={14} /> Analyst Agent
+          <Sparkles width={14} height={14} /> Multi-Agent Analyst
           <span className="agent-lens"><cat.icon width={11} height={11} /> {cat.label}</span>
         </div>
 
         <div className="steps-track">
-          {msg.steps.map((s, i) => <AgentStep key={i} step={s} />)}
+          {displaySteps.map((s, i) => <AgentStep key={i} step={s} />)}
         </div>
+
+        {msg.plan && <PlanBadge plan={msg.plan} />}
 
         {msg.code && (
           <div className="code-section">
@@ -599,13 +665,22 @@ function ChatMessage({ msg }) {
           </div>
         )}
 
-        {msg.result && !isError && (
-          <div className="result-box"><pre className="result-text">{msg.result}</pre></div>
-        )}
-
         {msg.chart && (
           <img className="chart-img" src={`data:image/png;base64,${msg.chart}`} alt="Generated chart" />
         )}
+
+        {msg.report && !isError && (
+          <div className="report-section">
+            <div className="report-label"><Sparkles width={12} height={12} /> Executive Summary</div>
+            <div className="report-body">{msg.report}</div>
+          </div>
+        )}
+
+        {!msg.report && msg.result && !isError && (
+          <div className="result-box"><pre className="result-text">{msg.result}</pre></div>
+        )}
+
+        {msg.critique && isDone && <CritiqueBadge critique={msg.critique} />}
       </div>
     </div>
   )
@@ -736,7 +811,7 @@ export default function App() {
     if (!upload || loading) return
     setLoading(true)
     const msgId = Date.now()
-    setMessages((prev) => [...prev, { id: msgId, question: label, category, steps: [], code: null, result: null, chart: null }])
+    setMessages((prev) => [...prev, { id: msgId, question: label, category, steps: [], code: null, result: null, chart: null, report: null, critique: null, plan: null }])
 
     try {
       const res = await fetch(url, {
@@ -764,6 +839,9 @@ export default function App() {
             code: event.code ?? m.code,
             result: event.result ?? m.result,
             chart: event.chart ?? m.chart,
+            report: event.report ?? m.report,
+            critique: event.critique ?? m.critique,
+            plan: event.plan ?? m.plan,
           }))
         } catch (_) {}
       }

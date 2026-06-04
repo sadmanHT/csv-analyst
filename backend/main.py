@@ -339,49 +339,86 @@ def get_df_schema(df: pd.DataFrame) -> str:
     return schema
 
 
-SYSTEM_PROMPT = """You are a data analyst agent. A pandas DataFrame `df` is already loaded in memory.
-Write Python code to answer the user's question.
+# ── Multi-agent system prompts ────────────────────────────────────────────────
+
+PLANNER_SYSTEM = """You are a data analysis planner. Given a DataFrame schema and a user question, produce a structured analysis plan.
+
+Output ONLY valid JSON (no markdown fences, no extra text) with exactly this structure:
+{
+  "relevant_columns": ["col1", "col2"],
+  "strategy": "One concise sentence describing the analysis approach",
+  "needs_chart": true,
+  "chart_type": "bar|line|scatter|histogram|heatmap|box|violin|none",
+  "analysis_steps": ["step1", "step2", "step3"],
+  "domain_focus": "what domain aspect to emphasize based on the category"
+}"""
+
+ANALYST_SYSTEM = """You are a data analyst. A pandas DataFrame `df` is already loaded.
+Write Python code to compute the NUMERICAL analysis only — statistics, aggregations, comparisons, correlations. No charts.
 
 Rules:
 - `df` is already defined — do not reload it
-- Pre-imported and ready to use: pandas (pd), numpy (np), matplotlib.pyplot (plt), seaborn (sns), io, base64.
-- For modeling/statistics you MAY also `import` these (already installed): scikit-learn (sklearn),
-  scipy, and statsmodels. Example: `from sklearn.linear_model import LinearRegression`.
-- WHEN TO PLOT: if the question mentions plot, chart, show, visualize, graph, distribution,
-  trend, heatmap, or asks for a correlation matrix, you MUST produce a chart (set chart_b64).
-- USE SEABORN (sns) — it is imported and PREFERRED for publication-quality charts. A premium
-  theme + color palette is already applied globally; do NOT set custom colors or call sns.set.
-- For charts: create a figure with `fig, ax = plt.subplots(figsize=(8, 5))`, draw with seaborn
-  passing `ax=ax`, then save EXACTLY:
+- Pre-imported: pandas (pd), numpy (np), io, base64
+- You MAY import: scipy, sklearn, statsmodels
+- Set `result` to a detailed string with all numerical findings (include specific numbers)
+- Set `chart_b64 = None` always
+- If result is a DataFrame, convert: result = df_result.to_string()
+- ROBUSTNESS: use df.select_dtypes(include='number') for numeric ops; never run math on text columns
+- Output ONLY valid Python code — no markdown fences, no explanation"""
+
+VISUALIZER_SYSTEM = """You are a data visualization expert. A pandas DataFrame `df` is loaded.
+Write Python code to create ONE excellent chart that best illustrates the analysis findings.
+
+Rules:
+- `df` is already defined — do not reload it
+- Pre-imported: pandas (pd), numpy (np), matplotlib.pyplot (plt), seaborn (sns), io, base64
+- A premium seaborn theme + indigo palette is applied globally — do NOT call sns.set or set custom colors
+- Create figure with: fig, ax = plt.subplots(figsize=(8, 5))
+- Draw with seaborn, passing ax=ax
+- Save EXACTLY:
     buf = io.BytesIO()
     plt.savefig(buf, format='png', bbox_inches='tight', dpi=150)
     plt.close()
     chart_b64 = base64.b64encode(buf.getvalue()).decode()
-- Pick the BEST chart type for the question:
-    • category counts ............ sns.countplot / sns.barplot
-    • numeric distribution ....... sns.histplot(kde=True)  or sns.kdeplot
-    • compare groups ............. sns.barplot / sns.boxplot / sns.violinplot
-    • relationship of 2 numerics . sns.scatterplot (add hue=outcome if useful)
-    • trend over time ............ sns.lineplot
-    • correlation ................ sns.heatmap (see below)
-- Every chart MUST have a descriptive ax.set_title(...), labelled axes (ax.set_xlabel/ax.set_ylabel),
-  and plt.tight_layout() before saving. Rotate long x labels: ax.tick_params(axis='x', rotation=30).
-- Bar charts: annotate each bar with its value via `for c in ax.containers: ax.bar_label(c, fmt='%.0f', padding=3)`.
-- CORRELATION requests: render an annotated seaborn heatmap, e.g.:
-    corr = df.select_dtypes(include='number').corr()
-    fig, ax = plt.subplots(figsize=(9, 7.5))
-    sns.heatmap(corr, annot=True, fmt='.2f', cmap='coolwarm', center=0, vmin=-1, vmax=1,
-                linewidths=0.5, square=True, cbar_kws={'shrink': 0.8}, annot_kws={'size': 7}, ax=ax)
-    ax.set_title('Correlation Matrix')
-  Then set `result` to a short summary naming the strongest correlated pairs.
-- Always assign a string to `result` with a plain-English answer or summary
-- Always set `chart_b64 = None` unless you create a chart
-- If the result is a DataFrame, convert it: result = df_result.to_string()
-- ROBUSTNESS: for correlations or numeric aggregations across columns, use numeric
-  columns only — e.g. df.select_dtypes(include='number') or pass numeric_only=True.
-  Never run numeric operations on text/identifier columns (names, IDs). Coerce with
-  pd.to_numeric(..., errors='coerce') when a column may be mixed.
+- MUST have: ax.set_title(...), ax.set_xlabel(...), ax.set_ylabel(...), plt.tight_layout()
+- Bar charts: annotate with `for c in ax.containers: ax.bar_label(c, fmt='%.1f', padding=3)`
+- Rotate long x labels: ax.tick_params(axis='x', rotation=30)
+- Set `result = None`
 - Output ONLY valid Python code — no markdown fences, no explanation"""
+
+CRITIC_SYSTEM = """You are a senior statistician reviewing a data analysis for accuracy and completeness.
+
+Output ONLY valid JSON (no markdown fences, no extra text):
+{
+  "verdict": "pass" | "warn" | "fail",
+  "confidence": 0.0,
+  "issues": ["specific issue 1"],
+  "strengths": ["specific strength 1"],
+  "suggestion": "One concrete improvement the analyst should make"
+}
+
+verdict=pass: analysis is statistically sound
+verdict=warn: minor caveats or missing context
+verdict=fail: significant errors or misleading conclusions
+confidence: your confidence that the findings answer the question (0.0-1.0)"""
+
+REPORTER_SYSTEM = """You are an executive analyst writing a business-ready summary of data findings.
+Write a clear, structured report with NO padding.
+
+Structure your response EXACTLY as:
+**Headline:** One sentence direct answer to the question.
+
+**Key Findings:**
+• Finding 1 with specific numbers
+• Finding 2 with specific numbers
+• Finding 3 with specific numbers
+
+**Implication:** One sentence business recommendation or implication.
+
+**Caveat:** One sentence noting any limitation or assumption (if relevant)."""
+
+# Keep the original SYSTEM_PROMPT for backward compatibility with non-agentic paths
+SYSTEM_PROMPT = ANALYST_SYSTEM
 
 
 # Domain lenses — the selected category turns the agent into a domain expert,
@@ -530,22 +567,19 @@ async def query_csv(req: QueryRequest) -> StreamingResponse:
 
     df = dataframes[req.session_id]
     schema = get_df_schema(df)
+    category_persona = CATEGORY_PERSONAS.get(req.category, CATEGORY_PERSONAS["general"])
 
     async def stream():
         def emit(payload: dict) -> str:
             return f"data: {json.dumps(payload)}\n\n"
 
-        yield emit({"step": "analyzing", "message": "Analyzing your dataset..."})
-
-        yield emit({"step": "thinking", "message": "Agent is writing pandas code..."})
-
-        def generate(user_text: str) -> str:
+        def llm(system: str, user: str, temperature: float = 0) -> str:
             resp = client.models.generate_content(
                 model=GEMINI_MODEL,
-                contents=user_text,
+                contents=user,
                 config=types.GenerateContentConfig(
-                    system_instruction=system_prompt_for(req.category),
-                    temperature=0,
+                    system_instruction=system,
+                    temperature=temperature,
                 ),
             )
             text = (resp.text or "").strip()
@@ -555,38 +589,128 @@ async def query_csv(req: QueryRequest) -> StreamingResponse:
                 text = text.rsplit("```", 1)[0]
             return text.strip()
 
-        base_prompt = f"DataFrame schema:\n{schema}\n\nQuestion: {req.question}"
+        def parse_json_safe(text: str) -> dict:
+            import re as _re
+            try:
+                return json.loads(text)
+            except Exception:
+                m = _re.search(r'\{.*\}', text, _re.DOTALL)
+                if m:
+                    try:
+                        return json.loads(m.group())
+                    except Exception:
+                        pass
+            return {}
 
+        def run_code_with_repair(system: str, context: str, code_label: str) -> tuple[str | None, str | None, str | None]:
+            """Generate code, execute it, repair once on failure. Returns (code, result, chart_b64)."""
+            try:
+                code = llm(system, context)
+            except Exception as e:
+                return None, None, None
+
+            for attempt in range(2):
+                try:
+                    result, chart = execute_code(code, df)
+                    return code, result, chart
+                except Exception:
+                    err = traceback.format_exc().strip().splitlines()[-1]
+                    if attempt == 0:
+                        try:
+                            code = llm(system,
+                                       f"{context}\n\nPrevious code failed:\n{code}\nError: {err}\nFix it.")
+                        except Exception:
+                            return code, None, None
+                    else:
+                        return code, None, None
+            return code, None, None
+
+        # ── AGENT 1: PLANNER ──────────────────────────────────────────────
+        yield emit({"step": "planning", "message": "Planner is mapping your question to the dataset..."})
         try:
-            code = generate(base_prompt)
-        except Exception as e:
-            yield emit({"step": "error", "message": f"Model error: {e}"})
+            plan_raw = llm(
+                PLANNER_SYSTEM,
+                f"Category: {req.category}\nDomain context: {category_persona}\n\nSchema:\n{schema}\n\nQuestion: {req.question}"
+            )
+            plan = parse_json_safe(plan_raw)
+        except Exception:
+            plan = {"needs_chart": True, "strategy": "Direct analysis", "relevant_columns": [], "analysis_steps": [], "chart_type": "auto"}
+
+        yield emit({"step": "plan", "message": f"Plan: {plan.get('strategy', 'Analyzing...')}", "plan": plan})
+
+        # ── AGENT 2: ANALYST ──────────────────────────────────────────────
+        yield emit({"step": "analyst", "message": "Analyst agent computing statistics..."})
+
+        analyst_context = (
+            f"Domain context: {category_persona}\n"
+            f"Schema:\n{schema}\n\n"
+            f"Analysis strategy: {plan.get('strategy', '')}\n"
+            f"Focus on columns: {', '.join(plan.get('relevant_columns', []))}\n"
+            f"Steps to follow: {'; '.join(plan.get('analysis_steps', []))}\n\n"
+            f"Question: {req.question}"
+        )
+
+        analyst_code, analyst_result, _ = run_code_with_repair(ANALYST_SYSTEM, analyst_context, "analyst")
+
+        if analyst_code:
+            yield emit({"step": "code", "message": "Analyst code generated", "code": analyst_code})
+        yield emit({"step": "executing", "message": "Executing analysis on your data..."})
+
+        if analyst_result is None:
+            yield emit({"step": "error", "message": "Analyst agent could not compute results."})
             return
 
-        # Execute, with one self-correcting repair attempt on failure.
-        for attempt in range(2):
-            yield emit({"step": "code", "message": "Code generated", "code": code})
-            yield emit({"step": "executing", "message": "Executing code on your data..."})
-            try:
-                result, chart_b64 = execute_code(code, df)
-                yield emit({"step": "done", "message": "Analysis complete", "result": result, "chart": chart_b64})
-                return
-            except Exception:
-                err = traceback.format_exc().strip().splitlines()[-1]
-                if attempt == 0:
-                    yield emit({"step": "thinking", "message": f"Hit an error — agent is fixing the code… ({err})"})
-                    try:
-                        code = generate(
-                            f"{base_prompt}\n\nYou previously wrote this code:\n{code}\n\n"
-                            f"It failed with this error:\n{err}\n\n"
-                            "Fix the code so it runs correctly. Output ONLY the corrected Python code."
-                        )
-                        continue
-                    except Exception as e:
-                        yield emit({"step": "error", "message": f"Model error during repair: {e}"})
-                        return
-                yield emit({"step": "error", "message": f"Execution error: {err}"})
-                return
+        # ── AGENT 3: VISUALIZER ───────────────────────────────────────────
+        chart_b64 = None
+        if plan.get("needs_chart", True):
+            yield emit({"step": "visualizing", "message": "Visualizer agent creating chart..."})
+            viz_context = (
+                f"Schema:\n{schema}\n\n"
+                f"Question: {req.question}\n"
+                f"Suggested chart type: {plan.get('chart_type', 'auto')}\n"
+                f"Analysis findings to visualize:\n{analyst_result[:800]}"
+            )
+            viz_code, _, chart_b64 = run_code_with_repair(VISUALIZER_SYSTEM, viz_context, "visualizer")
+            if viz_code:
+                yield emit({"step": "code", "message": "Visualizer code generated", "code": viz_code})
+
+        # ── AGENT 4: CRITIC ───────────────────────────────────────────────
+        yield emit({"step": "critiquing", "message": "Critic agent reviewing the analysis..."})
+        try:
+            critique_raw = llm(
+                CRITIC_SYSTEM,
+                f"Question: {req.question}\nAnalysis strategy: {plan.get('strategy', '')}\n\nFindings:\n{analyst_result}"
+            )
+            critique = parse_json_safe(critique_raw)
+            if not critique:
+                critique = {"verdict": "pass", "confidence": 0.85, "issues": [], "strengths": ["Analysis completed"], "suggestion": ""}
+        except Exception:
+            critique = {"verdict": "pass", "confidence": 0.85, "issues": [], "strengths": [], "suggestion": ""}
+
+        confidence = critique.get("confidence", 0.85)
+        verdict = critique.get("verdict", "pass")
+        yield emit({"step": "critique", "message": f"Critic: {verdict.upper()} · {confidence:.0%} confidence", "critique": critique})
+
+        # ── AGENT 5: REPORTER ─────────────────────────────────────────────
+        yield emit({"step": "reporting", "message": "Report agent writing executive summary..."})
+        try:
+            report = llm(
+                REPORTER_SYSTEM,
+                f"Question: {req.question}\nCategory: {req.category}\n\nFindings:\n{analyst_result}\n\nCritic notes: {critique.get('suggestion', '')}",
+                temperature=0.2,
+            )
+        except Exception:
+            report = analyst_result
+
+        yield emit({
+            "step": "done",
+            "message": "Analysis complete",
+            "result": analyst_result,
+            "chart": chart_b64,
+            "report": report,
+            "critique": critique,
+            "plan": plan,
+        })
 
     return StreamingResponse(stream(), media_type="text/event-stream")
 

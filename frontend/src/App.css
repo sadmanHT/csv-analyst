@@ -485,6 +485,70 @@ pre {
   animation: popIn 0.4s cubic-bezier(.2,.8,.2,1); box-shadow: var(--sh);
 }
 
+/* ── Plan badge ──────────────────────────────────────────────── */
+.plan-badge {
+  margin: 10px 0 6px;
+  border: 1px solid #DDD6FE; border-radius: var(--r);
+  overflow: hidden; animation: fadeIn 0.3s ease;
+}
+.plan-toggle {
+  width: 100%; display: flex; align-items: center; justify-content: space-between;
+  background: #F5F3FF; border: none; padding: 9px 13px;
+  font-size: 12.5px; font-weight: 600; color: #5B21B6; font-family: inherit;
+  cursor: pointer; text-align: left; gap: 8px;
+}
+.plan-toggle:hover { background: #EDE9FE; }
+.plan-arrow { font-size: 10px; opacity: 0.7; margin-left: auto; }
+.plan-detail { padding: 10px 13px 12px; background: #FAFAF9; }
+.plan-steps { margin: 0 0 8px 16px; padding: 0; font-size: 12px; color: var(--text-soft); line-height: 1.7; }
+.plan-cols { display: flex; flex-wrap: wrap; gap: 5px; align-items: center; font-size: 11px; color: var(--text-faint); }
+.plan-col {
+  background: var(--primary-soft); color: var(--primary);
+  padding: 2px 7px; border-radius: 5px; font-weight: 600; font-size: 11px;
+}
+
+/* ── Critique badge ──────────────────────────────────────────── */
+.critique-badge {
+  margin-top: 12px; padding: 12px 14px;
+  background: var(--vbg, #F0FDF4); border: 1px solid var(--vborder, #BBF7D0);
+  border-radius: var(--r); animation: popIn 0.3s ease;
+}
+.cb-verdict {
+  font-size: 11px; font-weight: 800; letter-spacing: 0.08em;
+  color: var(--vcolor, #10B981); display: flex; align-items: center; gap: 8px; margin-bottom: 6px;
+}
+.cb-conf {
+  font-size: 11px; font-weight: 500; letter-spacing: 0; color: var(--text-muted);
+  background: rgba(0,0,0,0.05); padding: 1px 6px; border-radius: 4px;
+}
+.cb-list { margin: 4px 0 4px 14px; padding: 0; font-size: 12px; line-height: 1.6; }
+.cb-issues li { color: #DC2626; }
+.cb-strengths li { color: #065F46; }
+.cb-suggestion {
+  margin: 8px 0 0; font-size: 12px; color: var(--text-soft);
+  padding: 7px 10px; background: rgba(0,0,0,0.04); border-radius: 7px;
+}
+
+/* ── Report section ──────────────────────────────────────────── */
+.report-section {
+  margin-top: 14px; border: 1px solid #D1FAE5;
+  border-radius: var(--r); overflow: hidden;
+  animation: popIn 0.4s cubic-bezier(.2,.8,.2,1);
+}
+.report-label {
+  display: flex; align-items: center; gap: 6px;
+  background: #ECFDF5; padding: 8px 14px;
+  font-size: 11px; font-weight: 700; text-transform: uppercase;
+  letter-spacing: 0.07em; color: #065F46;
+}
+.report-label svg { color: #10B981; }
+.report-body {
+  padding: 14px 16px; font-size: 13.5px; line-height: 1.75;
+  color: var(--text); white-space: pre-wrap; word-break: break-word;
+  background: #fff;
+}
+.report-body strong, .report-body b { color: var(--text); font-weight: 700; }
+
 /* ── Instant overview dashboard (empty state with charts) ──── */
 .overview-scroll {
   flex: 1; overflow-y: auto;
