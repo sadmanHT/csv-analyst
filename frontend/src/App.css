@@ -194,6 +194,42 @@
 .modal-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 14px; margin-bottom: 16px; }
 .modal-head h3 { font-size: 18px; font-weight: 700; letter-spacing: -0.4px; }
 .modal-head p { font-size: 13px; color: var(--text-muted); margin-top: 3px; }
+
+/* ── Benchmark modal ─────────────────────────────────────────── */
+.bm-modal { width: 860px; max-height: 85vh; overflow-y: auto; }
+.bm-config {
+  display: flex; align-items: center; gap: 12px;
+  padding: 14px 0; border-bottom: 1px solid var(--border); margin-bottom: 16px;
+}
+.bm-n-label { font-size: 13px; font-weight: 600; color: var(--text-soft); white-space: nowrap; }
+.bm-config input[type=range] { flex: 1; accent-color: var(--primary); }
+.bm-n-val { font-size: 13px; font-weight: 700; color: var(--primary); min-width: 28px; }
+.bm-progress { font-size: 13px; color: var(--text-muted); padding: 12px 0; font-style: italic; }
+.bm-metrics {
+  display: flex; gap: 14px; margin-bottom: 18px; flex-wrap: wrap;
+}
+.bm-metric {
+  flex: 1; min-width: 90px; text-align: center;
+  background: var(--inset); border: 1px solid var(--border);
+  border-radius: var(--r); padding: 14px 10px;
+}
+.bm-pct { font-size: 24px; font-weight: 800; letter-spacing: -0.5px; margin-bottom: 4px; }
+.bm-mlabel { font-size: 11px; font-weight: 600; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.05em; }
+.bm-table-wrap { overflow-x: auto; border-radius: var(--r); border: 1px solid var(--border); }
+.bm-table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+.bm-table th {
+  background: var(--inset); padding: 9px 10px; text-align: left;
+  font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em;
+  color: var(--text-muted); border-bottom: 1px solid var(--border); white-space: nowrap;
+}
+.bm-table td { padding: 8px 10px; border-bottom: 1px solid var(--border-lt); vertical-align: middle; }
+.bm-table tr:last-child td { border-bottom: none; }
+.bm-table tr.bm-fail { background: #FFF5F5; }
+.bm-table tr:hover td { background: var(--inset); }
+.bm-cat { font-size: 11px; font-weight: 600; color: var(--primary); background: var(--primary-soft); padding: 2px 6px; border-radius: 4px; }
+.bm-q { max-width: 320px; color: var(--text-soft); font-size: 12px; }
+.bm-repaired { color: var(--warning); font-size: 11px; font-weight: 600; }
+.benchmark-card { background: linear-gradient(180deg, #fff, #F0F4FF); border-color: #C7D2FE; }
 .paste-area {
   width: 100%; min-height: 200px; resize: vertical;
   background: var(--inset); border: 1px solid var(--border); border-radius: var(--r);

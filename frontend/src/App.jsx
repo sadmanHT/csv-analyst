@@ -507,7 +507,101 @@ function PredictInputCard({ sessionId, modelInfo }) {
   )
 }
 
-function InsightsPanel({ upload, category, onAsk, onPredict, onOpenPaste, modelInfo, loading }) {
+function BenchmarkModal({ sessionId, onClose }) {
+  const [n, setN] = useState(10)
+  const [running, setRunning] = useState(false)
+  const [data, setData] = useState(null)
+  const [error, setError] = useState(null)
+
+  const run = async () => {
+    setRunning(true); setData(null); setError(null)
+    try {
+      const res = await fetch(`/benchmark/${sessionId}?n=${n}`)
+      const json = await res.json()
+      if (!res.ok) throw new Error(json.detail || 'Benchmark failed')
+      setData(json)
+    } catch (e) {
+      setError(e.message)
+    } finally {
+      setRunning(false)
+    }
+  }
+
+  const pct = (v) => `${Math.round(v * 100)}%`
+  const color = (v) => v >= 0.85 ? '#10B981' : v >= 0.65 ? '#F59E0B' : '#EF4444'
+
+  return (
+    <div className="modal-overlay" onClick={() => !running && onClose()}>
+      <div className="modal bm-modal" onClick={e => e.stopPropagation()}>
+        <div className="modal-head">
+          <div>
+            <h3>🏆 Benchmark Evaluation</h3>
+            <p>Run a suite of analytics questions and measure system performance.</p>
+          </div>
+          <button className="icon-btn" onClick={onClose} disabled={running}><X width={16} height={16} /></button>
+        </div>
+
+        <div className="bm-config">
+          <label className="bm-n-label">Questions to run:</label>
+          <input type="range" min={5} max={50} step={5} value={n}
+            onChange={e => setN(+e.target.value)} disabled={running} />
+          <span className="bm-n-val">{n}</span>
+          <button className="paste-submit" onClick={run} disabled={running}>
+            {running ? <><span className="spinner" /> Running…</> : '▶ Run benchmark'}
+          </button>
+        </div>
+
+        {running && <div className="bm-progress">Running {n} questions through the multi-agent pipeline… this may take a few minutes.</div>}
+        {error && <p style={{color:'#EF4444', fontSize:13, margin:'12px 0'}}>{error}</p>}
+
+        {data && (
+          <>
+            <div className="bm-metrics">
+              {[
+                { label: 'Success Rate',     v: data.success_rate },
+                { label: 'Chart Rate',       v: data.chart_rate },
+                { label: 'SQL Routing',      v: data.sql_routing_accuracy },
+                { label: 'Repair Success',   v: data.repair_success_rate },
+              ].map(m => (
+                <div key={m.label} className="bm-metric">
+                  <div className="bm-pct" style={{ color: color(m.v) }}>{pct(m.v)}</div>
+                  <div className="bm-mlabel">{m.label}</div>
+                </div>
+              ))}
+              <div className="bm-metric">
+                <div className="bm-pct" style={{ color: '#4F46E5' }}>{data.avg_time_s}s</div>
+                <div className="bm-mlabel">Avg Time</div>
+              </div>
+            </div>
+
+            <div className="bm-table-wrap">
+              <table className="bm-table">
+                <thead><tr>
+                  <th>#</th><th>Category</th><th>Engine</th><th>Chart</th><th>OK</th><th>Time</th><th>Question</th>
+                </tr></thead>
+                <tbody>
+                  {data.results.map((r, i) => (
+                    <tr key={i} className={r.success ? '' : 'bm-fail'}>
+                      <td>{i + 1}</td>
+                      <td><span className="bm-cat">{r.category}</span></td>
+                      <td><span className={`code-lang-badge ${r.query_type === 'sql' ? 'sql' : 'py'}`}>{r.query_type === 'sql' ? 'SQL' : 'py'}</span></td>
+                      <td style={{textAlign:'center'}}>{r.has_chart ? '✓' : r.expects_chart ? '·' : ''}</td>
+                      <td style={{textAlign:'center', color: r.success ? '#10B981' : '#EF4444', fontWeight:700}}>{r.success ? '✓' : '✗'}</td>
+                      <td style={{textAlign:'right', fontVariantNumeric:'tabular-nums'}}>{r.time_s}s</td>
+                      <td className="bm-q">{r.question}{r.used_repair ? <span className="bm-repaired"> (repaired)</span> : ''}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </>
+        )}
+      </div>
+    </div>
+  )
+}
+
+function InsightsPanel({ upload, category, onAsk, onPredict, onOpenPaste, onOpenBenchmark, modelInfo, loading }) {
   const cat = catByKey(category)
   const numericCols = Object.keys(upload.numeric_stats || {})
   const [statCol, setStatCol] = useState(numericCols[0] || '')
@@ -592,6 +686,14 @@ function InsightsPanel({ upload, category, onAsk, onPredict, onOpenPaste, modelI
       {modelInfo?.trained && (
         <PredictInputCard sessionId={upload.session_id} modelInfo={modelInfo} />
       )}
+
+      <div className="insight-card benchmark-card">
+        <div className="ic-head">🏆 Benchmark</div>
+        <p className="predict-hint">Evaluate the system with a suite of analytics questions and measure accuracy, chart rate, SQL routing, and response time.</p>
+        <button className="custom-btn" disabled={loading} onClick={() => onOpenBenchmark()}>
+          ▶ Run evaluation benchmark
+        </button>
+      </div>
 
       <div className="insight-card">
         <div className="ic-head"><cat.icon width={15} height={15} /> {cat.label} Analyses</div>
@@ -897,6 +999,7 @@ export default function App() {
   const [question, setQuestion] = useState('')
   const [loading, setLoading] = useState(false)
   const [showPaste, setShowPaste] = useState(false)
+  const [showBenchmark, setShowBenchmark] = useState(false)
   const [modelInfo, setModelInfo] = useState(null)
   const [docs, setDocs] = useState([])
   const inputRef = useRef()
@@ -1047,6 +1150,7 @@ export default function App() {
             onAsk={ask}
             onPredict={predict}
             onOpenPaste={() => setShowPaste(true)}
+            onOpenBenchmark={() => setShowBenchmark(true)}
             modelInfo={modelInfo}
             loading={loading}
           />
@@ -1055,6 +1159,10 @@ export default function App() {
 
       {showPaste && (
         <PasteModal uploading={uploading} onClose={() => setShowPaste(false)} onSubmit={handlePasteSubmit} />
+      )}
+
+      {showBenchmark && upload && (
+        <BenchmarkModal sessionId={upload.session_id} onClose={() => setShowBenchmark(false)} />
       )}
     </div>
   )

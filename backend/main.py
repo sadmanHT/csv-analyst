@@ -1089,3 +1089,224 @@ def predict_input(req: PredictInputRequest) -> dict:
                 "confidence": round(proba, 3), "is_classification": True}
     return {"target": info["target"], "prediction": round(float(pred), 2),
             "confidence": None, "is_classification": False}
+
+
+# ── Benchmark evaluation framework ───────────────────────────────────────────
+
+BENCHMARK_QUESTIONS = [
+    # ── General statistics ────────────────────────────────────────────────
+    {"question": "What are the summary statistics for all numeric columns?",            "category": "general",   "expects_chart": False, "expects_sql": False},
+    {"question": "How many rows and columns does the dataset have?",                    "category": "general",   "expects_chart": False, "expects_sql": True},
+    {"question": "Show a correlation heatmap of all numeric columns",                   "category": "general",   "expects_chart": True,  "expects_sql": False},
+    {"question": "Plot the distribution of the first numeric column",                   "category": "general",   "expects_chart": True,  "expects_sql": False},
+    {"question": "Show a bar chart of the top categories by count",                     "category": "general",   "expects_chart": True,  "expects_sql": True},
+    {"question": "What percentage of values are missing in each column?",               "category": "general",   "expects_chart": False, "expects_sql": False},
+    {"question": "Are there any duplicate rows?",                                       "category": "general",   "expects_chart": False, "expects_sql": True},
+    {"question": "Show a box plot of all numeric columns to detect outliers",           "category": "general",   "expects_chart": True,  "expects_sql": False},
+    # ── SQL-type (filter / group-by / top-N) ─────────────────────────────
+    {"question": "Show the top 10 rows sorted by the highest numeric column",           "category": "general",   "expects_chart": False, "expects_sql": True},
+    {"question": "Count records in each category and sort by count descending",         "category": "general",   "expects_chart": False, "expects_sql": True},
+    {"question": "What is the average of each numeric column grouped by the main category?", "category": "general", "expects_chart": False, "expects_sql": True},
+    {"question": "Show all records where the first numeric column is above its average","category": "general",   "expects_chart": False, "expects_sql": True},
+    {"question": "What are the top 5 categories by total of the main numeric column?",  "category": "general",   "expects_chart": False, "expects_sql": True},
+    # ── Financial ─────────────────────────────────────────────────────────
+    {"question": "What is the total revenue?",                                          "category": "financial", "expects_chart": False, "expects_sql": True},
+    {"question": "Show total revenue by category sorted descending as a bar chart",     "category": "financial", "expects_chart": True,  "expects_sql": True},
+    {"question": "Calculate mean, standard deviation and CV of the main numeric metric","category": "financial", "expects_chart": False, "expects_sql": False},
+    {"question": "What are the top 5 items by revenue? Show a bar chart",               "category": "financial", "expects_chart": True,  "expects_sql": True},
+    {"question": "Plot total revenue over time as a line chart",                        "category": "financial", "expects_chart": True,  "expects_sql": False},
+    {"question": "What is the period-over-period growth rate of the main metric?",      "category": "financial", "expects_chart": True,  "expects_sql": False},
+    # ── Retail ────────────────────────────────────────────────────────────
+    {"question": "Which product or category has the highest total sales?",              "category": "retail",    "expects_chart": False, "expects_sql": True},
+    {"question": "Show a bar chart of revenue by region or segment",                    "category": "retail",    "expects_chart": True,  "expects_sql": True},
+    {"question": "What is the average order value?",                                    "category": "retail",    "expects_chart": False, "expects_sql": True},
+    {"question": "Show a scatter plot of quantity vs revenue",                          "category": "retail",    "expects_chart": True,  "expects_sql": False},
+    {"question": "What percentage of total revenue does each category contribute?",     "category": "retail",    "expects_chart": True,  "expects_sql": False},
+    {"question": "Show the top 10 best-selling products by revenue as a bar chart",     "category": "retail",    "expects_chart": True,  "expects_sql": True},
+    # ── Marketing ─────────────────────────────────────────────────────────
+    {"question": "Break down totals by each categorical column",                        "category": "marketing", "expects_chart": True,  "expects_sql": True},
+    {"question": "Which segment or channel performs best by total metric?",             "category": "marketing", "expects_chart": True,  "expects_sql": True},
+    {"question": "Show the share of each category as a pie or bar chart",               "category": "marketing", "expects_chart": True,  "expects_sql": False},
+    {"question": "Compare the mean numeric values across segments with a bar chart",    "category": "marketing", "expects_chart": True,  "expects_sql": False},
+    # ── HR ────────────────────────────────────────────────────────────────
+    {"question": "Show the headcount by department or category as a bar chart",         "category": "hr",        "expects_chart": True,  "expects_sql": True},
+    {"question": "Plot the distribution of the main numeric column across the dataset", "category": "hr",        "expects_chart": True,  "expects_sql": False},
+    {"question": "Compare the mean of each numeric feature between groups",             "category": "hr",        "expects_chart": True,  "expects_sql": False},
+    {"question": "What is the average of the main numeric column by group?",            "category": "hr",        "expects_chart": False, "expects_sql": True},
+    # ── Correlation & statistics ──────────────────────────────────────────
+    {"question": "Which two columns are most strongly correlated?",                     "category": "general",   "expects_chart": True,  "expects_sql": False},
+    {"question": "Show the covariance matrix of numeric columns",                       "category": "general",   "expects_chart": False, "expects_sql": False},
+    {"question": "What is the skewness and kurtosis of each numeric column?",           "category": "general",   "expects_chart": False, "expects_sql": False},
+    {"question": "Are there significant differences in means between groups? Show statistical test", "category": "general", "expects_chart": False, "expects_sql": False},
+    # ── Time series ───────────────────────────────────────────────────────
+    {"question": "Plot the trend of the main numeric column over time",                 "category": "financial", "expects_chart": True,  "expects_sql": False},
+    {"question": "Show a monthly or yearly breakdown of the main metric",               "category": "financial", "expects_chart": True,  "expects_sql": True},
+    # ── Edge cases ────────────────────────────────────────────────────────
+    {"question": "Show me something interesting about this data",                       "category": "general",   "expects_chart": True,  "expects_sql": False},
+    {"question": "What story does this dataset tell?",                                  "category": "general",   "expects_chart": False, "expects_sql": False},
+    {"question": "Identify the most important pattern or anomaly in this data",         "category": "general",   "expects_chart": True,  "expects_sql": False},
+    # ── Medical ───────────────────────────────────────────────────────────
+    {"question": "Which features correlate most with the outcome variable?",            "category": "medical",   "expects_chart": True,  "expects_sql": False},
+    {"question": "Compare the mean of each numeric feature between outcome groups",     "category": "medical",   "expects_chart": True,  "expects_sql": False},
+    {"question": "Show the distribution of age split by outcome group",                 "category": "medical",   "expects_chart": True,  "expects_sql": False},
+    {"question": "What is the prevalence of each outcome class?",                       "category": "medical",   "expects_chart": True,  "expects_sql": True},
+    {"question": "Show a violin plot comparing groups on the main clinical metric",     "category": "medical",   "expects_chart": True,  "expects_sql": False},
+    # ── Multi-step ────────────────────────────────────────────────────────
+    {"question": "Rank all categories by revenue, show top 5 and bottom 5",            "category": "retail",    "expects_chart": True,  "expects_sql": True},
+    {"question": "Calculate the Pareto principle: what top % of categories drive 80% of the main metric?", "category": "financial", "expects_chart": True, "expects_sql": False},
+]
+
+
+def _run_agent_pipeline_sync(df: pd.DataFrame, schema: str, question: str,
+                              category: str, doc_store=None) -> dict:
+    """Non-streaming pipeline runner for benchmarking. Returns metrics dict."""
+    import time, re as _re
+
+    t0 = time.time()
+    category_persona = CATEGORY_PERSONAS.get(category, CATEGORY_PERSONAS["general"])
+
+    def _llm(system: str, user: str, temperature: float = 0) -> str:
+        resp = client.models.generate_content(
+            model=GEMINI_MODEL, contents=user,
+            config=types.GenerateContentConfig(system_instruction=system, temperature=temperature),
+        )
+        text = (resp.text or "").strip()
+        if text.startswith("```"): text = text.split("\n", 1)[1]
+        if "```" in text: text = text.rsplit("```", 1)[0]
+        return text.strip()
+
+    def _parse_json(text: str) -> dict:
+        try: return json.loads(text)
+        except Exception:
+            m = _re.search(r'\{.*\}', text, _re.DOTALL)
+            if m:
+                try: return json.loads(m.group())
+                except: pass
+        return {}
+
+    # RAG context
+    rag_block = ""
+    if doc_store and doc_store.chunks:
+        hits = doc_store.search(question, top_k=3)
+        if hits:
+            rag_block = "\n\nRELEVANT DOCUMENTATION:\n" + "\n\n".join(
+                f"[Source: {h['filename']}]\n{h['text']}" for h in hits
+            )
+
+    # Agent 1: Planner
+    used_repair = False
+    try:
+        plan = _parse_json(_llm(PLANNER_SYSTEM,
+            f"Category: {category}\nDomain context: {category_persona}\n\nSchema:\n{schema}{rag_block}\n\nQuestion: {question}"))
+    except Exception:
+        plan = {"needs_chart": True, "strategy": "Direct", "relevant_columns": [],
+                "analysis_steps": [], "chart_type": "auto", "query_type": "pandas"}
+
+    query_type = plan.get("query_type", "pandas")
+    analyst_result = None
+
+    # Agent 2: Analyst or SQL
+    if query_type == "sql":
+        sql_schema = get_sql_schema(df)
+        sql_ctx = (f"Domain context: {category_persona}\nSchema:\n{sql_schema}\n"
+                   f"Strategy: {plan.get('strategy', '')}\nQuestion: {question}")
+        try:
+            sql = _llm(SQL_ANALYST_SYSTEM, sql_ctx).strip()
+            try:
+                analyst_result = execute_sql(sql, df)
+            except Exception as e:
+                used_repair = True
+                sql = _llm(SQL_ANALYST_SYSTEM, f"{sql_ctx}\n\nFailed:\n{sql}\nError: {e}\nFix it.")
+                try: analyst_result = execute_sql(sql, df)
+                except: analyst_result = None
+        except Exception:
+            analyst_result = None
+    else:
+        analyst_ctx = (f"Domain context: {category_persona}\nSchema:\n{schema}\n"
+                       f"Strategy: {plan.get('strategy', '')}\nFocus: {', '.join(plan.get('relevant_columns', []))}\n"
+                       f"Question: {question}")
+        try:
+            code = _llm(ANALYST_SYSTEM, analyst_ctx)
+            try:
+                analyst_result, _, __ = execute_code(code, df)
+            except Exception as e:
+                used_repair = True
+                code = _llm(ANALYST_SYSTEM, f"{analyst_ctx}\n\nFailed:\n{code}\nError: {e}\nFix it.")
+                try: analyst_result, _, __ = execute_code(code, df)
+                except: analyst_result = None
+        except Exception:
+            analyst_result = None
+
+    # Agent 3: Visualizer
+    has_chart = False
+    if plan.get("needs_chart", True) and analyst_result:
+        viz_ctx = (f"Schema:\n{schema}\nQuestion: {question}\n"
+                   f"Chart type: {plan.get('chart_type', 'auto')}\n"
+                   f"Findings:\n{(analyst_result or '')[:500]}")
+        try:
+            viz_code = _llm(VISUALIZER_SYSTEM, viz_ctx)
+            try:
+                _, __, chart_json = execute_code(viz_code, df)
+                has_chart = chart_json is not None
+            except Exception as e:
+                viz_code = _llm(VISUALIZER_SYSTEM, f"{viz_ctx}\n\nFailed:\n{viz_code}\nError: {e}\nFix it.")
+                try:
+                    _, __, chart_json = execute_code(viz_code, df)
+                    has_chart = chart_json is not None
+                except: pass
+        except Exception:
+            pass
+
+    elapsed = round(time.time() - t0, 2)
+    return {
+        "success":     analyst_result is not None,
+        "has_chart":   has_chart,
+        "query_type":  query_type,
+        "used_repair": used_repair,
+        "time_s":      elapsed,
+    }
+
+
+@app.get("/benchmark/{session_id}")
+async def run_benchmark(session_id: str, n: int = 15) -> dict:
+    """Run up to n benchmark questions against the uploaded dataset and return metrics."""
+    if session_id not in dataframes:
+        raise HTTPException(status_code=404, detail="Session not found. Upload a CSV first.")
+
+    df      = dataframes[session_id]
+    schema  = get_df_schema(df)
+    store   = doc_stores.get(session_id)
+    n       = min(n, len(BENCHMARK_QUESTIONS))
+    suite   = BENCHMARK_QUESTIONS[:n]
+
+    results = []
+    for bq in suite:
+        m = _run_agent_pipeline_sync(df, schema, bq["question"], bq["category"], store)
+        results.append({
+            "question":      bq["question"],
+            "category":      bq["category"],
+            "expects_chart": bq["expects_chart"],
+            "expects_sql":   bq["expects_sql"],
+            **m,
+        })
+
+    total          = len(results)
+    n_success      = sum(1 for r in results if r["success"])
+    n_chart_exp    = sum(1 for r in results if r["expects_chart"])
+    n_chart_got    = sum(1 for r in results if r["expects_chart"] and r["has_chart"])
+    n_sql_exp      = sum(1 for r in results if r["expects_sql"])
+    n_sql_routed   = sum(1 for r in results if r["expects_sql"] and r["query_type"] == "sql")
+    n_repair       = sum(1 for r in results if r["used_repair"])
+    n_repair_ok    = sum(1 for r in results if r["used_repair"] and r["success"])
+    avg_time       = round(sum(r["time_s"] for r in results) / total, 2) if total else 0
+
+    return {
+        "total":                 total,
+        "success_rate":          round(n_success / total, 3),
+        "chart_rate":            round(n_chart_got / max(1, n_chart_exp), 3),
+        "sql_routing_accuracy":  round(n_sql_routed / max(1, n_sql_exp), 3),
+        "repair_rate":           round(n_repair / total, 3),
+        "repair_success_rate":   round(n_repair_ok / max(1, n_repair), 3),
+        "avg_time_s":            avg_time,
+        "results":               results,
+    }
