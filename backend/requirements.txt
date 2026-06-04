@@ -16,3 +16,6 @@ pypdf
 openpyxl
 shap
 plotly
+kaleido
+reportlab
+python-pptx

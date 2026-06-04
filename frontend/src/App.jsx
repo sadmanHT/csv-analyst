@@ -601,7 +601,65 @@ function BenchmarkModal({ sessionId, onClose }) {
   )
 }
 
-function InsightsPanel({ upload, category, onAsk, onPredict, onOpenPaste, onOpenBenchmark, modelInfo, loading }) {
+function ExportCard({ upload, messages, category }) {
+  const [busy, setBusy] = useState(null) // 'pdf' | 'pptx' | null
+
+  const exportReport = async (format) => {
+    setBusy(format)
+    try {
+      const body = {
+        messages: messages.map(m => ({
+          question:  m.question,
+          report:    m.report,
+          result:    m.result,
+          chart:     m.chart,
+          chart_json: m.chart_json,
+          shap_chart: m.shap_chart,
+          critique:  m.critique,
+          code:      m.code,
+          code_lang: m.code_lang,
+        })),
+        category,
+        filename: upload.filename.replace('.csv', ''),
+      }
+      const res = await fetch(`/report/${upload.session_id}?format=${format}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      })
+      if (!res.ok) { const e = await res.json(); throw new Error(e.detail || 'Export failed') }
+      const blob = await res.blob()
+      const url  = URL.createObjectURL(blob)
+      const a    = document.createElement('a')
+      a.href     = url
+      a.download = `${upload.filename.replace('.csv', '')}_report.${format}`
+      a.click()
+      URL.revokeObjectURL(url)
+    } catch (e) {
+      alert(e.message)
+    } finally {
+      setBusy(null)
+    }
+  }
+
+  return (
+    <div className="insight-card export-card">
+      <div className="ic-head">📄 Export Report</div>
+      <p className="predict-hint">Download the full analytics report with all charts, summaries, and insights.</p>
+      <div className="export-btns">
+        <button className="export-btn pdf" onClick={() => exportReport('pdf')} disabled={!!busy || messages.length === 0}>
+          {busy === 'pdf' ? <span className="spinner" style={{borderTopColor:'#EF4444',borderColor:'#FECACA'}} /> : '⬇ PDF'}
+        </button>
+        <button className="export-btn pptx" onClick={() => exportReport('pptx')} disabled={!!busy || messages.length === 0}>
+          {busy === 'pptx' ? <span className="spinner" style={{borderTopColor:'#F59E0B',borderColor:'#FDE68A'}} /> : '⬇ PPTX'}
+        </button>
+      </div>
+      {messages.length === 0 && <p className="predict-hint" style={{marginTop:4}}>Ask a question first to generate content for the report.</p>}
+    </div>
+  )
+}
+
+function InsightsPanel({ upload, category, onAsk, onPredict, onOpenPaste, onOpenBenchmark, modelInfo, loading, messages }) {
   const cat = catByKey(category)
   const numericCols = Object.keys(upload.numeric_stats || {})
   const [statCol, setStatCol] = useState(numericCols[0] || '')
@@ -694,6 +752,8 @@ function InsightsPanel({ upload, category, onAsk, onPredict, onOpenPaste, onOpen
           ▶ Run evaluation benchmark
         </button>
       </div>
+
+      <ExportCard upload={upload} messages={messages} category={category} />
 
       <div className="insight-card">
         <div className="ic-head"><cat.icon width={15} height={15} /> {cat.label} Analyses</div>
@@ -1154,6 +1214,7 @@ export default function App() {
             onOpenBenchmark={() => setShowBenchmark(true)}
             modelInfo={modelInfo}
             loading={loading}
+            messages={messages}
           />
         </div>
       )}

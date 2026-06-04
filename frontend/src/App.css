@@ -230,6 +230,22 @@
 .bm-q { max-width: 320px; color: var(--text-soft); font-size: 12px; }
 .bm-repaired { color: var(--warning); font-size: 11px; font-weight: 600; }
 .benchmark-card { background: linear-gradient(180deg, #fff, #F0F4FF); border-color: #C7D2FE; }
+
+/* ── Export card ─────────────────────────────────────────────── */
+.export-card { background: linear-gradient(180deg, #fff, #FFF7ED); border-color: #FED7AA; }
+.export-btns { display: flex; gap: 8px; }
+.export-btn {
+  flex: 1; padding: 10px 8px;
+  border: none; border-radius: 9px; cursor: pointer;
+  font-size: 13px; font-weight: 700; font-family: inherit;
+  display: flex; align-items: center; justify-content: center; gap: 5px;
+  transition: all .18s; box-shadow: var(--sh-sm);
+}
+.export-btn.pdf  { background: #EF4444; color: #fff; }
+.export-btn.pptx { background: #F59E0B; color: #fff; }
+.export-btn.pdf:hover:not(:disabled)  { background: #DC2626; transform: translateY(-1px); box-shadow: 0 4px 12px rgba(239,68,68,0.35); }
+.export-btn.pptx:hover:not(:disabled) { background: #D97706; transform: translateY(-1px); box-shadow: 0 4px 12px rgba(245,158,11,0.35); }
+.export-btn:disabled { opacity: .5; cursor: not-allowed; box-shadow: none; }
 .paste-area {
   width: 100%; min-height: 200px; resize: vertical;
   background: var(--inset); border: 1px solid var(--border); border-radius: var(--r);

@@ -15,6 +15,7 @@ export default defineConfig({
       '/upload_doc': 'http://localhost:8001',
       '/docs': 'http://localhost:8001',
       '/benchmark': 'http://localhost:8001',
+      '/report': 'http://localhost:8001',
       '/health': 'http://localhost:8001',
     }
   }
