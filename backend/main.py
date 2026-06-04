@@ -86,6 +86,92 @@ client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
 dataframes: dict[str, pd.DataFrame] = {}
 models: dict[str, dict] = {}  # session_id -> trained model info (for inference on new input)
 
+# ── RAG document store ────────────────────────────────────────────────────────
+
+EMBED_MODEL = "models/text-embedding-004"
+EMBED_DIM   = 768
+
+
+def _chunk_text(text: str, size: int = 600, overlap: int = 80) -> list[str]:
+    text = " ".join(text.split())
+    chunks, start = [], 0
+    while start < len(text):
+        chunks.append(text[start:start + size])
+        start += size - overlap
+    return [c for c in chunks if len(c.strip()) > 40]
+
+
+def _embed_batch(texts: list[str]) -> list[list[float]]:
+    """Embed a list of texts using Gemini text-embedding-004."""
+    results = []
+    for text in texts:
+        try:
+            resp = client.models.embed_content(model=EMBED_MODEL, contents=text)
+            results.append(list(resp.embeddings[0].values))
+        except Exception:
+            results.append([0.0] * EMBED_DIM)
+    return results
+
+
+def _parse_doc(content: bytes, filename: str) -> str:
+    ext = filename.rsplit(".", 1)[-1].lower()
+    if ext == "pdf":
+        try:
+            from pypdf import PdfReader
+            reader = PdfReader(io.BytesIO(content))
+            return "\n".join(p.extract_text() or "" for p in reader.pages)
+        except Exception as e:
+            raise ValueError(f"Could not parse PDF: {e}")
+    elif ext in ("xlsx", "xls"):
+        try:
+            df_doc = pd.read_excel(io.BytesIO(content))
+            return df_doc.to_string(index=False)
+        except Exception as e:
+            raise ValueError(f"Could not parse Excel: {e}")
+    elif ext in ("txt", "md", "rst", "csv"):
+        return content.decode("utf-8", errors="replace")
+    else:
+        raise ValueError(f"Unsupported file type: .{ext}. Use PDF, Excel, or text files.")
+
+
+class DocStore:
+    """Per-session in-memory vector store for RAG over uploaded documentation."""
+
+    def __init__(self):
+        self.chunks:    list[str]        = []
+        self.embeddings: list[list[float]] = []
+        self.metadata:  list[dict]       = []   # {filename, chunk_idx}
+        self.filenames: list[str]        = []
+
+    def add(self, text: str, filename: str) -> int:
+        chunks = _chunk_text(text)
+        embs   = _embed_batch(chunks)
+        for i, (c, e) in enumerate(zip(chunks, embs)):
+            self.chunks.append(c)
+            self.embeddings.append(e)
+            self.metadata.append({"filename": filename, "chunk_idx": i})
+        if filename not in self.filenames:
+            self.filenames.append(filename)
+        return len(chunks)
+
+    def search(self, query: str, top_k: int = 4) -> list[dict]:
+        if not self.embeddings:
+            return []
+        q = np.array(_embed_batch([query])[0], dtype=np.float32)
+        sims = [
+            float(np.dot(q, np.array(e, dtype=np.float32)) /
+                  (np.linalg.norm(q) * np.linalg.norm(e) + 1e-9))
+            for e in self.embeddings
+        ]
+        top_idx = sorted(range(len(sims)), key=lambda i: sims[i], reverse=True)[:top_k]
+        return [
+            {"text": self.chunks[i], "filename": self.metadata[i]["filename"], "score": round(sims[i], 3)}
+            for i in top_idx if sims[i] > 0.25
+        ]
+
+
+doc_stores: dict[str, DocStore] = {}
+
 
 class QueryRequest(BaseModel):
     session_id: str
@@ -560,6 +646,36 @@ async def upload_text(req: TextUploadRequest) -> dict:
     return register_dataframe(df, req.filename or "pasted_data.csv")
 
 
+@app.post("/upload_doc")
+async def upload_doc(session_id: str, file: UploadFile = File(...)) -> dict:
+    """Upload a PDF, Excel, or text file to enrich analysis with RAG context."""
+    if session_id not in dataframes:
+        raise HTTPException(status_code=404, detail="Upload a CSV first, then attach documents.")
+    content = await file.read()
+    try:
+        text = _parse_doc(content, file.filename)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    if not text.strip():
+        raise HTTPException(status_code=422, detail="Document appears to be empty.")
+    if session_id not in doc_stores:
+        doc_stores[session_id] = DocStore()
+    n_chunks = doc_stores[session_id].add(text, file.filename)
+    return {
+        "filename": file.filename,
+        "chunks_indexed": n_chunks,
+        "filenames": doc_stores[session_id].filenames,
+    }
+
+
+@app.get("/docs/{session_id}")
+def get_docs(session_id: str) -> dict:
+    store = doc_stores.get(session_id)
+    if not store:
+        return {"filenames": [], "chunks": 0}
+    return {"filenames": store.filenames, "chunks": len(store.chunks)}
+
+
 @app.post("/query")
 async def query_csv(req: QueryRequest) -> StreamingResponse:
     if req.session_id not in dataframes:
@@ -625,17 +741,33 @@ async def query_csv(req: QueryRequest) -> StreamingResponse:
                         return code, None, None
             return code, None, None
 
+        # ── RAG: retrieve context from uploaded documents ──────────────────
+        rag_context = ""
+        rag_sources: list[str] = []
+        store = doc_stores.get(req.session_id)
+        if store and store.chunks:
+            yield emit({"step": "analyzing", "message": f"Retrieving context from {len(store.filenames)} document(s)..."})
+            hits = store.search(req.question, top_k=4)
+            if hits:
+                rag_context = "\n\n".join(
+                    f"[Source: {h['filename']}]\n{h['text']}" for h in hits
+                )
+                rag_sources = list(dict.fromkeys(h["filename"] for h in hits))
+
+        rag_block = f"\n\nRELEVANT DOCUMENTATION:\n{rag_context}" if rag_context else ""
+
         # ── AGENT 1: PLANNER ──────────────────────────────────────────────
         yield emit({"step": "planning", "message": "Planner is mapping your question to the dataset..."})
         try:
             plan_raw = llm(
                 PLANNER_SYSTEM,
-                f"Category: {req.category}\nDomain context: {category_persona}\n\nSchema:\n{schema}\n\nQuestion: {req.question}"
+                f"Category: {req.category}\nDomain context: {category_persona}\n\nSchema:\n{schema}{rag_block}\n\nQuestion: {req.question}"
             )
             plan = parse_json_safe(plan_raw)
         except Exception:
             plan = {"needs_chart": True, "strategy": "Direct analysis", "relevant_columns": [], "analysis_steps": [], "chart_type": "auto"}
 
+        plan["rag_sources"] = rag_sources
         yield emit({"step": "plan", "message": f"Plan: {plan.get('strategy', 'Analyzing...')}", "plan": plan})
 
         # ── AGENT 2: ANALYST ──────────────────────────────────────────────
@@ -646,8 +778,9 @@ async def query_csv(req: QueryRequest) -> StreamingResponse:
             f"Schema:\n{schema}\n\n"
             f"Analysis strategy: {plan.get('strategy', '')}\n"
             f"Focus on columns: {', '.join(plan.get('relevant_columns', []))}\n"
-            f"Steps to follow: {'; '.join(plan.get('analysis_steps', []))}\n\n"
-            f"Question: {req.question}"
+            f"Steps to follow: {'; '.join(plan.get('analysis_steps', []))}\n"
+            + (f"\nAdditional context from documentation:\n{rag_context}\n" if rag_context else "")
+            + f"\nQuestion: {req.question}"
         )
 
         analyst_code, analyst_result, _ = run_code_with_repair(ANALYST_SYSTEM, analyst_context, "analyst")

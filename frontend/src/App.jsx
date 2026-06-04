@@ -286,7 +286,56 @@ function UploadScreen({ onUpload, uploading, setUploading, category, setCategory
 
 // ─── Sidebar ───────────────────────────────────────────────────────────────────
 
-function Sidebar({ upload, category, setCategory, onReset }) {
+function DocUploadPanel({ sessionId, docs, onDocsUpdated }) {
+  const [uploading, setUploading] = useState(false)
+  const inputRef = useRef()
+
+  const handleFile = useCallback(async (file) => {
+    if (!file) return
+    const allowed = ['.pdf', '.xlsx', '.xls', '.txt', '.md', '.csv']
+    if (!allowed.some(ext => file.name.toLowerCase().endsWith(ext))) {
+      alert('Supported formats: PDF, Excel, TXT, MD, CSV')
+      return
+    }
+    setUploading(true)
+    const fd = new FormData()
+    fd.append('file', file)
+    try {
+      const res = await fetch(`/upload_doc?session_id=${sessionId}`, { method: 'POST', body: fd })
+      const data = await res.json()
+      if (!res.ok) throw new Error(data.detail || 'Upload failed')
+      onDocsUpdated(data.filenames)
+    } catch (e) {
+      alert(e.message)
+    } finally {
+      setUploading(false)
+    }
+  }, [sessionId, onDocsUpdated])
+
+  return (
+    <div className="panel-section">
+      <div className="panel-head">📄 Documentation <span className="doc-count">{docs.length} file{docs.length !== 1 ? 's' : ''}</span></div>
+      <p className="doc-hint">Upload PDFs, Excel, or text files to enrich analysis with domain context.</p>
+      {docs.length > 0 && (
+        <div className="doc-list">
+          {docs.map(f => (
+            <div key={f} className="doc-item">
+              <span className="doc-icon">📄</span>
+              <span className="doc-name">{f}</span>
+            </div>
+          ))}
+        </div>
+      )}
+      <button className="doc-upload-btn" onClick={() => inputRef.current.click()} disabled={uploading}>
+        <input ref={inputRef} type="file" hidden accept=".pdf,.xlsx,.xls,.txt,.md,.csv"
+          onChange={e => handleFile(e.target.files[0])} />
+        {uploading ? <span className="spinner" style={{borderTopColor:'var(--primary)',borderColor:'var(--primary-ring)'}} /> : '+ Attach document'}
+      </button>
+    </div>
+  )
+}
+
+function Sidebar({ upload, category, setCategory, onReset, docs, onDocsUpdated }) {
   const [q, setQ] = useState('')
   const filtered = useMemo(
     () => upload.columns.filter((c) => c.toLowerCase().includes(q.toLowerCase())),
@@ -338,6 +387,8 @@ function Sidebar({ upload, category, setCategory, onReset }) {
           ))}
         </div>
       </div>
+
+      <DocUploadPanel sessionId={upload.session_id} docs={docs} onDocsUpdated={onDocsUpdated} />
 
       <div className="panel-section">
         <div className="panel-head">Schema</div>
@@ -625,6 +676,11 @@ function PlanBadge({ plan }) {
               Columns: {plan.relevant_columns.map(c => <span key={c} className="plan-col">{c}</span>)}
             </div>
           )}
+          {plan.rag_sources?.length > 0 && (
+            <div className="plan-rag">
+              📄 Context from: {plan.rag_sources.map(f => <span key={f} className="rag-source">{f}</span>)}
+            </div>
+          )}
         </div>
       )}
     </div>
@@ -782,6 +838,7 @@ export default function App() {
   const [loading, setLoading] = useState(false)
   const [showPaste, setShowPaste] = useState(false)
   const [modelInfo, setModelInfo] = useState(null)
+  const [docs, setDocs] = useState([])
   const inputRef = useRef()
 
   const handlePasteSubmit = useCallback(async (text, hasHeader) => {
@@ -798,6 +855,7 @@ export default function App() {
       setShowPaste(false)
       setMessages([])
       setModelInfo(null)
+      setDocs([])
       setUpload({ ...data, uploadedAt: new Date() })
     } catch (e) {
       alert(e.message)
@@ -904,7 +962,9 @@ export default function App() {
             upload={upload}
             category={category}
             setCategory={setCategory}
-            onReset={() => { setUpload(null); setMessages([]); setModelInfo(null) }}
+            onReset={() => { setUpload(null); setMessages([]); setModelInfo(null); setDocs([]) }}
+            docs={docs}
+            onDocsUpdated={setDocs}
           />
           <ChatArea
             upload={upload}
