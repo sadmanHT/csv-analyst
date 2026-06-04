@@ -173,9 +173,10 @@ def test_upload_counts_duplicate_rows():
 
 def test_execute_code_returns_result():
     df = pd.DataFrame({"a": [1, 2, 3], "b": [4, 5, 6]})
-    result, chart = execute_code("result = str(df['a'].sum())", df)
+    result, chart, chart_json = execute_code("result = str(df['a'].sum())", df)
     assert result == "6"
     assert chart is None
+    assert chart_json is None
 
 
 def test_execute_code_allows_chart_imports():
@@ -192,9 +193,27 @@ def test_execute_code_allows_chart_imports():
         "chart_b64 = base64.b64encode(buf.getvalue()).decode()\n"
         "result = 'ok'"
     )
-    result, chart = execute_code(code, df)
+    result, chart, chart_json = execute_code(code, df)
     assert result == "ok"
     assert chart and len(chart) > 100
+
+
+def test_execute_code_plotly_chart():
+    """Plotly charts should produce chart_json, not chart_b64."""
+    df = pd.DataFrame({"cat": ["a", "b", "a"], "val": [1, 2, 3]})
+    code = (
+        "import plotly.express as px\n"
+        "fig = px.bar(df, x='cat', y='val', title='Test')\n"
+        "chart_json = fig.to_json()\n"
+        "chart_b64 = None\n"
+        "result = None"
+    )
+    result, chart_b64, chart_json = execute_code(code, df)
+    assert chart_b64 is None
+    assert chart_json is not None
+    import json as _json
+    parsed = _json.loads(chart_json)
+    assert "data" in parsed and "layout" in parsed
 
 
 def test_execute_code_blocks_unsafe_import():

@@ -573,6 +573,15 @@ pre {
 }
 .report-body strong, .report-body b { color: var(--text); font-weight: 700; }
 
+/* ── Interactive Plotly chart ────────────────────────────────── */
+.plotly-chart {
+  width: 100%; min-height: 380px;
+  border-radius: var(--r); border: 1px solid var(--border);
+  background: #fff; overflow: hidden;
+  animation: popIn 0.4s cubic-bezier(.2,.8,.2,1);
+  box-shadow: var(--sh);
+}
+
 /* ── Explainability panel (SHAP / permutation / PDP tabs) ───── */
 .explain-panel {
   margin-top: 14px; border: 1px solid #E0E7FF;

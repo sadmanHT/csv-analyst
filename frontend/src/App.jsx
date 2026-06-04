@@ -5,6 +5,7 @@ import {
   Rows, Columns, AlertDot, Activity, Layers, Code, ChartUp, Brain,
   DollarSign, HeartPulse, ShoppingCart, Megaphone, Users,
 } from './icons.jsx'
+import Plotly from 'plotly.js-dist-min'
 
 // ─── Domain categories (the differentiator) ────────────────────────────────────
 
@@ -616,6 +617,28 @@ function Stat({ label, v }) {
   )
 }
 
+// ─── Interactive Plotly chart ──────────────────────────────────────────────────
+
+function PlotlyChart({ json }) {
+  const ref = useRef()
+  useEffect(() => {
+    if (!ref.current || !json) return
+    let fig
+    try { fig = JSON.parse(json) } catch { return }
+    Plotly.newPlot(ref.current, fig.data, {
+      ...fig.layout,
+      paper_bgcolor: 'white',
+      plot_bgcolor: 'white',
+      font: { family: 'Inter, Segoe UI, Helvetica Neue, Arial, sans-serif', size: 12 },
+      margin: fig.layout?.margin ?? { l: 60, r: 30, t: 60, b: 60 },
+      autosize: true,
+    }, { responsive: true, displayModeBar: true, displaylogo: false,
+         modeBarButtonsToRemove: ['select2d', 'lasso2d'] })
+    return () => { if (ref.current) Plotly.purge(ref.current) }
+  }, [json])
+  return <div ref={ref} className="plotly-chart" />
+}
+
 // ─── Chat ──────────────────────────────────────────────────────────────────────
 
 function AgentStep({ step }) {
@@ -749,9 +772,11 @@ function ChatMessage({ msg }) {
           </div>
         )}
 
-        {/* ML predict: show feature importance then explainability panel */}
+        {/* ML predict: explainability panel; otherwise Plotly or PNG chart */}
         {hasExplain ? (
           <ExplainPanel msg={msg} />
+        ) : msg.chart_json ? (
+          <PlotlyChart json={msg.chart_json} />
         ) : (
           msg.chart && <img className="chart-img" src={`data:image/png;base64,${msg.chart}`} alt="Generated chart" />
         )}
@@ -900,7 +925,7 @@ export default function App() {
     if (!upload || loading) return
     setLoading(true)
     const msgId = Date.now()
-    setMessages((prev) => [...prev, { id: msgId, question: label, category, steps: [], code: null, result: null, chart: null, report: null, critique: null, plan: null, shap_chart: null, perm_chart: null, pdp_chart: null }])
+    setMessages((prev) => [...prev, { id: msgId, question: label, category, steps: [], code: null, result: null, chart: null, chart_json: null, report: null, critique: null, plan: null, shap_chart: null, perm_chart: null, pdp_chart: null }])
 
     try {
       const res = await fetch(url, {
@@ -928,6 +953,7 @@ export default function App() {
             code: event.code ?? m.code,
             result: event.result ?? m.result,
             chart: event.chart ?? m.chart,
+            chart_json: event.chart_json ?? m.chart_json,
             report: event.report ?? m.report,
             critique: event.critique ?? m.critique,
             plan: event.plan ?? m.plan,

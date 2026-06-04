@@ -10,6 +10,8 @@ import numpy as np
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import plotly.express as px
+import plotly.graph_objects as go
 import seaborn as sns
 
 # ── Premium chart theme — seaborn base + custom rcParams, matched to the indigo UI ──
@@ -513,23 +515,31 @@ Rules:
 - Output ONLY valid Python code — no markdown fences, no explanation"""
 
 VISUALIZER_SYSTEM = """You are a data visualization expert. A pandas DataFrame `df` is loaded.
-Write Python code to create ONE excellent chart that best illustrates the analysis findings.
+Write Python code to create ONE excellent INTERACTIVE Plotly chart that best illustrates the findings.
 
 Rules:
 - `df` is already defined — do not reload it
-- Pre-imported: pandas (pd), numpy (np), matplotlib.pyplot (plt), seaborn (sns), io, base64
-- A premium seaborn theme + indigo palette is applied globally — do NOT call sns.set or set custom colors
-- Create figure with: fig, ax = plt.subplots(figsize=(8, 5))
-- Draw with seaborn, passing ax=ax
-- Save EXACTLY:
-    buf = io.BytesIO()
-    plt.savefig(buf, format='png', bbox_inches='tight', dpi=150)
-    plt.close()
-    chart_b64 = base64.b64encode(buf.getvalue()).decode()
-- MUST have: ax.set_title(...), ax.set_xlabel(...), ax.set_ylabel(...), plt.tight_layout()
-- Bar charts: annotate with `for c in ax.containers: ax.bar_label(c, fmt='%.1f', padding=3)`
-- Rotate long x labels: ax.tick_params(axis='x', rotation=30)
-- Set `result = None`
+- Pre-imported: pandas (pd), numpy (np), plotly.express (px), plotly.graph_objects (go)
+- Create a Plotly figure named `fig` using px or go
+- Apply this theme exactly ONCE after creating fig:
+    fig.update_layout(
+        template='plotly_white',
+        font=dict(family='Inter, Segoe UI, sans-serif', size=12),
+        title_font_size=15, title_font_weight='bold',
+        colorway=['#4F46E5','#10B981','#F59E0B','#8B5CF6','#EF4444','#06B6D4','#EC4899','#0EA5E9'],
+        margin=dict(l=60, r=30, t=60, b=60),
+        hoverlabel=dict(bgcolor='white', font_size=12),
+    )
+- Give the chart a clear descriptive title and labelled axes via update_layout
+- Save as: chart_json = fig.to_json()
+- Set chart_b64 = None, result = None
+- Common chart patterns:
+    • Bar: px.bar(df, x='col', y='col', title='...')
+    • Line: px.line(df, x='date_col', y='metric', title='...')
+    • Scatter: px.scatter(df, x='col1', y='col2', color='group', title='...')
+    • Histogram: px.histogram(df, x='col', title='...')
+    • Box: px.box(df, x='group', y='metric', title='...')
+    • Heatmap: use go.Heatmap with z=corr.values, x=corr.columns, y=corr.columns
 - Output ONLY valid Python code — no markdown fences, no explanation"""
 
 CRITIC_SYSTEM = """You are a senior statistician reviewing a data analysis for accuracy and completeness.
@@ -614,7 +624,7 @@ def system_prompt_for(category: str) -> str:
 # Modules the generated analysis code is allowed to import.
 ALLOWED_MODULES = {
     "pandas", "numpy", "matplotlib", "seaborn", "scipy", "sklearn", "statsmodels",
-    "math", "statistics", "datetime", "io", "base64", "collections", "itertools", "re", "json",
+    "plotly", "math", "statistics", "datetime", "io", "base64", "collections", "itertools", "re", "json",
 }
 
 
@@ -641,22 +651,26 @@ SAFE_BUILTINS = {
 }
 
 
-def execute_code(code: str, df: pd.DataFrame) -> tuple[str, str | None]:
+def execute_code(code: str, df: pd.DataFrame) -> tuple[str, str | None, str | None]:
+    """Execute sandboxed code. Returns (result, chart_b64, chart_json)."""
     safe_globals = {
         "__builtins__": SAFE_BUILTINS,
         "pd": pd, "np": np, "plt": plt, "sns": sns, "io": io, "base64": base64,
+        "px": px, "go": go,
     }
     local_vars: dict = {
         "df": df.copy(),
         "result": None,
         "chart_b64": None,
+        "chart_json": None,
     }
     exec(code, safe_globals, local_vars)
-    result = local_vars.get("result")
+    result    = local_vars.get("result")
     chart_b64 = local_vars.get("chart_b64")
+    chart_json = local_vars.get("chart_json")
     if result is None:
-        result = "Done. See chart above." if chart_b64 else "No result returned."
-    return str(result), chart_b64
+        result = "Done. See chart above." if (chart_b64 or chart_json) else "No result returned."
+    return str(result), chart_b64, chart_json
 
 
 @app.get("/health")
@@ -778,17 +792,17 @@ async def query_csv(req: QueryRequest) -> StreamingResponse:
                         pass
             return {}
 
-        def run_code_with_repair(system: str, context: str, code_label: str) -> tuple[str | None, str | None, str | None]:
-            """Generate code, execute it, repair once on failure. Returns (code, result, chart_b64)."""
+        def run_code_with_repair(system: str, context: str, code_label: str) -> tuple[str | None, str | None, str | None, str | None]:
+            """Generate code, execute it, repair once on failure. Returns (code, result, chart_b64, chart_json)."""
             try:
                 code = llm(system, context)
-            except Exception as e:
-                return None, None, None
+            except Exception:
+                return None, None, None, None
 
             for attempt in range(2):
                 try:
-                    result, chart = execute_code(code, df)
-                    return code, result, chart
+                    result, chart_b64, chart_json = execute_code(code, df)
+                    return code, result, chart_b64, chart_json
                 except Exception:
                     err = traceback.format_exc().strip().splitlines()[-1]
                     if attempt == 0:
@@ -796,10 +810,10 @@ async def query_csv(req: QueryRequest) -> StreamingResponse:
                             code = llm(system,
                                        f"{context}\n\nPrevious code failed:\n{code}\nError: {err}\nFix it.")
                         except Exception:
-                            return code, None, None
+                            return code, None, None, None
                     else:
-                        return code, None, None
-            return code, None, None
+                        return code, None, None, None
+            return code, None, None, None
 
         # ── RAG: retrieve context from uploaded documents ──────────────────
         rag_context = ""
@@ -843,7 +857,7 @@ async def query_csv(req: QueryRequest) -> StreamingResponse:
             + f"\nQuestion: {req.question}"
         )
 
-        analyst_code, analyst_result, _ = run_code_with_repair(ANALYST_SYSTEM, analyst_context, "analyst")
+        analyst_code, analyst_result, _, __ = run_code_with_repair(ANALYST_SYSTEM, analyst_context, "analyst")
 
         if analyst_code:
             yield emit({"step": "code", "message": "Analyst code generated", "code": analyst_code})
@@ -855,15 +869,16 @@ async def query_csv(req: QueryRequest) -> StreamingResponse:
 
         # ── AGENT 3: VISUALIZER ───────────────────────────────────────────
         chart_b64 = None
+        chart_json = None
         if plan.get("needs_chart", True):
-            yield emit({"step": "visualizing", "message": "Visualizer agent creating chart..."})
+            yield emit({"step": "visualizing", "message": "Visualizer agent creating interactive chart..."})
             viz_context = (
                 f"Schema:\n{schema}\n\n"
                 f"Question: {req.question}\n"
                 f"Suggested chart type: {plan.get('chart_type', 'auto')}\n"
                 f"Analysis findings to visualize:\n{analyst_result[:800]}"
             )
-            viz_code, _, chart_b64 = run_code_with_repair(VISUALIZER_SYSTEM, viz_context, "visualizer")
+            viz_code, _, chart_b64, chart_json = run_code_with_repair(VISUALIZER_SYSTEM, viz_context, "visualizer")
             if viz_code:
                 yield emit({"step": "code", "message": "Visualizer code generated", "code": viz_code})
 
@@ -900,6 +915,7 @@ async def query_csv(req: QueryRequest) -> StreamingResponse:
             "message": "Analysis complete",
             "result": analyst_result,
             "chart": chart_b64,
+            "chart_json": chart_json,
             "report": report,
             "critique": critique,
             "plan": plan,
