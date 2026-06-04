@@ -317,11 +317,13 @@ def build_overview_charts(df: pd.DataFrame) -> list[dict]:
     return charts
 
 
-def train_predictive_model(df: pd.DataFrame, target: str) -> tuple[str, str]:
-    """Train a Random Forest to predict `target`; return (summary, importance_chart_b64)."""
+def train_predictive_model(df: pd.DataFrame, target: str) -> tuple[str, str, dict]:
+    """Train a Random Forest; return (summary, importance_chart, info).
+    info also contains shap_chart, perm_chart, pdp_chart for explainability."""
     from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
     from sklearn.model_selection import train_test_split
     from sklearn.metrics import accuracy_score, f1_score, r2_score, mean_absolute_error
+    from sklearn.inspection import permutation_importance, PartialDependenceDisplay
 
     data = df.dropna(subset=[target]).copy()
     if len(data) < 30:
@@ -330,15 +332,12 @@ def train_predictive_model(df: pd.DataFrame, target: str) -> tuple[str, str]:
     y_raw = data[target]
     X = data.drop(columns=[target])
 
-    # Drop identifier-like columns (named *_id, or quasi-unique numerics) so the model
-    # doesn't treat row IDs as predictive features.
     id_like = [c for c in X.columns
                if str(c).lower() in ("id", "index")
                or str(c).lower().endswith("_id")
                or (pd.api.types.is_integer_dtype(X[c]) and X[c].nunique() > 0.95 * len(X))]
     X = X.drop(columns=id_like, errors="ignore")
 
-    # numeric features + one-hot of low-cardinality categoricals; drop high-card text/ids
     num_cols = list(X.select_dtypes(include="number").columns)
     cat_cols = [c for c in X.columns
                 if not pd.api.types.is_numeric_dtype(X[c]) and X[c].nunique() <= 15]
@@ -366,31 +365,88 @@ def train_predictive_model(df: pd.DataFrame, target: str) -> tuple[str, str]:
     model.fit(Xtr, ytr)
     pred = model.predict(Xte)
 
+    # ── 1. Feature importance (gini / MDI) ───────────────────────────────────
     importances = pd.Series(model.feature_importances_, index=X.columns).sort_values(ascending=False)
     top = importances.head(12)
-
     fig, ax = plt.subplots(figsize=(8, max(4, 0.5 * len(top))))
     sns.barplot(x=top.values, y=top.index.astype(str), ax=ax)
     for cont in ax.containers:
         ax.bar_label(cont, fmt="%.3f", padding=3)
-    ax.set_title(f"What predicts '{target}'?  ·  Feature Importance")
-    ax.set_xlabel("Importance")
-    ax.set_ylabel("Feature")
+    ax.set_title(f"What predicts '{target}'?  ·  Feature Importance (MDI)")
+    ax.set_xlabel("Importance"); ax.set_ylabel("Feature")
     chart = _fig_to_b64(fig)
 
+    # ── 2. SHAP beeswarm (global explanation) ────────────────────────────────
+    shap_chart = None
+    try:
+        import shap
+        X_sample = Xtr.iloc[:min(300, len(Xtr))]
+        explainer = shap.TreeExplainer(model)
+        shap_values = explainer.shap_values(X_sample)
+        if is_classification and isinstance(shap_values, list):
+            sv = shap_values[1] if len(shap_values) > 1 else shap_values[0]
+        else:
+            sv = shap_values
+        plt.figure(figsize=(8, max(4, 0.4 * min(12, X_sample.shape[1]))))
+        shap.summary_plot(sv, X_sample, show=False, max_display=12, plot_type="dot")
+        plt.title(f"SHAP Feature Impact on '{target}'", fontsize=14, fontweight="bold", pad=14)
+        plt.tight_layout()
+        buf = io.BytesIO()
+        plt.savefig(buf, format="png", bbox_inches="tight", dpi=150)
+        plt.close("all")
+        shap_chart = base64.b64encode(buf.getvalue()).decode()
+    except Exception:
+        plt.close("all")
+
+    # ── 3. Permutation importance (test-set, unbiased) ───────────────────────
+    perm_chart = None
+    try:
+        perm = permutation_importance(model, Xte, yte, n_repeats=5, random_state=42, n_jobs=-1)
+        perm_df = (pd.DataFrame({"Feature": X.columns,
+                                 "Importance": perm.importances_mean,
+                                 "Std": perm.importances_std})
+                   .sort_values("Importance", ascending=False).head(12))
+        fig, ax = plt.subplots(figsize=(8, max(4, 0.5 * len(perm_df))))
+        ax.barh(perm_df["Feature"][::-1], perm_df["Importance"][::-1],
+                xerr=perm_df["Std"][::-1], color="#4F46E5", alpha=0.85, capsize=3)
+        ax.set_title(f"Permutation Importance · '{target}' (test set)")
+        ax.set_xlabel("Mean decrease in score")
+        plt.tight_layout()
+        perm_chart = _fig_to_b64(fig)
+    except Exception:
+        plt.close("all")
+
+    # ── 4. Partial Dependence Plots (top 2 features) ─────────────────────────
+    pdp_chart = None
+    try:
+        top2 = list(importances.head(2).index)
+        n = len(top2)
+        fig, axes = plt.subplots(1, n, figsize=(6 * n, 4))
+        if n == 1:
+            axes = [axes]
+        PartialDependenceDisplay.from_estimator(model, X, top2, ax=axes,
+                                                kind="average", subsample=500, random_state=42)
+        fig.suptitle(f"Partial Dependence — Top Features for '{target}'",
+                     fontsize=13, fontweight="bold")
+        fig.tight_layout()
+        pdp_chart = _fig_to_b64(fig)
+    except Exception:
+        plt.close("all")
+
+    # ── metrics & summary ────────────────────────────────────────────────────
     if is_classification:
         metric = f"Accuracy: {accuracy_score(yte, pred):.1%}   |   F1 (weighted): {f1_score(yte, pred, average='weighted'):.2f}"
         task = f"Trained a Random Forest classifier to predict '{target}' ({n_classes} classes)."
     else:
-        metric = f"R-squared: {r2_score(yte, pred):.2f}   |   MAE: {mean_absolute_error(yte, pred):,.2f}"
+        metric = f"R²: {r2_score(yte, pred):.3f}   |   MAE: {mean_absolute_error(yte, pred):,.3f}"
         task = f"Trained a Random Forest regressor to predict '{target}'."
 
     top3 = ", ".join(f"{n} ({v:.0%})" for n, v in top.head(3).items())
     summary = (f"{task}\n{metric}\n\n"
-               f"Most predictive features: {top3}.\n"
-               f"Trained on {len(Xtr)} rows, validated on {len(Xte)}, using {X.shape[1]} features.")
+               f"Top features: {top3}.\n"
+               f"Trained on {len(Xtr)} rows, validated on {len(Xte)}, {X.shape[1]} features.\n"
+               f"Explainability: SHAP beeswarm · Permutation importance · Partial dependence plots generated.")
 
-    # Feature metadata so the UI can offer a "predict a new case" form.
     features_meta = []
     for c in num_cols + cat_cols:
         if c in cat_cols:
@@ -406,13 +462,17 @@ def train_predictive_model(df: pd.DataFrame, target: str) -> tuple[str, str]:
     info = {
         "target": target,
         "model": model,
-        "feature_cols": list(X.columns),       # encoded training columns
+        "feature_cols": list(X.columns),
         "num_cols": num_cols,
         "cat_cols": cat_cols,
         "is_classification": is_classification,
         "classes": classes,
         "medians": {k: (None if pd.isna(v) else float(v)) for k, v in X.median().items()},
         "features": features_meta,
+        # Explainability charts
+        "shap_chart": shap_chart,
+        "perm_chart": perm_chart,
+        "pdp_chart":  pdp_chart,
     }
     return summary, chart, info
 
@@ -868,9 +928,19 @@ async def predict(req: PredictRequest) -> StreamingResponse:
         except Exception as e:
             yield emit({"step": "error", "message": f"Could not train model: {e}"})
             return
-        yield emit({"step": "executing", "message": "Evaluating on a held-out test set..."})
-        yield emit({"step": "done", "message": "Model trained", "result": summary, "chart": chart,
-                    "features": info["features"], "target": info["target"]})
+        yield emit({"step": "executing", "message": "Evaluating on held-out test set..."})
+        yield emit({"step": "thinking", "message": "Computing SHAP values and permutation importance..."})
+        yield emit({
+            "step": "done",
+            "message": "Model trained with full explainability",
+            "result": summary,
+            "chart": chart,
+            "shap_chart":  info.get("shap_chart"),
+            "perm_chart":  info.get("perm_chart"),
+            "pdp_chart":   info.get("pdp_chart"),
+            "features": info["features"],
+            "target":   info["target"],
+        })
 
     return StreamingResponse(stream(), media_type="text/event-stream")
 

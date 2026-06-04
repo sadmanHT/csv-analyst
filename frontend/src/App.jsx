@@ -687,11 +687,39 @@ function PlanBadge({ plan }) {
   )
 }
 
+const EXPLAIN_TABS = [
+  { key: 'importance', label: '📊 Feature Importance', field: 'chart' },
+  { key: 'shap',       label: '🔬 SHAP Beeswarm',     field: 'shap_chart' },
+  { key: 'perm',       label: '🎲 Permutation',        field: 'perm_chart' },
+  { key: 'pdp',        label: '📈 Partial Dependence', field: 'pdp_chart' },
+]
+
+function ExplainPanel({ msg }) {
+  const available = EXPLAIN_TABS.filter(t => msg[t.field])
+  const [active, setActive] = useState(0)
+  if (available.length === 0) return null
+  const current = available[active]
+  return (
+    <div className="explain-panel">
+      <div className="explain-label">🧠 Explainability</div>
+      <div className="explain-tabs">
+        {available.map((t, i) => (
+          <button key={t.key} className={`explain-tab ${i === active ? 'active' : ''}`}
+            onClick={() => setActive(i)}>{t.label}</button>
+        ))}
+      </div>
+      <img className="chart-img" src={`data:image/png;base64,${msg[current.field]}`}
+        alt={current.label} />
+    </div>
+  )
+}
+
 function ChatMessage({ msg }) {
   const [showCode, setShowCode] = useState(false)
   const isDone = msg.steps.some((s) => s.step === 'done')
   const isError = msg.steps.some((s) => s.step === 'error')
   const cat = catByKey(msg.category)
+  const hasExplain = msg.shap_chart || msg.perm_chart || msg.pdp_chart
 
   // Filter display steps — hide internal plan/critique/code steps from the track
   const displaySteps = msg.steps.filter(s => !['plan', 'critique', 'code'].includes(s.step))
@@ -721,8 +749,11 @@ function ChatMessage({ msg }) {
           </div>
         )}
 
-        {msg.chart && (
-          <img className="chart-img" src={`data:image/png;base64,${msg.chart}`} alt="Generated chart" />
+        {/* ML predict: show feature importance then explainability panel */}
+        {hasExplain ? (
+          <ExplainPanel msg={msg} />
+        ) : (
+          msg.chart && <img className="chart-img" src={`data:image/png;base64,${msg.chart}`} alt="Generated chart" />
         )}
 
         {msg.report && !isError && (
@@ -869,7 +900,7 @@ export default function App() {
     if (!upload || loading) return
     setLoading(true)
     const msgId = Date.now()
-    setMessages((prev) => [...prev, { id: msgId, question: label, category, steps: [], code: null, result: null, chart: null, report: null, critique: null, plan: null }])
+    setMessages((prev) => [...prev, { id: msgId, question: label, category, steps: [], code: null, result: null, chart: null, report: null, critique: null, plan: null, shap_chart: null, perm_chart: null, pdp_chart: null }])
 
     try {
       const res = await fetch(url, {
@@ -900,6 +931,9 @@ export default function App() {
             report: event.report ?? m.report,
             critique: event.critique ?? m.critique,
             plan: event.plan ?? m.plan,
+            shap_chart: event.shap_chart ?? m.shap_chart,
+            perm_chart: event.perm_chart ?? m.perm_chart,
+            pdp_chart:  event.pdp_chart  ?? m.pdp_chart,
           }))
         } catch (_) {}
       }

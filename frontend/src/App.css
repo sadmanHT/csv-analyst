@@ -573,6 +573,31 @@ pre {
 }
 .report-body strong, .report-body b { color: var(--text); font-weight: 700; }
 
+/* ── Explainability panel (SHAP / permutation / PDP tabs) ───── */
+.explain-panel {
+  margin-top: 14px; border: 1px solid #E0E7FF;
+  border-radius: var(--r); overflow: hidden;
+  animation: popIn 0.4s cubic-bezier(.2,.8,.2,1);
+}
+.explain-label {
+  background: #EEF2FF; padding: 8px 14px;
+  font-size: 11px; font-weight: 700; text-transform: uppercase;
+  letter-spacing: 0.07em; color: #3730A3;
+}
+.explain-tabs {
+  display: flex; border-bottom: 1px solid #E0E7FF;
+  background: #F5F3FF; overflow-x: auto;
+}
+.explain-tab {
+  padding: 8px 14px; font-size: 12px; font-weight: 600; font-family: inherit;
+  border: none; background: none; cursor: pointer; white-space: nowrap;
+  color: var(--text-muted); border-bottom: 2px solid transparent;
+  transition: all .15s;
+}
+.explain-tab:hover { color: var(--text); }
+.explain-tab.active { color: var(--primary); border-bottom-color: var(--primary); background: #fff; }
+.explain-panel .chart-img { border-radius: 0; border: none; box-shadow: none; }
+
 /* ── Instant overview dashboard (empty state with charts) ──── */
 .overview-scroll {
   flex: 1; overflow-y: auto;
