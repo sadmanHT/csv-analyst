@@ -222,6 +222,45 @@ def test_execute_code_blocks_unsafe_import():
         execute_code("import os\nresult = os.getcwd()", df)
 
 
+# ── SQL generation ──────────────────────────────────────────────────────
+
+def test_execute_sql_basic_select():
+    from main import execute_sql
+    df = pd.DataFrame({"name": ["Alice", "Bob", "Carla"], "salary": [50000, 45000, 60000]})
+    result = execute_sql("SELECT name, salary FROM data ORDER BY salary DESC", df)
+    assert "Carla" in result
+    assert "60000" in result
+
+
+def test_execute_sql_aggregation():
+    from main import execute_sql
+    df = pd.DataFrame({"dept": ["Eng", "Eng", "HR"], "salary": [80000, 90000, 60000]})
+    result = execute_sql("SELECT dept, AVG(salary) AS avg_sal FROM data GROUP BY dept", df)
+    assert "Eng" in result and "HR" in result
+
+
+def test_execute_sql_filter():
+    from main import execute_sql
+    df = pd.DataFrame({"product": ["A", "B", "C"], "revenue": [1000, 5000, 200]})
+    result = execute_sql("SELECT product, revenue FROM data WHERE revenue > 500 ORDER BY revenue DESC", df)
+    assert "A" in result and "B" in result
+    assert "C" not in result
+
+
+def test_execute_sql_empty_result():
+    from main import execute_sql
+    df = pd.DataFrame({"x": [1, 2, 3]})
+    result = execute_sql("SELECT x FROM data WHERE x > 100", df)
+    assert "no results" in result.lower()
+
+
+def test_get_sql_schema():
+    from main import get_sql_schema
+    df = pd.DataFrame({"age": [25, 30], "name": ["Alice", "Bob"]})
+    schema = get_sql_schema(df)
+    assert "data" in schema and "age" in schema and "name" in schema
+
+
 # ── Predictive model ────────────────────────────────────────────────────
 
 def _classification_df(n=120):

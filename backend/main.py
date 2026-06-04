@@ -487,6 +487,28 @@ def get_df_schema(df: pd.DataFrame) -> str:
     return schema
 
 
+def get_sql_schema(df: pd.DataFrame) -> str:
+    """Schema description formatted for a SQL agent (table name: `data`)."""
+    schema = f"Table name: `data`\nRows: {len(df)}\n\nColumns:\n"
+    for col in df.columns:
+        schema += f"  - `{col}` ({df[col].dtype}): e.g. {df[col].dropna().head(3).tolist()}\n"
+    return schema
+
+
+def execute_sql(sql: str, df: pd.DataFrame) -> str:
+    """Load df into in-memory SQLite as table 'data', run sql, return result string."""
+    import sqlite3
+    conn = sqlite3.connect(":memory:")
+    try:
+        df.to_sql("data", conn, index=False, if_exists="replace")
+        result_df = pd.read_sql_query(sql, conn)
+        if result_df.empty:
+            return "The query returned no results."
+        return result_df.to_string(index=False)
+    finally:
+        conn.close()
+
+
 # ── Multi-agent system prompts ────────────────────────────────────────────────
 
 PLANNER_SYSTEM = """You are a data analysis planner. Given a DataFrame schema and a user question, produce a structured analysis plan.
@@ -498,8 +520,16 @@ Output ONLY valid JSON (no markdown fences, no extra text) with exactly this str
   "needs_chart": true,
   "chart_type": "bar|line|scatter|histogram|heatmap|box|violin|none",
   "analysis_steps": ["step1", "step2", "step3"],
-  "domain_focus": "what domain aspect to emphasize based on the category"
-}"""
+  "domain_focus": "what domain aspect to emphasize based on the category",
+  "query_type": "pandas"
+}
+
+query_type rules — choose "sql" when the question involves:
+- Filtering rows by value (WHERE-style: top N, specific category, date range)
+- Grouping and aggregating (GROUP BY: sum/count/avg by category)
+- Ranking or sorting a subset (ORDER BY + LIMIT)
+- Simple lookups or cross-tabulations
+Otherwise use "pandas" (for correlations, distributions, ML, custom statistics)."""
 
 ANALYST_SYSTEM = """You are a data analyst. A pandas DataFrame `df` is already loaded.
 Write Python code to compute the NUMERICAL analysis only — statistics, aggregations, comparisons, correlations. No charts.
@@ -513,6 +543,24 @@ Rules:
 - If result is a DataFrame, convert: result = df_result.to_string()
 - ROBUSTNESS: use df.select_dtypes(include='number') for numeric ops; never run math on text columns
 - Output ONLY valid Python code — no markdown fences, no explanation"""
+
+SQL_ANALYST_SYSTEM = """You are a SQL data analyst. A SQLite database table named `data` contains the user's dataset.
+Write a single SQL SELECT query to answer the user's question.
+
+Rules:
+- Table name is always `data` (lowercase)
+- Use standard SQLite SQL syntax
+- For column names with spaces or special characters: wrap in double quotes e.g. "column name"
+- For text matching: use LIKE '%value%' (case insensitive in SQLite)
+- For aggregations: use GROUP BY, ORDER BY, LIMIT
+- Always add ORDER BY for ranking/top-N questions
+- Output ONLY the raw SQL query — no markdown fences, no semicolon, no explanation
+
+Common patterns:
+  Top N by metric:     SELECT category, SUM(metric) AS total FROM data GROUP BY category ORDER BY total DESC LIMIT 10
+  Filter + aggregate:  SELECT region, AVG(sales) FROM data WHERE year = 2023 GROUP BY region
+  Count by group:      SELECT status, COUNT(*) AS count FROM data GROUP BY status ORDER BY count DESC
+  Date range:          SELECT * FROM data WHERE date >= '2023-01-01' AND date <= '2023-12-31'"""
 
 VISUALIZER_SYSTEM = """You are a data visualization expert. A pandas DataFrame `df` is loaded.
 Write Python code to create ONE excellent INTERACTIVE Plotly chart that best illustrates the findings.
@@ -844,28 +892,67 @@ async def query_csv(req: QueryRequest) -> StreamingResponse:
         plan["rag_sources"] = rag_sources
         yield emit({"step": "plan", "message": f"Plan: {plan.get('strategy', 'Analyzing...')}", "plan": plan})
 
-        # ── AGENT 2: ANALYST ──────────────────────────────────────────────
-        yield emit({"step": "analyst", "message": "Analyst agent computing statistics..."})
+        # ── AGENT 2: ANALYST (pandas) or SQL ANALYST ──────────────────────
+        query_type = plan.get("query_type", "pandas")
+        analyst_result = None
+        analyst_code   = None
 
-        analyst_context = (
-            f"Domain context: {category_persona}\n"
-            f"Schema:\n{schema}\n\n"
-            f"Analysis strategy: {plan.get('strategy', '')}\n"
-            f"Focus on columns: {', '.join(plan.get('relevant_columns', []))}\n"
-            f"Steps to follow: {'; '.join(plan.get('analysis_steps', []))}\n"
-            + (f"\nAdditional context from documentation:\n{rag_context}\n" if rag_context else "")
-            + f"\nQuestion: {req.question}"
-        )
+        if query_type == "sql":
+            yield emit({"step": "analyst", "message": "SQL analyst generating query..."})
+            sql_schema = get_sql_schema(df)
+            sql_context = (
+                f"Domain context: {category_persona}\n"
+                f"Schema:\n{sql_schema}\n"
+                + (f"\nDocumentation context:\n{rag_context}\n" if rag_context else "")
+                + f"\nAnalysis strategy: {plan.get('strategy', '')}\n"
+                f"Question: {req.question}"
+            )
+            sql_query = ""
+            try:
+                sql_query = llm(SQL_ANALYST_SYSTEM, sql_context).strip()
+            except Exception as e:
+                yield emit({"step": "error", "message": f"SQL agent error: {e}"}); return
 
-        analyst_code, analyst_result, _, __ = run_code_with_repair(ANALYST_SYSTEM, analyst_context, "analyst")
+            yield emit({"step": "code", "message": "SQL query generated", "code": sql_query, "code_lang": "sql"})
+            yield emit({"step": "executing", "message": "Executing SQL on your data..."})
 
-        if analyst_code:
-            yield emit({"step": "code", "message": "Analyst code generated", "code": analyst_code})
-        yield emit({"step": "executing", "message": "Executing analysis on your data..."})
+            for attempt in range(2):
+                try:
+                    analyst_result = execute_sql(sql_query, df)
+                    analyst_code = sql_query
+                    break
+                except Exception:
+                    err = traceback.format_exc().strip().splitlines()[-1]
+                    if attempt == 0:
+                        yield emit({"step": "thinking", "message": f"SQL error — fixing… ({err})"})
+                        try:
+                            sql_query = llm(SQL_ANALYST_SYSTEM,
+                                            f"{sql_context}\n\nPrevious query failed:\n{sql_query}\nError: {err}\nWrite a corrected SQL query.")
+                        except Exception:
+                            break
+                    else:
+                        yield emit({"step": "error", "message": f"SQL error: {err}"}); return
 
-        if analyst_result is None:
-            yield emit({"step": "error", "message": "Analyst agent could not compute results."})
-            return
+            if analyst_result is None:
+                yield emit({"step": "error", "message": "SQL analyst could not produce results."}); return
+
+        else:
+            yield emit({"step": "analyst", "message": "Analyst agent computing statistics..."})
+            analyst_context = (
+                f"Domain context: {category_persona}\n"
+                f"Schema:\n{schema}\n\n"
+                f"Analysis strategy: {plan.get('strategy', '')}\n"
+                f"Focus on columns: {', '.join(plan.get('relevant_columns', []))}\n"
+                f"Steps to follow: {'; '.join(plan.get('analysis_steps', []))}\n"
+                + (f"\nAdditional context from documentation:\n{rag_context}\n" if rag_context else "")
+                + f"\nQuestion: {req.question}"
+            )
+            analyst_code, analyst_result, _, __ = run_code_with_repair(ANALYST_SYSTEM, analyst_context, "analyst")
+            if analyst_code:
+                yield emit({"step": "code", "message": "Analyst code generated", "code": analyst_code, "code_lang": "python"})
+            yield emit({"step": "executing", "message": "Executing analysis on your data..."})
+            if analyst_result is None:
+                yield emit({"step": "error", "message": "Analyst agent could not compute results."}); return
 
         # ── AGENT 3: VISUALIZER ───────────────────────────────────────────
         chart_b64 = None

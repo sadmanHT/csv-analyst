@@ -766,7 +766,11 @@ function ChatMessage({ msg }) {
         {msg.code && (
           <div className="code-section">
             <button className="code-toggle" onClick={() => setShowCode((v) => !v)}>
-              <Code width={14} height={14} /> {showCode ? 'Hide' : 'Show'} generated code
+              <Code width={14} height={14} />
+              {msg.code_lang === 'sql'
+                ? <span className="code-lang-badge sql">SQL</span>
+                : <span className="code-lang-badge py">Python</span>}
+              {showCode ? 'Hide' : 'Show'} generated code
             </button>
             {showCode && <div className="code-block"><pre>{msg.code}</pre></div>}
           </div>
@@ -925,7 +929,7 @@ export default function App() {
     if (!upload || loading) return
     setLoading(true)
     const msgId = Date.now()
-    setMessages((prev) => [...prev, { id: msgId, question: label, category, steps: [], code: null, result: null, chart: null, chart_json: null, report: null, critique: null, plan: null, shap_chart: null, perm_chart: null, pdp_chart: null }])
+    setMessages((prev) => [...prev, { id: msgId, question: label, category, steps: [], code: null, code_lang: null, result: null, chart: null, chart_json: null, report: null, critique: null, plan: null, shap_chart: null, perm_chart: null, pdp_chart: null }])
 
     try {
       const res = await fetch(url, {
@@ -951,6 +955,7 @@ export default function App() {
             ...m,
             steps: [...m.steps, event],
             code: event.code ?? m.code,
+            code_lang: event.code_lang ?? m.code_lang,
             result: event.result ?? m.result,
             chart: event.chart ?? m.chart,
             chart_json: event.chart_json ?? m.chart_json,

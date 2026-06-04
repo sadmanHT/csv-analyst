@@ -475,6 +475,12 @@
   transition: all .18s;
 }
 .code-toggle:hover { border-color: var(--primary); color: var(--primary); background: var(--primary-soft); }
+.code-lang-badge {
+  font-size: 10px; font-weight: 800; letter-spacing: 0.06em;
+  padding: 1px 6px; border-radius: 4px; text-transform: uppercase;
+}
+.code-lang-badge.sql { background: #FEF3C7; color: #92400E; }
+.code-lang-badge.py  { background: #EEF2FF; color: #3730A3; }
 
 .code-block {
   border-radius: var(--r); overflow: hidden;
