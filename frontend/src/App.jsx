@@ -857,6 +857,7 @@ function ChatMessage({ msg }) {
         <div className="agent-head">
           <Sparkles width={14} height={14} /> Multi-Agent Analyst
           <span className="agent-lens"><cat.icon width={11} height={11} /> {cat.label}</span>
+          <span className="security-badge" title="AST-validated · sandboxed execution · 30s timeout">🔒</span>
         </div>
 
         <div className="steps-track">

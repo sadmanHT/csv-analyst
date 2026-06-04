@@ -217,9 +217,86 @@ def test_execute_code_plotly_chart():
 
 
 def test_execute_code_blocks_unsafe_import():
+    """AST scan now catches forbidden imports before exec — raises SecurityError."""
+    from main import SecurityError
     df = pd.DataFrame({"a": [1]})
-    with pytest.raises(ImportError):
+    with pytest.raises((ImportError, SecurityError)):
         execute_code("import os\nresult = os.getcwd()", df)
+
+
+# ── AST security validation ─────────────────────────────────────────────
+
+def test_ast_blocks_dunder_class():
+    from main import validate_code_ast, SecurityError
+    with pytest.raises(SecurityError):
+        validate_code_ast("x = df.__class__.__bases__")
+
+
+def test_ast_blocks_globals_access():
+    from main import validate_code_ast, SecurityError
+    with pytest.raises(SecurityError):
+        validate_code_ast("x = ().__class__.__bases__[0].__subclasses__()")
+
+
+def test_ast_blocks_eval():
+    from main import validate_code_ast, SecurityError
+    with pytest.raises(SecurityError, match="eval"):
+        validate_code_ast("result = eval('1 + 1')")
+
+
+def test_ast_blocks_exec():
+    from main import validate_code_ast, SecurityError
+    with pytest.raises(SecurityError, match="exec"):
+        validate_code_ast("exec('import os')")
+
+
+def test_ast_blocks_open():
+    from main import validate_code_ast, SecurityError
+    with pytest.raises(SecurityError, match="open"):
+        validate_code_ast("f = open('/etc/passwd')")
+
+
+def test_ast_blocks_compile():
+    from main import validate_code_ast, SecurityError
+    with pytest.raises(SecurityError, match="compile"):
+        validate_code_ast("compile('x=1', '<s>', 'exec')")
+
+
+def test_ast_blocks_forbidden_import():
+    from main import validate_code_ast, SecurityError
+    with pytest.raises(SecurityError):
+        validate_code_ast("import subprocess")
+
+
+def test_ast_allows_valid_pandas_code():
+    from main import validate_code_ast
+    validate_code_ast("result = df.groupby('cat')['val'].sum().to_string()")
+
+
+def test_ast_allows_plotly_code():
+    from main import validate_code_ast
+    validate_code_ast(
+        "import plotly.express as px\n"
+        "fig = px.bar(df, x='cat', y='val')\n"
+        "chart_json = fig.to_json()\n"
+        "result = None"
+    )
+
+
+def test_execute_code_raises_security_error_on_eval():
+    from main import SecurityError
+    df = pd.DataFrame({"a": [1]})
+    with pytest.raises(SecurityError):
+        execute_code("result = eval('1+1')", df)
+
+
+def test_execute_code_truncates_large_result():
+    from main import MAX_RESULT_CHARS
+    df = pd.DataFrame({"a": range(10)})
+    code = f"result = 'x' * {MAX_RESULT_CHARS + 1000}"
+    result, _, __ = execute_code(code, df)
+    assert "truncated" in result
+    assert len(result) < MAX_RESULT_CHARS + 200
 
 
 # ── SQL generation ──────────────────────────────────────────────────────

@@ -490,6 +490,7 @@
   text-transform: capitalize;
 }
 .agent-lens svg { color: var(--primary); }
+.security-badge { font-size: 12px; margin-left: auto; opacity: 0.6; cursor: help; }
 
 .steps-track { display: flex; flex-direction: column; gap: 6px; }
 .step-row {

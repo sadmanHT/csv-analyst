@@ -1,9 +1,11 @@
+import ast
 import io
 import os
 import uuid
 import json
 import base64
 import traceback
+import concurrent.futures
 
 import pandas as pd
 import numpy as np
@@ -669,11 +671,75 @@ def system_prompt_for(category: str) -> str:
     return f"{persona}\n\n{SYSTEM_PROMPT}"
 
 
+# ── Sandbox security configuration ───────────────────────────────────────────
+
+MAX_EXEC_SECONDS  = 30    # hard wall-clock timeout per code execution
+MAX_RESULT_CHARS  = 5_000 # truncate oversized results to prevent memory abuse
+
 # Modules the generated analysis code is allowed to import.
 ALLOWED_MODULES = {
     "pandas", "numpy", "matplotlib", "seaborn", "scipy", "sklearn", "statsmodels",
     "plotly", "math", "statistics", "datetime", "io", "base64", "collections", "itertools", "re", "json",
 }
+
+# Dangerous dunder / frame attributes that could be used to escape the sandbox.
+_BLOCKED_ATTRS = frozenset({
+    "__class__", "__bases__", "__subclasses__", "__mro__",
+    "__globals__", "__builtins__", "__code__", "__closure__",
+    "__dict__", "__loader__", "__spec__", "__wrapped__",
+    "f_locals", "f_globals", "f_back", "gi_frame",
+    "func_globals", "func_code",
+})
+
+# Dangerous callables that must never appear in generated code.
+_BLOCKED_CALLS = frozenset({
+    "eval", "exec", "compile", "open", "breakpoint",
+    "__import__", "input", "memoryview",
+})
+
+
+class SecurityError(Exception):
+    """Raised when generated code fails the AST security scan."""
+
+
+class _ASTSecurityVisitor(ast.NodeVisitor):
+    """Walk the AST and raise SecurityError on any dangerous pattern."""
+
+    def visit_Attribute(self, node: ast.Attribute) -> None:
+        if node.attr in _BLOCKED_ATTRS:
+            raise SecurityError(
+                f"Access to attribute '{node.attr}' is blocked in the sandbox"
+            )
+        self.generic_visit(node)
+
+    def visit_Call(self, node: ast.Call) -> None:
+        if isinstance(node.func, ast.Name) and node.func.id in _BLOCKED_CALLS:
+            raise SecurityError(
+                f"Call to '{node.func.id}' is blocked in the sandbox"
+            )
+        self.generic_visit(node)
+
+    def visit_Import(self, node: ast.Import) -> None:
+        for alias in node.names:
+            root = alias.name.split(".")[0]
+            if root not in ALLOWED_MODULES:
+                raise SecurityError(f"Import of '{alias.name}' is not allowed in the sandbox")
+        self.generic_visit(node)
+
+    def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+        root = (node.module or "").split(".")[0]
+        if root not in ALLOWED_MODULES:
+            raise SecurityError(f"Import from '{node.module}' is not allowed in the sandbox")
+        self.generic_visit(node)
+
+
+def validate_code_ast(code: str) -> None:
+    """Parse code and run the AST security scan. Raises SecurityError on any violation."""
+    try:
+        tree = ast.parse(code)
+    except SyntaxError as e:
+        raise SecurityError(f"Syntax error in generated code: {e}")
+    _ASTSecurityVisitor().visit(tree)
 
 
 def _safe_import(name, globals=None, locals=None, fromlist=(), level=0):
@@ -700,7 +766,16 @@ SAFE_BUILTINS = {
 
 
 def execute_code(code: str, df: pd.DataFrame) -> tuple[str, str | None, str | None]:
-    """Execute sandboxed code. Returns (result, chart_b64, chart_json)."""
+    """Execute sandboxed code with three security layers:
+    1. AST pre-scan (blocks dangerous attributes / calls / imports)
+    2. Restricted __builtins__ (whitelisted only)
+    3. Thread-based execution timeout (MAX_EXEC_SECONDS)
+    Returns (result, chart_b64, chart_json).
+    """
+    # Layer 1 — AST security scan (raises SecurityError on violations)
+    validate_code_ast(code)
+
+    # Layer 2 — restricted sandbox globals
     safe_globals = {
         "__builtins__": SAFE_BUILTINS,
         "pd": pd, "np": np, "plt": plt, "sns": sns, "io": io, "base64": base64,
@@ -712,13 +787,34 @@ def execute_code(code: str, df: pd.DataFrame) -> tuple[str, str | None, str | No
         "chart_b64": None,
         "chart_json": None,
     }
-    exec(code, safe_globals, local_vars)
-    result    = local_vars.get("result")
-    chart_b64 = local_vars.get("chart_b64")
+
+    # Layer 3 — execution timeout via thread pool
+    def _run():
+        exec(code, safe_globals, local_vars)  # noqa: S102
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(_run)
+        try:
+            future.result(timeout=MAX_EXEC_SECONDS)
+        except concurrent.futures.TimeoutError:
+            raise TimeoutError(
+                f"Code execution exceeded the {MAX_EXEC_SECONDS}s time limit and was cancelled."
+            )
+
+    result     = local_vars.get("result")
+    chart_b64  = local_vars.get("chart_b64")
     chart_json = local_vars.get("chart_json")
+
     if result is None:
         result = "Done. See chart above." if (chart_b64 or chart_json) else "No result returned."
-    return str(result), chart_b64, chart_json
+
+    # Result size guard — truncate enormous outputs
+    result_str = str(result)
+    if len(result_str) > MAX_RESULT_CHARS:
+        result_str = (result_str[:MAX_RESULT_CHARS]
+                      + f"\n… [truncated — {len(result_str):,} chars total]")
+
+    return result_str, chart_b64, chart_json
 
 
 @app.get("/health")
