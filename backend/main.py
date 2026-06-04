@@ -74,11 +74,16 @@ from dotenv import load_dotenv
 
 load_dotenv(override=True)
 
-app = FastAPI(title="CSV Analyst Agent")
+app = FastAPI(title="CSV Analyst AI — Agentic Data Scientist")
+
+# ALLOWED_ORIGINS: comma-separated list, e.g. "https://your-app.vercel.app"
+# Falls back to "*" in local dev (when env var is not set).
+_raw_origins = os.environ.get("ALLOWED_ORIGINS", "*")
+ALLOWED_ORIGINS = [o.strip() for o in _raw_origins.split(",")] if _raw_origins != "*" else ["*"]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

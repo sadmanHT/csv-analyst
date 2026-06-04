@@ -7,6 +7,10 @@ import {
 } from './icons.jsx'
 import Plotly from 'plotly.js-dist-min'
 
+// In production VITE_API_BASE_URL points to the Railway backend.
+// In local dev it is empty and Vite proxies all API calls automatically.
+const API = import.meta.env.VITE_API_BASE_URL ?? ''
+
 // ─── Domain categories (the differentiator) ────────────────────────────────────
 
 const CATEGORIES = [
@@ -223,7 +227,7 @@ function UploadScreen({ onUpload, uploading, setUploading, category, setCategory
     const fd = new FormData()
     fd.append('file', file)
     try {
-      const res = await fetch('/upload', { method: 'POST', body: fd })
+      const res = await fetch(`${API}/upload`, { method: 'POST', body: fd })
       const data = await res.json()
       if (!res.ok) throw new Error(data.detail || 'Upload failed')
       onUpload({ ...data, uploadedAt: new Date() })
@@ -302,7 +306,7 @@ function DocUploadPanel({ sessionId, docs, onDocsUpdated }) {
     const fd = new FormData()
     fd.append('file', file)
     try {
-      const res = await fetch(`/upload_doc?session_id=${sessionId}`, { method: 'POST', body: fd })
+      const res = await fetch(`${API}/upload_doc?session_id=${sessionId}`, { method: 'POST', body: fd })
       const data = await res.json()
       if (!res.ok) throw new Error(data.detail || 'Upload failed')
       onDocsUpdated(data.filenames)
@@ -453,7 +457,7 @@ function PredictInputCard({ sessionId, modelInfo }) {
   const run = async () => {
     setBusy(true); setResult(null)
     try {
-      const res = await fetch('/predict_input', {
+      const res = await fetch(`${API}/predict_input`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ session_id: sessionId, values }),
@@ -516,7 +520,7 @@ function BenchmarkModal({ sessionId, onClose }) {
   const run = async () => {
     setRunning(true); setData(null); setError(null)
     try {
-      const res = await fetch(`/benchmark/${sessionId}?n=${n}`)
+      const res = await fetch(`${API}/benchmark/${sessionId}?n=${n}`)
       const json = await res.json()
       if (!res.ok) throw new Error(json.detail || 'Benchmark failed')
       setData(json)
@@ -622,7 +626,7 @@ function ExportCard({ upload, messages, category }) {
         category,
         filename: upload.filename.replace('.csv', ''),
       }
-      const res = await fetch(`/report/${upload.session_id}?format=${format}`, {
+      const res = await fetch(`${API}/report/${upload.session_id}?format=${format}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
@@ -1069,7 +1073,7 @@ export default function App() {
     if (!text.trim()) return
     setUploading(true)
     try {
-      const res = await fetch('/upload_text', {
+      const res = await fetch(`${API}/upload_text`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ text, has_header: hasHeader, filename: 'pasted_data.csv' }),
@@ -1157,15 +1161,15 @@ export default function App() {
     const text = (typeof q === 'string' ? q : question).trim()
     if (!text) return
     setQuestion('')
-    return streamInto('/query', { session_id: upload.session_id, question: text, category }, text)
+    return streamInto(`${API}/query`, { session_id: upload.session_id, question: text, category }, text)
   }, [question, upload, category, streamInto])
 
   const predict = useCallback(async (target) => {
     if (!target) return
-    await streamInto('/predict', { session_id: upload.session_id, target, category }, `🔮 Predict "${target}"`)
+    await streamInto(`${API}/predict`, { session_id: upload.session_id, target, category }, `🔮 Predict "${target}"`)
     // Load the trained-model metadata so the user can predict new cases.
     try {
-      const res = await fetch(`/model_info/${upload.session_id}`)
+      const res = await fetch(`${API}/model_info/${upload.session_id}`)
       if (res.ok) {
         const info = await res.json()
         if (info.trained) setModelInfo(info)

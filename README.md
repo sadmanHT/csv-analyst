@@ -1,22 +1,69 @@
-# CSV Analyst AI — Gemini Edition
+# CSV Analyst AI — Agentic Data Scientist
 
-A domain-aware AI data analyst that lets you upload a CSV and ask questions in plain English. Powered by **Google Gemini 2.0 Flash**, it writes and executes pandas/matplotlib code on your data in a secure sandbox, streams every step live, and renders publication-quality charts — no coding required.
+> **Powered by Google Gemini 2.5 Flash-Lite · Built for the MLH Gemini Prize**
 
-Built for the **MLH Gemini Prize** track.
+A production-grade, domain-aware AI data analyst. Upload a CSV (or paste rows from Excel/Sheets), ask questions in plain English, and a **multi-agent pipeline** reasons over your data like a senior analyst — planning, computing, visualising, critiquing, and reporting.
+
+---
+
+## What Makes This Different
+
+| Feature | Most CSV chatbots | This project |
+|---|---|---|
+| Architecture | Single LLM call | 5-agent pipeline (Planner → Analyst → Visualizer → Critic → Reporter) |
+| Charts | Static PNG | Interactive Plotly (zoom, hover, pan) |
+| ML | None | Random Forest + SHAP + Permutation Importance + PDP |
+| SQL | Never | Planner auto-routes to SQLite when appropriate |
+| RAG | None | Gemini embeddings over uploaded PDFs / Excel docs |
+| Security | `exec()` sandbox | AST scan + restricted builtins + 30s timeout |
+| Export | None | PDF (reportlab) + PPTX (python-pptx) with all charts |
+| Evaluation | None | 49-question benchmark suite with live metrics dashboard |
 
 ---
 
 ## Features
 
-- **Natural language analysis** — ask any question; Gemini writes the pandas code, runs it, and narrates the result
-- **Domain lenses** — switch between General, Financial, Medical, Retail, Marketing, and HR modes to get expert-framed answers
-- **Instant overview dashboard** — correlation heatmap, distributions, and top-category charts auto-generated the moment your CSV loads (no LLM call)
-- **Predictive ML** — train a Random Forest classifier or regressor on any column with one click; see feature importance and live inference on new cases
-- **Paste data** — paste rows copied from Excel or Google Sheets directly, no file needed
-- **Self-correcting agent** — if generated code fails, the agent automatically retries with the error context
-- **Secure sandbox** — generated code runs in a whitelisted exec environment; `os`, `sys`, `subprocess` and friends are blocked
-- **Streaming UI** — every agent step (analyze → think → code → execute → done) streamed live via SSE
-- **24 pytest tests** covering upload, text paste, overview charts, sandbox, and the full ML predict flow
+### Multi-Agent Pipeline
+Every question runs through 5 chained Gemini agents:
+1. **Planner** — maps the question to relevant columns, picks analysis strategy and chart type, decides pandas vs SQL
+2. **Analyst** — writes and executes pandas code for numerical findings (with self-repair on failure)
+3. **Visualizer** — generates interactive Plotly charts (bar, line, scatter, histogram, heatmap, box…)
+4. **Critic** — reviews statistical soundness, returns `pass/warn/fail` verdict + confidence score + issues
+5. **Reporter** — writes a structured executive summary (Headline · Key Findings · Implication · Caveat)
+
+### Domain Lenses
+6 expert modes that change how the agent reasons: **General · Financial · Medical · Retail · Marketing · HR**
+
+### RAG over Documentation
+Upload PDFs, Excel files, or data dictionaries alongside your CSV. Gemini `text-embedding-004` indexes them into a per-session vector store (numpy cosine similarity). Relevant chunks are retrieved and injected into the Planner and Analyst prompts.
+
+### Explainable ML
+One-click Random Forest training with full explainability:
+- **SHAP beeswarm** — global feature impact with directionality
+- **Permutation importance** — statistically robust, test-set importance with error bars
+- **Partial Dependence Plots** — how the top 2 features affect the prediction
+- Live inference form for predicting new cases
+
+### SQL Generation
+The Planner automatically routes filter/group-by/top-N questions to a SQL agent that generates SQLite queries run against an in-memory database.
+
+### Instant Overview Dashboard
+Auto-generated correlation heatmap + distribution plots + top-category chart the moment a CSV loads — zero LLM calls.
+
+### Secure Sandbox (3 Layers)
+1. **AST scan** — blocks `__class__`, `__globals__`, `eval`, `exec`, `compile`, `open`, `subprocess` before execution
+2. **Restricted namespace** — `__builtins__` replaced with a 40-entry whitelist
+3. **Thread timeout** — hard 30-second wall-clock limit via `ThreadPoolExecutor`
+
+### Export
+- **PDF** — cover page, dataset profile table, numeric stats, per-message sections with charts, SHAP plots, critique verdicts
+- **PPTX** — branded title slide, KPI card slide, one slide per message with chart + summary
+
+### Benchmark Evaluation
+49-question suite across 8 domains. Metrics: success rate, chart rate, SQL routing accuracy, repair rate, avg response time. Run from the UI or CLI:
+```bash
+python benchmark.py --csv data.csv --n 30 --out results.json
+```
 
 ---
 
@@ -24,127 +71,115 @@ Built for the **MLH Gemini Prize** track.
 
 | Layer | Technology |
 |---|---|
-| LLM | Google Gemini 2.0 Flash (`google-genai`) |
+| LLM | Gemini 2.5 Flash-Lite (`google-genai`) |
+| Embeddings | Gemini `text-embedding-004` |
 | Backend | FastAPI + uvicorn |
-| Data | pandas, numpy, matplotlib, seaborn, scikit-learn |
+| Data | pandas, numpy, matplotlib, seaborn |
+| ML | scikit-learn (Random Forest) |
+| Explainability | SHAP, sklearn.inspection |
+| Charts | Plotly (interactive) + matplotlib/seaborn (static) |
+| SQL | SQLite (stdlib) |
+| RAG | numpy cosine similarity |
+| PDF export | reportlab |
+| PPTX export | python-pptx |
+| Chart → image | kaleido |
+| Doc parsing | pypdf, openpyxl |
 | Frontend | React 18 + Vite |
-| Tests | pytest + FastAPI TestClient |
+| Tests | pytest + FastAPI TestClient (42 tests) |
 
 ---
 
-## Quick Start
+## Quick Start (Local)
 
 ### Prerequisites
-
-- Python 3.11+
-- Node.js 18+
+- Python 3.11+, Node.js 18+
 - A [Google AI Studio](https://aistudio.google.com/) API key
 
-### 1. Clone and set up the backend
-
+### Backend
 ```bash
-git clone https://github.com/sadmanHT/csv-analyst.git
-cd csv-analyst/backend
-
+cd backend
 python -m venv .venv
-# Windows
-.venv\Scripts\activate
-# macOS/Linux
-source .venv/bin/activate
-
+.venv\Scripts\activate          # Windows
+# source .venv/bin/activate     # macOS/Linux
 pip install -r requirements.txt
 ```
 
-Create a `.env` file in the `backend/` directory:
-
+Create `backend/.env`:
 ```
-GEMINI_API_KEY=your_api_key_here
+GEMINI_API_KEY=your_key_here
 ```
-
-### 2. Start the backend
 
 ```bash
 uvicorn main:app --reload --port 8001
 ```
 
-### 3. Start the frontend
-
+### Frontend
 ```bash
-cd ../frontend
+cd frontend
 npm install
 npm run dev
 ```
 
-Open [http://localhost:5174](http://localhost:5174) in your browser.
-
-> The Vite dev server proxies `/upload`, `/query`, `/predict`, etc. to `localhost:8001` automatically.
+Open **http://localhost:5174**
 
 ---
 
-## Usage
+## Deploy to Production
 
-1. **Pick a lens** — choose General, Financial, Medical, Retail, Marketing, or HR
-2. **Upload a CSV** — drag and drop, click to browse, or paste rows from Excel/Sheets
-3. **Explore the overview** — instant charts appear as soon as your data loads
-4. **Ask questions** — type in plain English; the agent writes code, runs it, and shows the chart
-5. **Train a model** — click "Train & Predict" in the right panel, pick a target column
-6. **Predict new cases** — after training, enter values in the inference form to get live predictions
+### Backend → Railway
 
-### Sample dataset
+1. New project at [railway.app](https://railway.app) → GitHub repo → **Root Directory: `backend/`**
+2. Railway auto-detects Python via `railway.toml` (included)
+3. Add environment variables in Railway dashboard:
+   ```
+   GEMINI_API_KEY=your_key_here
+   ALLOWED_ORIGINS=https://your-app.vercel.app
+   ```
+4. Copy your Railway public URL
 
-A sample e-commerce CSV is included at `sample_data/ecommerce_sales.csv` to try right away.
+### Frontend → Vercel
 
----
-
-## Running Tests
-
-```bash
-cd backend
-pytest test_main.py -v
-```
-
-24 tests cover:
-- CSV and text upload endpoints
-- Instant overview chart generation
-- Data profiling (missing values, duplicates, numeric stats)
-- Sandbox security (blocked imports)
-- Random Forest classifier and regressor training
-- Full predict → model_info → predict_input flow
-- Error cases (unknown session, bad target column, too few rows)
+1. Import repo at [vercel.com/new](https://vercel.com/new) → **Root Directory: `frontend/`**
+2. Add environment variable:
+   ```
+   VITE_API_BASE_URL=https://your-railway-url.up.railway.app
+   ```
+3. Deploy — `frontend/vercel.json` is picked up automatically
 
 ---
 
-## Project Structure
-
-```
-csv-analyst/
-├── backend/
-│   ├── main.py           # FastAPI app, Gemini agent, sandbox, ML training
-│   ├── test_main.py      # 24 pytest tests
-│   └── requirements.txt
-├── frontend/
-│   └── src/
-│       ├── App.jsx       # React UI (upload, chat, insights panel, predict)
-│       ├── App.css       # Styles
-│       └── icons.jsx     # SVG icon components
-├── sample_data/
-│   └── ecommerce_sales.csv
-└── AGENTS.md             # Agent behavior rules
-```
-
----
-
-## API Endpoints
+## API Reference
 
 | Method | Path | Description |
 |---|---|---|
 | `GET` | `/health` | Health check |
-| `POST` | `/upload` | Upload a CSV file |
-| `POST` | `/upload_text` | Paste CSV/TSV rows as text |
+| `POST` | `/upload` | Upload CSV file |
+| `POST` | `/upload_text` | Paste CSV/TSV rows |
+| `POST` | `/upload_doc?session_id=` | Upload PDF/Excel for RAG |
 | `POST` | `/query` | Ask a question (SSE stream) |
-| `POST` | `/predict` | Train a Random Forest model (SSE stream) |
-| `GET` | `/model_info/{session_id}` | Get trained model metadata |
-| `POST` | `/predict_input` | Run inference on a new row |
+| `POST` | `/predict` | Train RF + SHAP (SSE stream) |
+| `GET` | `/model_info/{id}` | Trained model metadata |
+| `POST` | `/predict_input` | Inference on a new row |
+| `POST` | `/report/{id}?format=pdf\|pptx` | Generate business report |
+| `GET` | `/benchmark/{id}?n=15` | Run benchmark suite |
+
+Full Swagger UI at `/docs`.
+
+---
+
+## Tests
+
+```bash
+cd backend && pytest test_main.py -v
+```
+
+42 tests covering: upload, RAG, sandbox security (AST blocks `eval`/`exec`/dunders), Plotly charts, SQL generation, ML training, full predict flow, error cases.
+
+---
+
+## CV Bullet
+
+> **Agentic Data Scientist (Gemini 2.5 Flash-Lite)** — Autonomous data-analysis platform with multi-agent reasoning (Planner→Analyst→Visualizer→Critic→Reporter), interactive Plotly charts, RAG via Gemini embeddings, explainable ML (SHAP + permutation importance + PDP), SQL auto-generation, 3-layer AST security sandbox, PDF/PPTX export, and a 49-question benchmark evaluation suite.
 
 ---
 
