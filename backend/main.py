@@ -80,7 +80,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-GEMINI_MODEL = "gemini-2.0-flash"
+GEMINI_MODEL = "gemini-2.5-flash-lite-preview-06-17"
 client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
 
 dataframes: dict[str, pd.DataFrame] = {}
