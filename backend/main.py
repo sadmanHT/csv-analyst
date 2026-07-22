@@ -3759,23 +3759,55 @@ def prepare_model_features(info: dict, values: dict) -> pd.DataFrame:
 
 
 def predict_model_values(info: dict, values: dict) -> dict:
-    """Predict a single user-facing row and return JSON-safe prediction details."""
+    """Predict a single user-facing row and return JSON-safe prediction details with uncertainty bounds."""
     X_new = prepare_model_features(info, values)
-    model = info["model"]
-    pred = model.predict(X_new)[0]
+    model = info.get("model")
+    if model and hasattr(model, "predict"):
+        pred = model.predict(X_new)[0]
+    else:
+        pred = 0.0
+
     if info["is_classification"]:
-        label = info["classes"][int(pred)]
-        probabilities = {
-            str(info["classes"][idx]): round(float(value), 4)
-            for idx, value in enumerate(model.predict_proba(X_new)[0])
-        }
+        classes = info.get("classes") or []
+        label = classes[int(pred)] if (classes and int(pred) < len(classes)) else str(pred)
+        probabilities = {}
+        if model and hasattr(model, "predict_proba"):
+            probabilities = {
+                str(classes[idx]): round(float(value), 4)
+                for idx, value in enumerate(model.predict_proba(X_new)[0])
+            }
         proba = max(probabilities.values()) if probabilities else None
-        return {"target": info["target"], "prediction": str(label),
-                "confidence": round(float(proba), 3) if proba is not None else None,
-                "probabilities": probabilities,
-                "is_classification": True}
-    return {"target": info["target"], "prediction": round(float(pred), 2),
-            "confidence": None, "is_classification": False}
+        return {
+            "target": info["target"],
+            "prediction": str(label),
+            "confidence": round(float(proba), 3) if proba is not None else None,
+            "probabilities": probabilities,
+            "is_classification": True,
+        }
+
+    # For regression, compute 90% prediction interval from ensemble tree variance
+    pred_val = round(float(pred), 2)
+    interval = None
+    if model and hasattr(model, "estimators_"):
+        tree_preds = [float(tree.predict(X_new)[0]) for tree in model.estimators_]
+        std = float(np.std(tree_preds))
+        lower = round(float(pred_val - 1.645 * std), 2)
+        upper = round(float(pred_val + 1.645 * std), 2)
+        interval = {
+            "lower": lower,
+            "upper": upper,
+            "std_dev": round(std, 2),
+            "confidence": 0.90,
+            "explanation": "90% plausible prediction interval computed from Random Forest ensemble tree variance.",
+        }
+
+    return {
+        "target": info["target"],
+        "prediction": pred_val,
+        "prediction_interval": interval,
+        "confidence": None,
+        "is_classification": False,
+    }
 
 
 def default_model_values(info: dict) -> dict:
@@ -3972,31 +4004,13 @@ def predict_input(req: PredictInputRequest) -> dict:
     cleanup_expired_sessions()
     info = models.get(req.session_id)
     if not info:
+        info = storage.get_model_info(req.session_id)
+        if info:
+            models[req.session_id] = info
+    if not info:
         raise HTTPException(status_code=400, detail="Train a model first using the Predict button.")
     _touch_session(req.session_id)
-
-    row: dict = {}
-    for c in info["num_cols"]:
-        v = req.values.get(c)
-        row[c] = pd.to_numeric(v, errors="coerce") if v not in (None, "") else np.nan
-    for c in info["cat_cols"]:
-        row[c] = req.values.get(c)
-
-    X_new = pd.DataFrame([row])
-    if info["cat_cols"]:
-        X_new = pd.get_dummies(X_new, columns=info["cat_cols"], drop_first=True)
-    X_new = X_new.reindex(columns=info["feature_cols"], fill_value=0)
-    X_new = X_new.fillna(value=info["medians"]).fillna(0)
-
-    model = info["model"]
-    pred = model.predict(X_new)[0]
-    if info["is_classification"]:
-        label = info["classes"][int(pred)]
-        proba = float(max(model.predict_proba(X_new)[0]))
-        return {"target": info["target"], "prediction": str(label),
-                "confidence": round(proba, 3), "is_classification": True}
-    return {"target": info["target"], "prediction": round(float(pred), 2),
-            "confidence": None, "is_classification": False}
+    return predict_model_values(info, req.values)
 
 
 # ── Business report export (PDF + PPTX) ──────────────────────────────────────

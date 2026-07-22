@@ -1267,3 +1267,41 @@ def test_job_persistence_across_simulated_restart():
     assert b["status"] == "completed"
     assert b["result"]["report"] == "OK"
 
+
+def test_recover_orphan_jobs_on_startup():
+    import storage
+    import main
+    job = main.create_job("predict", "session-orphan")
+    job_id = job["job_id"]
+
+    # Simulate server crash leaving job in 'queued' state
+    recovered = storage.recover_orphan_jobs()
+    assert recovered >= 1
+
+    j = storage.get_job(job_id)
+    assert j["status"] == "failed"
+    assert "Server restarted" in j["error"]
+
+
+def test_predict_input_includes_prediction_interval():
+    import test_main
+    df = pd.DataFrame({
+        "x1": np.random.randn(100),
+        "x2": np.random.randn(100),
+        "target": np.random.randn(100) * 10 + 50,
+    })
+    up = client.post("/upload_text", json={"text": df.to_csv(index=False), "has_header": True})
+    sid = up.json()["session_id"]
+
+    client.post("/predict", json={"session_id": sid, "target": "target"})
+    res = client.post("/predict_input", json={"session_id": sid, "values": {"x1": 0.5, "x2": -0.2}})
+    assert res.status_code == 200
+    body = res.json()
+    assert "prediction" in body
+    assert body["is_classification"] is False
+    assert "prediction_interval" in body
+    interval = body["prediction_interval"]
+    assert interval["confidence"] == 0.90
+    assert interval["lower"] <= body["prediction"] <= interval["upper"]
+
+

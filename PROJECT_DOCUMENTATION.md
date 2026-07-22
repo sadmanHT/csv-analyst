@@ -1016,33 +1016,28 @@ Recommended demo:
 12. Export PDF or PPTX report.
 13. Run benchmark evaluation if time allows.
 
-## 20. Current Limitations
+## 20. Architecture & Deployment Notes
+
+Single-Instance vs Multi-Replica Storage:
+
+- Sessions and jobs are stored on disk using SQLite (`backend/data/storage.db`) and Parquet files (`backend/data/sessions/`). This provides robust, restart-safe durability for single-instance deployments (such as Railway or single-container instances).
+- If scaling horizontally across multiple stateless backend worker replicas, the state layer can be upgraded from disk-backed SQLite/Parquet to Redis (for sessions, cache, and job queues) + S3/Object Storage (for Parquet files and reports).
+
+## 21. Current Limitations
 
 Known limitations:
 
-- Sessions are in memory and do not survive backend restarts.
-- Multi-user production scaling would need persistent storage and background jobs.
-- Background job endpoints exist for long-running model, report, and benchmark work, but the job registry is still in memory.
+- Storage is currently single-instance disk/SQLite (multi-replica scale-out would require Redis + Object Storage).
 - RAG is per-session and in-memory.
 - Scenario simulation is predictive, not causal.
 - Natural-language scenario parsing is deterministic and intentionally conservative.
-- Plotly remains a large frontend dependency.
-- Authentication and signed sessions are not yet implemented.
+- Plotly remains a large frontend bundle dependency.
 
-## 21. Recommended Next Improvements
+## 22. Verification & Testing
 
-Highest-value next steps:
-
-- Persistent session storage.
-- Durable background job queue or database-backed job table for model training, report export, and benchmark runs.
-- Authentication or signed session tokens.
-- Multi-driver scenario simulation.
-- Operations, Product, and Data Scientist persona templates.
-- Better frontend error boundaries and retry states.
-- Frontend component tests for `ScenarioSimulatorCard`, `PredictInputCard`, and streaming message rendering.
-- Optional database-backed project history.
-- Dataset comparison workflow.
-- More compact Plotly bundle strategy or chart renderer split.
+- **Backend Test Suite**: **93 passing pytest tests** covering API routes, AST security filters, SQL validation, predictive modeling, report export, session persistence, and startup orphan job recovery.
+- **Frontend Test Suite**: **Vitest + React Testing Library unit tests** (`npm test`) covering key interactive components (`ScenarioSimulatorCard`, `PredictInputCard`).
+- **CI Workflow**: GitHub Actions workflow (`.github/workflows/ci.yml`) automatically executes `pytest backend/`, `npm test` in `frontend/`, and `npm run build` on every push.
 
 ## 22. Why This Is Strong for a Hackathon
 

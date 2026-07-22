@@ -457,7 +457,7 @@ function Sidebar({ upload, category, setCategory, onReset, docs, onDocsUpdated }
 
 // ─── Insights Panel ────────────────────────────────────────────────────────────
 
-function PredictInputCard({ sessionId, modelInfo }) {
+export function PredictInputCard({ sessionId, modelInfo }) {
   const features = modelInfo.features
   const [values, setValues] = useState(() =>
     Object.fromEntries(features.map((f) => [f.name, f.default ?? ''])))
@@ -533,7 +533,7 @@ function PredictInputCard({ sessionId, modelInfo }) {
   )
 }
 
-function ScenarioSimulatorCard({ sessionId, modelInfo, category }) {
+export function ScenarioSimulatorCard({ sessionId, modelInfo, category }) {
   const features = modelInfo.features
   const firstNumeric = features.find((f) => f.type === 'number')?.name || features[0]?.name || ''
   const [feature, setFeature] = useState(firstNumeric)

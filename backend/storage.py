@@ -63,6 +63,24 @@ def init_db(db_path: str = DB_PATH) -> None:
     conn.close()
 
 
+def recover_orphan_jobs(db_path: str = DB_PATH) -> int:
+    conn = get_db_connection(db_path)
+    cursor = conn.cursor()
+    now = time.time()
+    cursor.execute(
+        """
+        UPDATE jobs
+        SET status = 'failed', error = 'Server restarted while job was executing', updated_at = ?
+        WHERE status IN ('queued', 'running')
+        """,
+        (now,),
+    )
+    count = cursor.rowcount
+    conn.commit()
+    conn.close()
+    return count
+
+
 def save_session(
     session_id: str,
     token: str,
