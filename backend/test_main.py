@@ -1305,3 +1305,56 @@ def test_predict_input_includes_prediction_interval():
     assert interval["lower"] <= body["prediction"] <= interval["upper"]
 
 
+def test_upload_excel_xlsx():
+    df = pd.DataFrame({"item": ["Earbuds", "Speaker"], "price": [90, 120]})
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        df.to_excel(writer, sheet_name="Products", index=False)
+    buf.seek(0)
+
+    res = client.post(
+        "/upload",
+        files={"file": ("products.xlsx", buf, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+    )
+    assert res.status_code == 200
+    b = res.json()
+    assert b["rows"] == 2
+    assert "item" in b["columns"]
+    assert "sheets" in b
+    assert "Products" in b["sheets"]
+
+
+def test_infer_join_keys_and_join_datasets():
+    df_customers = pd.DataFrame({"customer_id": [1, 2, 3], "name": ["Alice", "Bob", "Charlie"]})
+    df_orders = pd.DataFrame({"order_id": [101, 102, 103], "customer_id": [1, 2, 1], "amount": [50, 100, 75]})
+
+    up1 = client.post("/upload_text", json={"text": df_customers.to_csv(index=False), "has_header": True, "filename": "customers.csv"})
+    up2 = client.post("/upload_text", json={"text": df_orders.to_csv(index=False), "has_header": True, "filename": "orders.csv"})
+    sid1 = up1.json()["session_id"]
+    sid2 = up2.json()["session_id"]
+
+    infer = client.post("/infer_join", json={"session_id_1": sid1, "session_id_2": sid2})
+    assert infer.status_code == 200
+    cands = infer.json()["candidates"]
+    assert len(cands) > 0
+    assert cands[0]["column_1"] == "customer_id"
+    assert cands[0]["column_2"] == "customer_id"
+    assert cands[0]["score"] >= 0.7
+
+    joined = client.post("/join", json={
+        "session_id_1": sid1,
+        "session_id_2": sid2,
+        "join_key_1": "customer_id",
+        "join_key_2": "customer_id",
+        "how": "inner",
+    })
+    assert joined.status_code == 200
+    jbody = joined.json()
+    assert jbody["rows"] == 3
+    assert "name" in jbody["columns"]
+    assert "amount" in jbody["columns"]
+    assert jbody["join_metadata"]["left_rows_before"] == 3
+    assert jbody["join_metadata"]["right_rows_before"] == 3
+
+
+

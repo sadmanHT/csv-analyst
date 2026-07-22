@@ -271,6 +271,19 @@ class TextUploadRequest(BaseModel):
     has_header: bool = True
 
 
+class InferJoinRequest(BaseModel):
+    session_id_1: str
+    session_id_2: str
+
+
+class JoinRequest(BaseModel):
+    session_id_1: str
+    session_id_2: str
+    join_key_1: str
+    join_key_2: str
+    how: str = "inner"
+
+
 class PredictInputRequest(BaseModel):
     session_id: str
     values: dict
@@ -3086,16 +3099,152 @@ def register_dataframe(df: pd.DataFrame, filename: str) -> dict:
     }
 
 
+def infer_join_keys(df1: pd.DataFrame, df2: pd.DataFrame) -> list[dict]:
+    """Find candidate join keys across two DataFrames using column names and value overlaps."""
+    candidates: list[dict] = []
+    cols1 = [str(c) for c in df1.columns]
+    cols2 = [str(c) for c in df2.columns]
+
+    for c1 in cols1:
+        s1 = df1[c1].dropna().astype(str).str.strip()
+        if s1.empty:
+            continue
+        vals1 = set(s1)
+
+        for c2 in cols2:
+            s2 = df2[c2].dropna().astype(str).str.strip()
+            if s2.empty:
+                continue
+            vals2 = set(s2)
+
+            name_match = (c1.lower() == c2.lower())
+            id_like = (c1.lower().endswith("id") or c2.lower().endswith("id") or c1.lower() == "id" or c2.lower() == "id")
+
+            if not (name_match or id_like or len(vals1 & vals2) > 0):
+                continue
+
+            common_vals = vals1 & vals2
+            if not common_vals:
+                continue
+
+            overlap_ratio1 = len(common_vals) / len(vals1) if vals1 else 0.0
+            overlap_ratio2 = len(common_vals) / len(vals2) if vals2 else 0.0
+            max_overlap = max(overlap_ratio1, overlap_ratio2)
+
+            score = max_overlap * 0.6
+            if name_match:
+                score += 0.3
+            if id_like:
+                score += 0.1
+            score = round(min(1.0, score), 2)
+
+            if score >= 0.2:
+                sample_matches = sorted(list(common_vals))[:3]
+                candidates.append({
+                    "column_1": c1,
+                    "column_2": c2,
+                    "score": score,
+                    "confidence_label": "High" if score >= 0.7 else "Medium" if score >= 0.4 else "Low",
+                    "matched_unique_count": len(common_vals),
+                    "overlap_pct_1": round(overlap_ratio1 * 100, 1),
+                    "overlap_pct_2": round(overlap_ratio2 * 100, 1),
+                    "sample_matches": sample_matches,
+                })
+
+    candidates.sort(key=lambda x: float(x["score"]), reverse=True)
+    return candidates[:5]
+
+
 @app.post("/upload")
-async def upload_csv(file: UploadFile = File(...)) -> dict:
-    if not file.filename.endswith(".csv"):
-        raise HTTPException(status_code=400, detail="Only CSV files are supported")
+async def upload_file(
+    file: UploadFile = File(...),
+    sheet_name: str | None = None,
+) -> dict:
+    ext = file.filename.rsplit(".", 1)[-1].lower() if "." in file.filename else ""
+    if ext not in ("csv", "xlsx", "xls", "parquet"):
+        raise HTTPException(
+            status_code=400,
+            detail="Unsupported file format. Supported formats: .csv, .xlsx, .xls, .parquet",
+        )
+
     content = await read_upload_limited(file)
+    sheets: list[str] = []
+
     try:
-        df = pd.read_csv(io.BytesIO(content))
+        if ext in ("xlsx", "xls"):
+            excel_file = pd.ExcelFile(io.BytesIO(content))
+            sheets = excel_file.sheet_names
+            target_sheet = sheet_name if (sheet_name and sheet_name in sheets) else 0
+            df = pd.read_excel(excel_file, sheet_name=target_sheet)
+        elif ext == "parquet":
+            df = pd.read_parquet(io.BytesIO(content))
+        else:
+            df = pd.read_csv(io.BytesIO(content))
     except Exception as e:
-        raise HTTPException(status_code=422, detail=f"Could not parse CSV: {e}")
-    return register_dataframe(df, file.filename)
+        raise HTTPException(status_code=422, detail=f"Could not parse uploaded file: {e}")
+
+    result = register_dataframe(df, file.filename)
+    if sheets:
+        result["sheets"] = sheets
+    return result
+
+
+@app.post("/infer_join")
+def infer_join_endpoint(req: InferJoinRequest) -> dict:
+    df1 = get_session_df(req.session_id_1)
+    df2 = get_session_df(req.session_id_2)
+    candidates = infer_join_keys(df1, df2)
+    return {
+        "session_id_1": req.session_id_1,
+        "session_id_2": req.session_id_2,
+        "candidates": candidates,
+    }
+
+
+@app.post("/join")
+def join_datasets(req: JoinRequest) -> dict:
+    df1 = get_session_df(req.session_id_1)
+    df2 = get_session_df(req.session_id_2)
+
+    if req.join_key_1 not in df1.columns:
+        raise HTTPException(status_code=400, detail=f"Column '{req.join_key_1}' not found in first dataset.")
+    if req.join_key_2 not in df2.columns:
+        raise HTTPException(status_code=400, detail=f"Column '{req.join_key_2}' not found in second dataset.")
+    if req.how not in ("inner", "left", "right", "outer"):
+        raise HTTPException(status_code=400, detail="Invalid join type. Use 'inner', 'left', 'right', or 'outer'.")
+
+    try:
+        joined_df = pd.merge(
+            df1,
+            df2,
+            left_on=req.join_key_1,
+            right_on=req.join_key_2,
+            how=req.how,
+            suffixes=("_left", "_right"),
+        )
+    except Exception as e:
+        raise HTTPException(status_code=422, detail=f"Could not join datasets: {e}")
+
+    meta1 = session_meta.get(req.session_id_1, {})
+    meta2 = session_meta.get(req.session_id_2, {})
+    f1 = str(meta1.get("filename", "table1")).rsplit(".", 1)[0]
+    f2 = str(meta2.get("filename", "table2")).rsplit(".", 1)[0]
+    joined_filename = f"{f1}_{req.how}_join_{f2}.csv"
+
+    res = register_dataframe(joined_df, joined_filename)
+    res["join_metadata"] = {
+        "left_session_id": req.session_id_1,
+        "right_session_id": req.session_id_2,
+        "left_filename": meta1.get("filename", "table1"),
+        "right_filename": meta2.get("filename", "table2"),
+        "join_key_1": req.join_key_1,
+        "join_key_2": req.join_key_2,
+        "how": req.how,
+        "left_rows_before": len(df1),
+        "right_rows_before": len(df2),
+        "rows_after": len(joined_df),
+    }
+    return res
 
 
 @app.post("/upload_text")
