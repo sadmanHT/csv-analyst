@@ -1231,3 +1231,39 @@ def test_predict_bad_target():
     sid = up.json()["session_id"]
     res = client.post("/predict", json={"session_id": sid, "target": "no_such_col"})
     assert res.status_code == 400
+
+
+def test_upload_returns_token_and_persists():
+    up = client.post("/upload", files={"file": ("data.csv", io.BytesIO(make_csv(SAMPLE_CSV)), "text/csv")})
+    assert up.status_code == 200
+    body = up.json()
+    assert "token" in body
+    assert len(body["token"]) > 10
+    sid = body["session_id"]
+
+    import main
+    # Simulate server restart by clearing in-memory dataframes
+    main.dataframes.clear()
+
+    # Session endpoints should still load the dataset from SQLite/Parquet on disk
+    brief = client.get(f"/brief/{sid}")
+    assert brief.status_code == 200
+    assert brief.json()["readiness_score"] >= 0
+
+
+def test_job_persistence_across_simulated_restart():
+    import main
+    job = main.create_job("report", "session-123")
+    job_id = job["job_id"]
+    main.update_job(job_id, "completed", result={"report": "OK"})
+
+    # Simulate server restart by clearing in-memory jobs registry
+    main.jobs.clear()
+
+    res = client.get(f"/jobs/{job_id}")
+    assert res.status_code == 200
+    b = res.json()
+    assert b["job_id"] == job_id
+    assert b["status"] == "completed"
+    assert b["result"]["report"] == "OK"
+

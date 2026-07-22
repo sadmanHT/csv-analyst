@@ -76,6 +76,7 @@ from google import genai
 from google.genai import types
 from dotenv import load_dotenv
 from sandbox_runner import execute_code_worker
+import storage
 
 load_dotenv(override=True)
 
@@ -317,6 +318,28 @@ def _delete_session(session_id: str) -> None:
             query_cache.pop(key, None)
 
 
+def get_session_df(session_id: str) -> pd.DataFrame:
+    """Retrieve session DataFrame from memory cache or load from SQLite/Parquet on disk."""
+    cleanup_expired_sessions()
+    if session_id in dataframes:
+        _touch_session(session_id)
+        storage.update_session_access(session_id)
+        return dataframes[session_id]
+    df = storage.load_dataframe(session_id)
+    if df is not None:
+        dataframes[session_id] = df
+        _touch_session(session_id)
+        storage.update_session_access(session_id)
+        return df
+    raise HTTPException(status_code=404, detail="Session not found. Upload a CSV first.")
+
+
+def is_valid_session(session_id: str) -> bool:
+    if session_id in dataframes:
+        return True
+    return storage.get_session(session_id) is not None
+
+
 def cleanup_expired_sessions() -> None:
     """Remove old in-memory state so local/prod workers do not grow forever."""
     now = _now()
@@ -334,6 +357,8 @@ def cleanup_expired_sessions() -> None:
         )
         _delete_session(oldest)
 
+    storage.cleanup_old_sessions(ttl_seconds=SESSION_TTL_SECONDS)
+
 
 def _cache_set(key: str, value: dict) -> None:
     query_cache[key] = value
@@ -343,9 +368,9 @@ def _cache_set(key: str, value: dict) -> None:
 
 
 def create_job(kind: str, session_id: str | None = None) -> dict:
-    """Create a bounded in-memory background job record."""
+    """Create a bounded background job record backed by SQLite persistence."""
     job_id = str(uuid.uuid4())
-    jobs[job_id] = {
+    job_data = {
         "job_id": job_id,
         "kind": kind,
         "session_id": session_id,
@@ -355,16 +380,32 @@ def create_job(kind: str, session_id: str | None = None) -> dict:
         "result": None,
         "error": None,
     }
+    jobs[job_id] = job_data
+    storage.save_job(job_id, session_id, kind, "queued")
     while len(jobs) > MAX_JOBS:
         oldest = min(jobs, key=lambda jid: float(jobs[jid].get("updated_at", jobs[jid].get("created_at", _now()))))
         jobs.pop(oldest, None)
-    return jobs[job_id]
+    return job_data
 
 
 def update_job(job_id: str, status: str, result: dict | None = None,
                error: str | None = None) -> None:
     """Update a job record with terminal or progress state."""
     job = jobs.get(job_id)
+    if not job:
+        job_db = storage.get_job(job_id)
+        if job_db:
+            job = {
+                "job_id": job_db["job_id"],
+                "kind": job_db["job_type"],
+                "session_id": job_db.get("session_id"),
+                "status": job_db["status"],
+                "created_at": job_db.get("created_at", _now()),
+                "updated_at": job_db.get("updated_at", _now()),
+                "result": job_db.get("result"),
+                "error": job_db.get("error"),
+            }
+            jobs[job_id] = job
     if not job:
         return
     job["status"] = status
@@ -373,6 +414,7 @@ def update_job(job_id: str, status: str, result: dict | None = None,
         job["result"] = result
     if error is not None:
         job["error"] = error
+    storage.update_job(job_id, status, result, error)
 
 
 def public_job(job: dict) -> dict:
@@ -3010,8 +3052,10 @@ def register_dataframe(df: pd.DataFrame, filename: str) -> dict:
     cleanup_expired_sessions()
     validate_dataframe_limits(df)
     session_id = str(uuid.uuid4())
+    token = str(uuid.uuid4())
     dataframes[session_id] = df
-    session_meta[session_id] = {"created_at": _now(), "last_accessed": _now(), "filename": filename}
+    session_meta[session_id] = {"created_at": _now(), "last_accessed": _now(), "filename": filename, "token": token}
+    storage.save_session(session_id, token, filename, df)
     cleanup_expired_sessions()
     profile = build_profile(df)
     overview = build_overview_charts(df)
@@ -3025,6 +3069,7 @@ def register_dataframe(df: pd.DataFrame, filename: str) -> dict:
     decision_actions = decision_brief.get("decision_actions", [])
     return {
         "session_id": session_id,
+        "token": token,
         "filename": filename,
         **profile,
         "overview": overview,
@@ -3114,39 +3159,25 @@ def get_docs(session_id: str) -> dict:
 
 @app.get("/quality/{session_id}")
 def quality(session_id: str) -> dict:
-    cleanup_expired_sessions()
-    if session_id not in dataframes:
-        raise HTTPException(status_code=404, detail="Session not found. Upload a CSV first.")
-    _touch_session(session_id)
-    return build_quality_report(dataframes[session_id])
+    df = get_session_df(session_id)
+    return build_quality_report(df)
 
 
 @app.get("/brief/{session_id}")
 def decision_brief(session_id: str, category: str = "general") -> dict:
-    cleanup_expired_sessions()
-    if session_id not in dataframes:
-        raise HTTPException(status_code=404, detail="Session not found. Upload a CSV first.")
-    _touch_session(session_id)
-    return build_decision_brief(dataframes[session_id], category)
+    df = get_session_df(session_id)
+    return build_decision_brief(df, category)
 
 
 @app.get("/cleaning_plan/{session_id}")
 def cleaning_plan(session_id: str) -> dict:
-    cleanup_expired_sessions()
-    if session_id not in dataframes:
-        raise HTTPException(status_code=404, detail="Session not found. Upload a CSV first.")
-    _touch_session(session_id)
-    return build_cleaning_plan(dataframes[session_id])
+    df = get_session_df(session_id)
+    return build_cleaning_plan(df)
 
 
 @app.post("/clean/{session_id}")
 def clean_dataset(session_id: str, req: CleanRequest) -> dict:
-    cleanup_expired_sessions()
-    if session_id not in dataframes:
-        raise HTTPException(status_code=404, detail="Session not found. Upload a CSV first.")
-    _touch_session(session_id)
-
-    df = dataframes[session_id]
+    df = get_session_df(session_id)
     plan = build_cleaning_plan(df)
     selected_actions = req.actions if req.actions is not None else plan["default_actions"]
     cleaned, applied_actions = apply_cleaning_actions(df, selected_actions)
@@ -3172,40 +3203,27 @@ def clean_dataset(session_id: str, req: CleanRequest) -> dict:
 
 @app.get("/contract/{session_id}")
 def data_contract(session_id: str) -> dict:
-    cleanup_expired_sessions()
-    if session_id not in dataframes:
-        raise HTTPException(status_code=404, detail="Session not found. Upload a CSV first.")
-    _touch_session(session_id)
-    return build_data_contract(dataframes[session_id])
+    df = get_session_df(session_id)
+    return build_data_contract(df)
 
 
 @app.post("/validate_rows/{session_id}")
 def validate_rows(session_id: str, req: ValidateRowsRequest) -> dict:
-    cleanup_expired_sessions()
-    if session_id not in dataframes:
-        raise HTTPException(status_code=404, detail="Session not found. Upload a CSV first.")
-    _touch_session(session_id)
-    contract = build_data_contract(dataframes[session_id])
+    df = get_session_df(session_id)
+    contract = build_data_contract(df)
     return validate_rows_against_contract(req.rows, contract)
 
 
 @app.get("/dashboard/{session_id}")
 def dashboard_spec(session_id: str, category: str = "general") -> dict:
-    cleanup_expired_sessions()
-    if session_id not in dataframes:
-        raise HTTPException(status_code=404, detail="Session not found. Upload a CSV first.")
-    _touch_session(session_id)
-    return build_dashboard_spec(dataframes[session_id], category)
+    df = get_session_df(session_id)
+    return build_dashboard_spec(df, category)
 
 
 @app.post("/investigate")
 async def investigate(req: InvestigationRequest) -> StreamingResponse:
     """Run an autonomous, deterministic investigation and stream the analyst workflow."""
-    cleanup_expired_sessions()
-    if req.session_id not in dataframes:
-        raise HTTPException(status_code=404, detail="Session not found. Upload a CSV first.")
-    _touch_session(req.session_id)
-    df = dataframes[req.session_id]
+    df = get_session_df(req.session_id)
 
     async def stream():
         emit = make_sse_emitter("investigate", req.session_id)
@@ -3702,8 +3720,22 @@ def get_job(job_id: str) -> dict:
     cleanup_expired_sessions()
     job = jobs.get(job_id)
     if not job:
+        job_db = storage.get_job(job_id)
+        if job_db:
+            job = {
+                "job_id": job_db["job_id"],
+                "kind": job_db["job_type"],
+                "session_id": job_db.get("session_id"),
+                "status": job_db["status"],
+                "created_at": job_db.get("created_at", _now()),
+                "updated_at": job_db.get("updated_at", _now()),
+                "result": job_db.get("result"),
+                "error": job_db.get("error"),
+            }
+            jobs[job_id] = job
+    if not job:
         raise HTTPException(status_code=404, detail="Job not found.")
-    if job.get("session_id") in dataframes:
+    if job.get("session_id") and is_valid_session(str(job["session_id"])):
         _touch_session(str(job["session_id"]))
     return public_job(job)
 

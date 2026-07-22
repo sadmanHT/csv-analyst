@@ -19,3 +19,8 @@ frontend/.vite/
 # OS
 .DS_Store
 Thumbs.db
+
+# Storage & DB
+backend/data/
+app_start_commands.txt
+
