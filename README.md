@@ -1,69 +1,49 @@
-# CSV Analyst AI — Agentic Data Scientist
+# CSV Analyst AI — The AI Analyst for Spreadsheets & Relational Data
 
 > **Powered by Google Gemini 2.5 Flash-Lite · Built for the MLH Gemini Prize**
 
-A production-grade, domain-aware AI data analyst. Upload a CSV (or paste rows from Excel/Sheets), ask questions in plain English, and a **multi-agent pipeline** reasons over your data like a senior analyst — planning, computing, visualising, critiquing, and reporting.
+A production-grade AI data analyst for spreadsheets and relational datasets. Upload CSV, Excel (`.xlsx`), Parquet, or JSON files (or paste a Google Sheets URL), ask questions in plain English, and a **multi-agent pipeline** reasons over your data like a senior analyst — profiling, joining, forecasting, predicting, critiquing, and exporting reports.
 
 ---
 
 ## What Makes This Different
 
-| Feature | Most CSV chatbots | This project |
+| Feature | Most Data Chatbots | CSV Analyst AI |
 |---|---|---|
+| Ingestion | Single CSV only | CSV, Excel (`.xlsx` multi-sheet), Parquet, JSON/JSONL, Google Sheets URL |
+| Relational Support | Single file only | Multi-file join key inference & dataset merging |
 | Architecture | Single LLM call | 5-agent pipeline (Planner → Analyst → Visualizer → Critic → Reporter) |
-| Charts | Static PNG | Interactive Plotly (zoom, hover, pan) |
-| ML | None | Random Forest + SHAP + Permutation Importance + PDP |
-| SQL | Never | Planner auto-routes to SQLite when appropriate |
-| RAG | None | Gemini embeddings over uploaded PDFs / Excel docs |
-| Security | `exec()` sandbox | AST scan + restricted builtins + 30s timeout |
+| Time-Series | None | Holt-Winters exponential smoothing + 95% confidence bounds |
+| ML & What-If | None | Random Forest + SHAP + 90% prediction bounds + scenario simulator |
+| Drift Analysis | None | Dataset v1 vs v2 schema diffing & numeric distribution shift detection |
+| Security | Basic or `exec()` | AST scan + 40-builtin sandbox + SQLite/Parquet storage + **SSRF URL guard** |
 | Export | None | PDF (reportlab) + PPTX (python-pptx) with all charts |
-| Evaluation | None | 49-question benchmark suite with live metrics dashboard |
+| Tests & Reliability | 0 tests | **105 backend pytest tests** + **7 Vitest frontend component tests** |
 
 ---
 
-## Features
+## Key Capabilities
 
-### Multi-Agent Pipeline
-Every question runs through 5 chained Gemini agents:
-1. **Planner** — maps the question to relevant columns, picks analysis strategy and chart type, decides pandas vs SQL
-2. **Analyst** — writes and executes pandas code for numerical findings (with self-repair on failure)
-3. **Visualizer** — generates interactive Plotly charts (bar, line, scatter, histogram, heatmap, box…)
-4. **Critic** — reviews statistical soundness, returns `pass/warn/fail` verdict + confidence score + issues
-5. **Reporter** — writes a structured executive summary (Headline · Key Findings · Implication · Caveat)
+### 1. Multi-Format & URL Ingestion
+- **Formats**: Direct parsing for `.csv`, `.xlsx` (multi-sheet), `.xls`, `.parquet`, `.json`, `.jsonl`.
+- **Google Sheets Import**: Paste public Google Sheets sharing URLs to import and profile dataset sessions directly.
+- **SSRF Security Guard**: `/import_url` strictly validates URLs against Google domains (`docs.google.com`) and resolves hostnames to block private IP addresses, loopback, and cloud metadata targets (`169.254.169.254`).
 
-### Domain Lenses
-6 expert modes that change how the agent reasons: **General · Financial · Medical · Retail · Marketing · HR**
+### 2. Multi-Table Relational Join Inference
+- **Automated Join Key Detection**: Ranks foreign key pairs (`customer_id`, `product_id`, matching columns) and value overlap ratios (`High`, `Medium`, `Low`).
+- **Dataset Merging**: Joins datasets (`inner`, `left`, `right`, `outer`) into a unified, profiled session payload for downstream investigation.
 
-### RAG over Documentation
-Upload PDFs, Excel files, or data dictionaries alongside your CSV. Gemini `text-embedding-004` indexes them into a per-session vector store (numpy cosine similarity). Relevant chunks are retrieved and injected into the Planner and Analyst prompts.
+### 3. Time-Series Trend Forecasting
+- **Holt-Winters Smoothing**: Fits `ExponentialSmoothing` (with automatic linear fallback) to extrapolate future trends.
+- **Uncertainty Bounds**: Generates 95% confidence intervals (`lower_95`, `upper_95`) and computes trend direction and growth metrics.
 
-### Explainable ML
-One-click Random Forest training with full explainability:
-- **SHAP beeswarm** — global feature impact with directionality
-- **Permutation importance** — statistically robust, test-set importance with error bars
-- **Partial Dependence Plots** — how the top 2 features affect the prediction
-- Live inference form for predicting new cases
+### 4. Dataset Comparison & Distribution Drift
+- **Schema Diffing**: Detects added, removed, and type-changed columns between dataset v1 and v2.
+- **Distribution Shift**: Ranks numeric columns by statistical drift level (`Significant`, `Moderate`, `Low`).
 
-### SQL Generation
-The Planner automatically routes filter/group-by/top-N questions to a SQL agent that generates SQLite queries run against an in-memory database.
-
-### Instant Overview Dashboard
-Auto-generated correlation heatmap + distribution plots + top-category chart the moment a CSV loads — zero LLM calls.
-
-### Secure Sandbox (3 Layers)
-1. **AST scan** — blocks `__class__`, `__globals__`, `eval`, `exec`, `compile`, `open`, `subprocess` before execution
-2. **Restricted namespace** — `__builtins__` replaced with a 40-entry whitelist
-3. **Thread timeout** — hard 30-second wall-clock limit via `ThreadPoolExecutor`
-
-### Export
-- **PDF** — cover page, dataset profile table, numeric stats, per-message sections with charts, SHAP plots, critique verdicts
-- **PPTX** — branded title slide, KPI card slide, one slide per message with chart + summary
-
-### Benchmark Evaluation
-49-question suite across 8 domains. Metrics: success rate, chart rate, SQL routing accuracy, repair rate, avg response time. Run from the UI or CLI:
-```bash
-python benchmark.py --csv data.csv --n 30 --out results.json
-```
+### 5. Multi-Agent Pipeline & Explainable ML
+- **5 Chained Gemini Agents**: Planner → Analyst → Visualizer → Critic → Reporter.
+- **Explainable ML**: Random Forest with SHAP beeswarm, permutation importance, PDP, and scenario simulator.
 
 ---
 
@@ -74,18 +54,12 @@ python benchmark.py --csv data.csv --n 30 --out results.json
 | LLM | Gemini 2.5 Flash-Lite (`google-genai`) |
 | Embeddings | Gemini `text-embedding-004` |
 | Backend | FastAPI + uvicorn |
-| Data | pandas, numpy, matplotlib, seaborn |
-| ML | scikit-learn (Random Forest) |
+| Data & Parsers | pandas, numpy, openpyxl, pyarrow, statsmodels |
+| ML & Forecasting | scikit-learn (Random Forest), Holt-Winters Exponential Smoothing |
 | Explainability | SHAP, sklearn.inspection |
-| Charts | Plotly (interactive) + matplotlib/seaborn (static) |
-| SQL | SQLite (stdlib) |
-| RAG | numpy cosine similarity |
-| PDF export | reportlab |
-| PPTX export | python-pptx |
-| Chart → image | kaleido |
-| Doc parsing | pypdf, openpyxl |
-| Frontend | React 18 + Vite |
-| Tests | pytest + FastAPI TestClient (42 tests) |
+| Charts | Plotly (interactive) + matplotlib/seaborn |
+| Security | AST Scanner, Restricted Builtins, SSRF Domain/IP Filter |
+| Tests | **105 pytest tests** (backend) + **7 Vitest tests** (frontend) |
 
 ---
 

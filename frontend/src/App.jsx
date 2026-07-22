@@ -827,6 +827,82 @@ function ExportCard({ upload, messages, category }) {
   )
 }
 
+export function TimeSeriesForecastCard({ sessionId, upload }) {
+  const dateCols = useMemo(() => {
+    return (upload?.columns || []).filter(c => {
+      const lower = String(c).toLowerCase()
+      return lower.includes('date') || lower.includes('time') || lower.includes('year') || lower.includes('month') || lower.includes('day')
+    })
+  }, [upload])
+
+  const numericCols = Object.keys(upload?.numeric_stats || {})
+  const [dateCol, setDateCol] = useState(dateCols[0] || upload?.columns?.[0] || '')
+  const [targetCol, setTargetCol] = useState(numericCols[0] || upload?.columns?.[1] || '')
+  const [periods, setPeriods] = useState(12)
+  const [busy, setBusy] = useState(false)
+  const [result, setResult] = useState(null)
+
+  const runForecast = async () => {
+    if (!dateCol || !targetCol) return
+    setBusy(true); setResult(null)
+    try {
+      const res = await fetch(`${API}/forecast`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ session_id: sessionId, date_column: dateCol, target_column: targetCol, periods }),
+      })
+      const data = await res.json()
+      if (!res.ok) throw new Error(data.detail || 'Forecast failed')
+      setResult(data)
+    } catch (e) {
+      alert(e.message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <div className="insight-card forecast-card">
+      <div className="ic-head"><ChartUp width={15} height={15} /> Time-Series Forecast</div>
+      <p className="predict-hint">Extrapolate future trends and 95% confidence bounds for <strong>{targetCol || 'metrics'}</strong>.</p>
+      <div className="scenario-controls">
+        <label>
+          <span>Date Column</span>
+          <select value={dateCol} onChange={e => setDateCol(e.target.value)}>
+            {(upload?.columns || []).map(c => <option key={c} value={c}>{c}</option>)}
+          </select>
+        </label>
+        <label>
+          <span>Target Metric</span>
+          <select value={targetCol} onChange={e => setTargetCol(e.target.value)}>
+            {numericCols.map(c => <option key={c} value={c}>{c}</option>)}
+          </select>
+        </label>
+        <label>
+          <span>Horizon</span>
+          <select value={periods} onChange={e => setPeriods(+e.target.value)}>
+            <option value={6}>6 periods</option>
+            <option value={12}>12 periods</option>
+            <option value={24}>24 periods</option>
+          </select>
+        </label>
+      </div>
+      <button className="predict-btn" disabled={busy || !dateCol || !targetCol} onClick={runForecast}>
+        {busy ? <span className="spinner" /> : <>📈 Forecast {targetCol}</>}
+      </button>
+      {result && (
+        <div className="scenario-result">
+          <div className="scenario-impact">
+            <span>Trend</span>
+            <strong>{result.metrics?.trend_direction} ({result.metrics?.growth_rate_pct}%)</strong>
+          </div>
+          {result.chart_json && <PlotlyChart json={result.chart_json} />}
+        </div>
+      )}
+    </div>
+  )
+}
+
 function InsightsPanel({ upload, category, onAsk, onStory, onInvestigate, onPredict, onOpenPaste, onOpenBenchmark, onCleanExport, onExportContract, onExportDashboard, cleaningBusy, modelInfo, loading, messages }) {
   const cat = catByKey(category)
   const numericCols = Object.keys(upload.numeric_stats || {})
@@ -1077,6 +1153,8 @@ function InsightsPanel({ upload, category, onAsk, onStory, onInvestigate, onPred
           <ScenarioSimulatorCard sessionId={upload.session_id} modelInfo={modelInfo} category={category} />
         </>
       )}
+
+      <TimeSeriesForecastCard sessionId={upload.session_id} upload={upload} />
 
       <div className="insight-card benchmark-card">
         <div className="ic-head">🏆 Benchmark</div>

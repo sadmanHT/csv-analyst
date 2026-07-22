@@ -8,6 +8,9 @@ import base64
 import traceback
 import time
 import queue
+import socket
+import ipaddress
+import urllib.parse
 import multiprocessing as mp
 from collections.abc import Awaitable, Callable
 
@@ -3218,11 +3221,54 @@ async def upload_file(
     return result
 
 
+ALLOWED_DOMAINS = {"docs.google.com", "drive.google.com", "sheets.googleapis.com"}
+
+
+def validate_safe_url(url_str: str) -> str:
+    """Validate that the input URL is a secure public Google Sheets export URL and block SSRF vectors."""
+    url_str = url_str.strip()
+    if not url_str:
+        raise HTTPException(status_code=400, detail="URL cannot be empty.")
+
+    try:
+        parsed = urllib.parse.urlparse(url_str)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid URL format.")
+
+    if parsed.scheme not in ("http", "https"):
+        raise HTTPException(status_code=400, detail="Invalid URL scheme. Only HTTP and HTTPS URLs are allowed.")
+
+    hostname = parsed.hostname
+    if not hostname:
+        raise HTTPException(status_code=400, detail="Invalid URL hostname.")
+
+    host_lower = hostname.lower()
+    if host_lower in ("localhost", "127.0.0.1", "::1", "169.254.169.254"):
+        raise HTTPException(status_code=400, detail="Security error: Internal loopback and metadata addresses are prohibited.")
+
+    domain_ok = any(host_lower == domain or host_lower.endswith("." + domain) for domain in ALLOWED_DOMAINS)
+    if not domain_ok:
+        raise HTTPException(
+            status_code=400,
+            detail="Security error: URL import is strictly restricted to public Google Sheets export links (docs.google.com).",
+        )
+
+    try:
+        ip_info = socket.getaddrinfo(hostname, None)
+        for item in ip_info:
+            ip_str = item[4][0]
+            ip_obj = ipaddress.ip_address(ip_str)
+            if ip_obj.is_private or ip_obj.is_loopback or ip_obj.is_link_local or ip_obj.is_reserved:
+                raise HTTPException(status_code=400, detail="Security error: Resolved IP address is private or restricted.")
+    except socket.gaierror:
+        raise HTTPException(status_code=400, detail="Could not resolve hostname.")
+
+    return url_str
+
+
 @app.post("/import_url")
 async def import_from_url(req: UrlImportRequest) -> dict:
-    raw_url = req.url.strip()
-    if not raw_url:
-        raise HTTPException(status_code=400, detail="URL cannot be empty.")
+    raw_url = validate_safe_url(req.url)
 
     target_url = raw_url
     if "docs.google.com/spreadsheets/d/" in raw_url:
@@ -3230,6 +3276,8 @@ async def import_from_url(req: UrlImportRequest) -> dict:
         if match:
             sheet_id = match.group(1)
             target_url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv"
+
+    validate_safe_url(target_url)
 
     try:
         async with httpx.AsyncClient(follow_redirects=True, timeout=15.0) as client:
@@ -3520,9 +3568,15 @@ async def upload_text(req: TextUploadRequest) -> dict:
             detail=f"Pasted data is too large. Maximum size is {MAX_UPLOAD_BYTES // (1024 * 1024)} MB.",
         )
     try:
-        # sep=None + python engine sniffs the delimiter (comma, tab, semicolon, …)
+        if "\t" in text:
+            sep = "\t"
+        elif ";" in text:
+            sep = ";"
+        else:
+            sep = ","
         df = pd.read_csv(
-            io.StringIO(text), sep=None, engine="python",
+            io.StringIO(text),
+            sep=sep,
             header=0 if req.has_header else None,
         )
     except Exception as e:

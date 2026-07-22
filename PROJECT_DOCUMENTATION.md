@@ -1033,10 +1033,17 @@ Known limitations:
 - Natural-language scenario parsing is deterministic and intentionally conservative.
 - Plotly remains a large frontend bundle dependency.
 
-## 22. Verification & Testing
+Recommended one-line pitch:
 
-- **Backend Test Suite**: **93 passing pytest tests** covering API routes, AST security filters, SQL validation, predictive modeling, report export, session persistence, and startup orphan job recovery.
-- **Frontend Test Suite**: **Vitest + React Testing Library unit tests** (`npm test`) covering key interactive components (`ScenarioSimulatorCard`, `PredictInputCard`).
+> CSV Analyst AI is the AI Data Analyst for Spreadsheets & Relational Datasets: Profile, Join, Investigate, Forecast, Predict, & Compare.
+
+---
+
+## 22. Verification & Security Controls
+
+- **SSRF Security Protection**: `/import_url` strictly enforces domain allowlisting (`docs.google.com` / `drive.google.com`) and resolves hostnames to block private IP CIDR ranges (`10.*`, `172.16-31.*`, `192.168.*`, `127.*`) and cloud metadata targets (`169.254.169.254`).
+- **Backend Test Suite**: **105 passing pytest tests** covering API routes, AST security filters, SSRF URL guards, SQL validation, predictive modeling, time-series forecasting, relational join inference, dataset drift comparison, report export, session persistence, and startup orphan job recovery.
+- **Frontend Test Suite**: **7 Vitest + React Testing Library unit tests** (`npm test`) covering key interactive components (`ScenarioSimulatorCard`, `PredictInputCard`, `TimeSeriesForecastCard`).
 - **CI Workflow**: GitHub Actions workflow (`.github/workflows/ci.yml`) automatically executes `pytest backend/`, `npm test` in `frontend/`, and `npm run build` on every push.
 
 ## 22. Why This Is Strong for a Hackathon

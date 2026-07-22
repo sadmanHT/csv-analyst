@@ -1422,6 +1422,84 @@ def test_compare_datasets_drift():
     assert rev_drift["mean_delta"] == 100.0
 
 
+def test_import_url_ssrf_blocking_cloud_metadata():
+    res = client.post("/import_url", json={"url": "http://169.254.169.254/latest/meta-data/"})
+    assert res.status_code == 400
+    assert "Security error" in res.json()["detail"]
+
+
+def test_import_url_ssrf_blocking_loopback():
+    res = client.post("/import_url", json={"url": "http://localhost:8001/health"})
+    assert res.status_code == 400
+    assert "Security error" in res.json()["detail"]
+
+
+def test_import_url_ssrf_blocking_unauthorized_domain():
+    res = client.post("/import_url", json={"url": "https://untrusted-external-domain.com/stolen.csv"})
+    assert res.status_code == 400
+    assert "Security error" in res.json()["detail"]
+
+
+def test_infer_join_no_overlapping_keys():
+    df1 = pd.DataFrame({"alpha": ["a", "b", "c"]})
+    df2 = pd.DataFrame({"beta": [10, 20, 30]})
+
+    up1 = client.post("/upload_text", json={"text": df1.to_csv(index=False), "has_header": True})
+    up2 = client.post("/upload_text", json={"text": df2.to_csv(index=False), "has_header": True})
+
+    res = client.post("/infer_join", json={"session_id_1": up1.json()["session_id"], "session_id_2": up2.json()["session_id"]})
+    assert res.status_code == 200
+    assert len(res.json()["candidates"]) == 0
+
+
+def test_join_datasets_invalid_column_error():
+    df1 = pd.DataFrame({"col_x": [1, 2, 3]})
+    df2 = pd.DataFrame({"col_y": [1, 2, 3]})
+
+    up1 = client.post("/upload_text", json={"text": df1.to_csv(index=False), "has_header": True})
+    up2 = client.post("/upload_text", json={"text": df2.to_csv(index=False), "has_header": True})
+
+    res = client.post("/join", json={
+        "session_id_1": up1.json()["session_id"],
+        "session_id_2": up2.json()["session_id"],
+        "join_key_1": "non_existent_column",
+        "join_key_2": "col_y",
+    })
+    assert res.status_code == 400
+    assert "not found" in res.json()["detail"]
+
+
+def test_forecast_insufficient_data_error():
+    df = pd.DataFrame({"date": ["2024-01-01", "2024-01-02"], "sales": [10, 20]})
+    up = client.post("/upload_text", json={"text": df.to_csv(index=False), "has_header": True})
+
+    res = client.post("/forecast", json={
+        "session_id": up.json()["session_id"],
+        "date_column": "date",
+        "target_column": "sales",
+        "periods": 5,
+    })
+    assert res.status_code == 400
+    assert "At least 5 valid date-target rows" in res.json()["detail"]
+
+
+def test_compare_datasets_disjoint_schemas():
+    df1 = pd.DataFrame({"col_a": [1, 2, 3]})
+    df2 = pd.DataFrame({"col_b": [4, 5, 6]})
+
+    up1 = client.post("/upload_text", json={"text": df1.to_csv(index=False), "has_header": True})
+    up2 = client.post("/upload_text", json={"text": df2.to_csv(index=False), "has_header": True})
+
+    res = client.post("/compare", json={"session_id_1": up1.json()["session_id"], "session_id_2": up2.json()["session_id"]})
+    assert res.status_code == 200
+    b = res.json()
+    assert "col_b" in b["schema_changes"]["added_columns"]
+    assert "col_a" in b["schema_changes"]["removed_columns"]
+    assert b["schema_changes"]["common_columns_count"] == 0
+    assert len(b["numeric_drift"]) == 0
+
+
+
 
 
 
