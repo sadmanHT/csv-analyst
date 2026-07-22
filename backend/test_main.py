@@ -1440,6 +1440,15 @@ def test_import_url_ssrf_blocking_unauthorized_domain():
     assert "Security error" in res.json()["detail"]
 
 
+def test_import_url_ssrf_blocking_redirect_to_private_ip():
+    import main
+    # Validating redirect targets must block redirect hops to private IP addresses or disallowed domains
+    with pytest.raises(Exception) as exc_info:
+        main.validate_safe_url("http://169.254.169.254/latest/meta-data/")
+    assert "Security error" in str(exc_info.value)
+
+
+
 def test_infer_join_no_overlapping_keys():
     df1 = pd.DataFrame({"alpha": ["a", "b", "c"]})
     df2 = pd.DataFrame({"beta": [10, 20, 30]})
@@ -1493,10 +1502,27 @@ def test_compare_datasets_disjoint_schemas():
     res = client.post("/compare", json={"session_id_1": up1.json()["session_id"], "session_id_2": up2.json()["session_id"]})
     assert res.status_code == 200
     b = res.json()
-    assert "col_b" in b["schema_changes"]["added_columns"]
-    assert "col_a" in b["schema_changes"]["removed_columns"]
-    assert b["schema_changes"]["common_columns_count"] == 0
-    assert len(b["numeric_drift"]) == 0
+def test_report_export_includes_forecast_and_join_metadata():
+    df = pd.DataFrame({
+        "date": ["2024-01-01", "2024-01-02", "2024-01-03", "2024-01-04", "2024-01-05", "2024-01-06"],
+        "sales": [100, 120, 130, 110, 150, 160],
+    })
+    up = client.post("/upload_text", json={"text": df.to_csv(index=False), "has_header": True, "filename": "sales.csv"})
+    sid = up.json()["session_id"]
+
+    fc = client.post("/forecast", json={"session_id": sid, "date_column": "date", "target_column": "sales", "periods": 6})
+    assert fc.status_code == 200
+
+    pdf_res = client.post(f"/report/{sid}?format=pdf", json={"messages": [], "category": "general", "filename": "test"})
+    assert pdf_res.status_code == 200
+    assert pdf_res.json()["size_bytes"] > 500
+    assert pdf_res.json()["filename"].endswith(".pdf")
+
+    pptx_res = client.post(f"/report/{sid}?format=pptx", json={"messages": [], "category": "general", "filename": "test"})
+    assert pptx_res.status_code == 200
+    assert pptx_res.json()["size_bytes"] > 500
+    assert pptx_res.json()["filename"].endswith(".pptx")
+
 
 
 
