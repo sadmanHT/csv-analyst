@@ -678,7 +678,9 @@ def build_proactive_insights(df: pd.DataFrame) -> list[dict]:
     numeric = df.select_dtypes(include="number")
     if numeric.shape[1] >= 2:
         corr = numeric.corr().abs()
-        np.fill_diagonal(corr.values, 0)
+        corr_matrix = corr.to_numpy(copy=True)
+        np.fill_diagonal(corr_matrix, 0)
+        corr = pd.DataFrame(corr_matrix, index=corr.index, columns=corr.columns)
         max_col = corr.max().idxmax()
         partner = corr[max_col].idxmax()
         score = _num(corr.loc[max_col, partner])
