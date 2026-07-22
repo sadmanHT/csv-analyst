@@ -1,11 +1,15 @@
 import ast
 import io
 import os
+import re
 import uuid
 import json
 import base64
 import traceback
-import concurrent.futures
+import time
+import queue
+import multiprocessing as mp
+from collections.abc import Awaitable, Callable
 
 import pandas as pd
 import numpy as np
@@ -64,13 +68,14 @@ plt.rcParams.update({
 })
 matplotlib.rcParams["axes.prop_cycle"] = matplotlib.cycler(color=INDIGO_PALETTE)
 
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, Request, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from fastapi.responses import JSONResponse, Response, StreamingResponse
+from pydantic import BaseModel, Field
 from google import genai
 from google.genai import types
 from dotenv import load_dotenv
+from sandbox_runner import execute_code_worker
 
 load_dotenv(override=True)
 
@@ -94,6 +99,60 @@ client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
 
 dataframes: dict[str, pd.DataFrame] = {}
 models: dict[str, dict] = {}  # session_id -> trained model info (for inference on new input)
+conversation_state: dict[str, dict] = {}
+query_cache: dict[str, dict] = {}
+session_meta: dict[str, dict] = {}
+rate_limit_buckets: dict[str, list[float]] = {}
+jobs: dict[str, dict] = {}
+
+MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_BYTES", 25 * 1024 * 1024))
+MAX_DATAFRAME_ROWS = int(os.environ.get("MAX_DATAFRAME_ROWS", 100_000))
+MAX_DATAFRAME_COLUMNS = int(os.environ.get("MAX_DATAFRAME_COLUMNS", 200))
+SESSION_TTL_SECONDS = int(os.environ.get("SESSION_TTL_SECONDS", 4 * 60 * 60))
+MAX_SESSIONS = int(os.environ.get("MAX_SESSIONS", 50))
+MAX_QUERY_CACHE_ENTRIES = int(os.environ.get("MAX_QUERY_CACHE_ENTRIES", 200))
+RATE_LIMIT_MAX_REQUESTS = int(os.environ.get("RATE_LIMIT_MAX_REQUESTS", 600))
+RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("RATE_LIMIT_WINDOW_SECONDS", 60))
+MAX_JOBS = int(os.environ.get("MAX_JOBS", 200))
+
+
+def client_rate_limit_key(request: Request) -> str:
+    forwarded_for = request.headers.get("x-forwarded-for", "")
+    client_ip = forwarded_for.split(",", 1)[0].strip()
+    if not client_ip and request.client:
+        client_ip = request.client.host
+    return f"{client_ip or 'unknown'}:{request.url.path}"
+
+
+@app.middleware("http")
+async def rate_limit_middleware(
+    request: Request,
+    call_next: Callable[[Request], Awaitable[Response]],
+) -> Response:
+    if RATE_LIMIT_MAX_REQUESTS <= 0:
+        return await call_next(request)
+
+    now = _now()
+    cutoff = now - RATE_LIMIT_WINDOW_SECONDS
+    key = client_rate_limit_key(request)
+    bucket = [ts for ts in rate_limit_buckets.get(key, []) if ts >= cutoff]
+    rate_limit_buckets[key] = bucket
+
+    if len(bucket) >= RATE_LIMIT_MAX_REQUESTS:
+        retry_after = max(1, int(RATE_LIMIT_WINDOW_SECONDS - (now - bucket[0])))
+        return JSONResponse(
+            status_code=429,
+            content={
+                "detail": "Rate limit exceeded. Please wait before retrying.",
+                "retry_after_seconds": retry_after,
+                "limit": RATE_LIMIT_MAX_REQUESTS,
+                "window_seconds": RATE_LIMIT_WINDOW_SECONDS,
+            },
+            headers={"Retry-After": str(retry_after)},
+        )
+
+    bucket.append(now)
+    return await call_next(request)
 
 # ── RAG document store ────────────────────────────────────────────────────────
 
@@ -188,6 +247,17 @@ class QueryRequest(BaseModel):
     category: str = "general"
 
 
+class StoryRequest(BaseModel):
+    session_id: str
+    category: str = "general"
+
+
+class InvestigationRequest(BaseModel):
+    session_id: str
+    goal: str = "Investigate the strongest decision opportunity in this dataset."
+    category: str = "general"
+
+
 class PredictRequest(BaseModel):
     session_id: str
     target: str
@@ -203,6 +273,169 @@ class TextUploadRequest(BaseModel):
 class PredictInputRequest(BaseModel):
     session_id: str
     values: dict
+
+
+class ScenarioRequest(BaseModel):
+    session_id: str
+    baseline: dict = Field(default_factory=dict)
+    changes: dict = Field(default_factory=dict)
+    category: str = "general"
+
+
+class ScenarioParseRequest(BaseModel):
+    session_id: str
+    prompt: str
+    category: str = "general"
+
+
+class CleanRequest(BaseModel):
+    actions: list[str] | None = None
+
+
+class ValidateRowsRequest(BaseModel):
+    rows: list[dict]
+
+
+def _now() -> float:
+    return time.time()
+
+
+def _touch_session(session_id: str) -> None:
+    meta = session_meta.setdefault(session_id, {"created_at": _now()})
+    meta["last_accessed"] = _now()
+
+
+def _delete_session(session_id: str) -> None:
+    dataframes.pop(session_id, None)
+    models.pop(session_id, None)
+    doc_stores.pop(session_id, None)
+    conversation_state.pop(session_id, None)
+    session_meta.pop(session_id, None)
+    for key in list(query_cache):
+        value = query_cache.get(key, {})
+        if key.startswith(f"{session_id}:") or value.get("session_id") == session_id:
+            query_cache.pop(key, None)
+
+
+def cleanup_expired_sessions() -> None:
+    """Remove old in-memory state so local/prod workers do not grow forever."""
+    now = _now()
+    expired = [
+        sid for sid, meta in session_meta.items()
+        if now - float(meta.get("last_accessed", meta.get("created_at", now))) > SESSION_TTL_SECONDS
+    ]
+    for sid in expired:
+        _delete_session(sid)
+
+    while len(session_meta) > MAX_SESSIONS:
+        oldest = min(
+            session_meta,
+            key=lambda sid: float(session_meta[sid].get("last_accessed", session_meta[sid].get("created_at", now))),
+        )
+        _delete_session(oldest)
+
+
+def _cache_set(key: str, value: dict) -> None:
+    query_cache[key] = value
+    while len(query_cache) > MAX_QUERY_CACHE_ENTRIES:
+        oldest = next(iter(query_cache))
+        query_cache.pop(oldest, None)
+
+
+def create_job(kind: str, session_id: str | None = None) -> dict:
+    """Create a bounded in-memory background job record."""
+    job_id = str(uuid.uuid4())
+    jobs[job_id] = {
+        "job_id": job_id,
+        "kind": kind,
+        "session_id": session_id,
+        "status": "queued",
+        "created_at": _now(),
+        "updated_at": _now(),
+        "result": None,
+        "error": None,
+    }
+    while len(jobs) > MAX_JOBS:
+        oldest = min(jobs, key=lambda jid: float(jobs[jid].get("updated_at", jobs[jid].get("created_at", _now()))))
+        jobs.pop(oldest, None)
+    return jobs[job_id]
+
+
+def update_job(job_id: str, status: str, result: dict | None = None,
+               error: str | None = None) -> None:
+    """Update a job record with terminal or progress state."""
+    job = jobs.get(job_id)
+    if not job:
+        return
+    job["status"] = status
+    job["updated_at"] = _now()
+    if result is not None:
+        job["result"] = result
+    if error is not None:
+        job["error"] = error
+
+
+def public_job(job: dict) -> dict:
+    """Return a JSON-safe view of a background job."""
+    return {
+        "job_id": job["job_id"],
+        "kind": job["kind"],
+        "session_id": job.get("session_id"),
+        "status": job["status"],
+        "created_at": job["created_at"],
+        "updated_at": job["updated_at"],
+        "result": job.get("result"),
+        "error": job.get("error"),
+    }
+
+
+def make_sse_emitter(endpoint: str, session_id: str) -> Callable[[dict], str]:
+    """Create an SSE encoder that adds request tracing metadata to every event."""
+    request_id = str(uuid.uuid4())
+    started_at = _now()
+    sequence = 0
+
+    def emit(payload: dict) -> str:
+        nonlocal sequence
+        sequence += 1
+        event = {**payload}
+        meta = {**event.get("meta", {})}
+        meta.update({
+            "request_id": request_id,
+            "endpoint": endpoint,
+            "session_id": session_id,
+            "elapsed_ms": int((_now() - started_at) * 1000),
+            "sequence": sequence,
+        })
+        event["meta"] = meta
+        return f"data: {json.dumps(event)}\n\n"
+
+    return emit
+
+
+def validate_dataframe_limits(df: pd.DataFrame) -> None:
+    """Reject datasets that exceed configured production safety limits."""
+    if df.shape[0] > MAX_DATAFRAME_ROWS:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Dataset has {df.shape[0]:,} rows; maximum allowed is {MAX_DATAFRAME_ROWS:,}.",
+        )
+    if df.shape[1] > MAX_DATAFRAME_COLUMNS:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Dataset has {df.shape[1]:,} columns; maximum allowed is {MAX_DATAFRAME_COLUMNS:,}.",
+        )
+
+
+async def read_upload_limited(file: UploadFile) -> bytes:
+    """Read an uploaded file while enforcing a hard byte limit."""
+    content = await file.read(MAX_UPLOAD_BYTES + 1)
+    if len(content) > MAX_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"File is too large. Maximum upload size is {MAX_UPLOAD_BYTES // (1024 * 1024)} MB.",
+        )
+    return content
 
 
 def _num(x) -> float | None:
@@ -324,6 +557,1928 @@ def build_overview_charts(df: pd.DataFrame) -> list[dict]:
                 pass
 
     return charts
+
+
+def build_proactive_insights(df: pd.DataFrame) -> list[dict]:
+    """Create deterministic fact-first insights immediately after upload."""
+    insights: list[dict] = []
+    roles = infer_column_roles(df)
+    profile = build_profile(df)
+
+    def add(kind: str, title: str, finding: str, source_columns: list[str],
+            confidence: str = "High", validation: str = "Computed directly from uploaded rows.") -> None:
+        insights.append({
+            "kind": kind,
+            "title": title,
+            "finding": finding,
+            "source_columns": source_columns,
+            "confidence": confidence,
+            "validation": validation,
+        })
+
+    def fmt(value: float | None) -> str:
+        return "n/a" if value is None else f"{value:,}"
+
+    add(
+        "profile",
+        "Dataset Loaded",
+        f"{profile['rows']:,} rows, {len(profile['columns']):,} columns, "
+        f"{profile['numeric_features']:,} numeric fields.",
+        [],
+    )
+
+    metric = roles["metrics"][0] if roles["metrics"] else None
+    dimension = roles["dimensions"][0] if roles["dimensions"] else None
+    if metric:
+        total = _num(df[metric].sum())
+        mean = _num(df[metric].mean())
+        add(
+            "kpi",
+            f"Primary Metric: {metric}",
+            f"Total {metric}: {fmt(total)}; average per row: {fmt(mean)}.",
+            [metric],
+            validation=f"Computed from {df[metric].notna().sum():,} non-missing values.",
+        )
+
+    if metric and dimension:
+        grouped = df.groupby(dimension)[metric].sum().sort_values(ascending=False)
+        if not grouped.empty:
+            leader = grouped.index[0]
+            leader_value = _num(grouped.iloc[0])
+            total = float(grouped.sum()) if grouped.sum() else 0.0
+            share = round(float(grouped.iloc[0]) / total * 100, 1) if total else 0.0
+            add(
+                "segment",
+                f"Top {dimension}",
+                f"{leader} leads {metric} with {fmt(leader_value)} ({share}% of grouped total).",
+                [dimension, metric],
+                validation=f"Grouped {metric} by {dimension} and ranked descending.",
+            )
+
+    if profile["missing_total"] or profile["duplicate_rows"]:
+        add(
+            "quality",
+            "Data Quality Watch",
+            f"{profile['missing_total']:,} missing values and "
+            f"{profile['duplicate_rows']:,} duplicate rows detected.",
+            [],
+            confidence="High",
+            validation="Computed with DataFrame missing-value and duplicate-row checks.",
+        )
+    else:
+        add(
+            "quality",
+            "Clean First Pass",
+            "No missing values or duplicate rows were detected in the uploaded data.",
+            [],
+        )
+
+    numeric = df.select_dtypes(include="number")
+    if numeric.shape[1] >= 2:
+        corr = numeric.corr().abs()
+        np.fill_diagonal(corr.values, 0)
+        max_col = corr.max().idxmax()
+        partner = corr[max_col].idxmax()
+        score = _num(corr.loc[max_col, partner])
+        if score and score >= 0.3:
+            add(
+                "relationship",
+                "Strongest Numeric Relationship",
+                f"{max_col} and {partner} have the strongest observed correlation ({score}).",
+                [str(max_col), str(partner)],
+                confidence="Medium" if score < 0.6 else "High",
+                validation="Computed from the absolute Pearson correlation matrix.",
+            )
+
+    if metric:
+        s = pd.to_numeric(df[metric], errors="coerce").dropna()
+        if len(s) >= 8:
+            q1, q3 = s.quantile([0.25, 0.75])
+            iqr = q3 - q1
+            if iqr:
+                outliers = int(((s < q1 - 1.5 * iqr) | (s > q3 + 1.5 * iqr)).sum())
+                if outliers:
+                    add(
+                        "anomaly",
+                        f"Outliers In {metric}",
+                        f"{outliers:,} potential outlier values found using the IQR rule.",
+                        [metric],
+                        confidence="Medium",
+                        validation="Computed with the 1.5x IQR outlier rule.",
+                    )
+
+    return insights[:6]
+
+
+def build_quality_report(df: pd.DataFrame) -> dict:
+    """Deterministically diagnose data-quality issues for the health panel."""
+    profile = build_profile(df)
+    roles = infer_column_roles(df)
+    issues: list[dict] = []
+
+    def add(severity: str, title: str, detail: str,
+            columns: list[str] | None = None,
+            suggestion: str = "") -> None:
+        issues.append({
+            "severity": severity,
+            "title": title,
+            "detail": detail,
+            "columns": columns or [],
+            "suggestion": suggestion,
+        })
+
+    if profile["missing_total"]:
+        missing_cols = df.isna().sum().sort_values(ascending=False)
+        affected = [str(c) for c, n in missing_cols.items() if n > 0][:5]
+        add(
+            "warn",
+            "Missing Values",
+            f"{profile['missing_total']:,} missing cells ({profile['missing_pct']}% of all cells).",
+            affected,
+            "Review whether blanks mean unknown, not applicable, or true zero before modeling.",
+        )
+
+    if profile["duplicate_rows"]:
+        add(
+            "warn",
+            "Duplicate Rows",
+            f"{profile['duplicate_rows']:,} duplicate rows detected.",
+            [],
+            "Deduplicate before aggregate reporting if repeated rows are not expected.",
+        )
+
+    if roles["ids"]:
+        add(
+            "info",
+            "Identifier Columns",
+            f"{len(roles['ids'])} likely identifier column(s) detected.",
+            roles["ids"][:5],
+            "Exclude identifiers from correlations and predictive modeling.",
+        )
+
+    for col in df.columns:
+        if pd.api.types.is_numeric_dtype(df[col]):
+            continue
+        nunique = int(df[col].nunique(dropna=True))
+        if nunique > 50 or nunique > max(len(df) * 0.8, 20):
+            add(
+                "info",
+                "High-Cardinality Category",
+                f"`{col}` has {nunique:,} unique values.",
+                [str(col)],
+                "Use top-N grouping or treat this as an identifier-like field in charts.",
+            )
+
+    numeric = df.select_dtypes(include="number")
+    for col in numeric.columns:
+        s = pd.to_numeric(df[col], errors="coerce").dropna()
+        if len(s) < 8:
+            continue
+        q1, q3 = s.quantile([0.25, 0.75])
+        iqr = q3 - q1
+        if iqr:
+            outliers = int(((s < q1 - 1.5 * iqr) | (s > q3 + 1.5 * iqr)).sum())
+            if outliers:
+                add(
+                    "warn",
+                    "Potential Outliers",
+                    f"`{col}` has {outliers:,} potential outlier value(s) by the IQR rule.",
+                    [str(col)],
+                    "Inspect outliers before training models or reporting averages.",
+                )
+        skew = s.skew()
+        if pd.notna(skew) and abs(float(skew)) >= 1.5:
+            add(
+                "info",
+                "Skewed Distribution",
+                f"`{col}` is strongly skewed (skew={round(float(skew), 2)}).",
+                [str(col)],
+                "Use medians, log transforms, or distribution charts when interpreting this field.",
+            )
+
+    score = 100
+    score -= min(35, int(profile["missing_pct"] * 2))
+    score -= min(25, int(profile["duplicate_rows"] / max(profile["rows"], 1) * 100))
+    score -= min(20, sum(1 for issue in issues if issue["severity"] == "warn") * 5)
+    score = max(35, score)
+    status = "excellent" if score >= 90 else "good" if score >= 75 else "needs_attention"
+
+    return {
+        "score": score,
+        "status": status,
+        "issues": issues[:8],
+        "summary": f"{len(issues)} issue(s) found. Data health score: {score}/100.",
+    }
+
+
+SUPPORTED_CLEANING_ACTIONS = {
+    "drop_empty_columns",
+    "remove_duplicate_rows",
+    "trim_string_whitespace",
+    "fill_numeric_median",
+    "fill_categorical_mode",
+}
+
+
+def build_cleaning_plan(df: pd.DataFrame) -> dict:
+    """Create deterministic, conservative cleaning actions for export."""
+    profile = build_profile(df)
+    actions: list[dict] = []
+
+    def add(action_id: str, title: str, detail: str, columns: list[str],
+            default: bool, impact: str) -> None:
+        actions.append({
+            "id": action_id,
+            "title": title,
+            "detail": detail,
+            "columns": columns,
+            "default": default,
+            "impact": impact,
+            "reversible": True,
+        })
+
+    empty_cols = [str(col) for col in df.columns if int(df[col].isna().sum()) == len(df)]
+    if empty_cols:
+        add(
+            "drop_empty_columns",
+            "Drop empty columns",
+            f"{len(empty_cols)} column(s) contain no usable values.",
+            empty_cols[:10],
+            True,
+            "Reduces noise before reporting and modeling.",
+        )
+
+    if profile["duplicate_rows"]:
+        add(
+            "remove_duplicate_rows",
+            "Remove duplicate rows",
+            f"{profile['duplicate_rows']:,} exact duplicate row(s) detected.",
+            [],
+            True,
+            "Prevents duplicate records from inflating aggregates.",
+        )
+
+    text_cols = [str(col) for col in df.select_dtypes(include=["object", "string"]).columns]
+    whitespace_cols = [
+        col for col in text_cols
+        if df[col].dropna().astype(str).map(lambda value: value != value.strip()).any()
+    ]
+    if whitespace_cols:
+        add(
+            "trim_string_whitespace",
+            "Trim text whitespace",
+            "Some text values include leading or trailing spaces.",
+            whitespace_cols[:10],
+            True,
+            "Prevents duplicate categories caused only by spacing.",
+        )
+
+    missing = df.isna().sum()
+    numeric_missing = [
+        str(col) for col in df.select_dtypes(include="number").columns
+        if int(missing.get(col, 0)) > 0 and df[col].notna().any()
+    ]
+    if numeric_missing:
+        add(
+            "fill_numeric_median",
+            "Fill numeric blanks with median",
+            f"{len(numeric_missing)} numeric column(s) contain missing values.",
+            numeric_missing[:10],
+            True,
+            "Preserves rows while using a robust central value.",
+        )
+
+    categorical_missing = [
+        str(col) for col in df.columns
+        if not pd.api.types.is_numeric_dtype(df[col])
+        and int(missing.get(col, 0)) > 0
+        and df[col].notna().any()
+    ]
+    if categorical_missing:
+        add(
+            "fill_categorical_mode",
+            "Fill category blanks with mode",
+            f"{len(categorical_missing)} categorical/text column(s) contain missing values.",
+            categorical_missing[:10],
+            False,
+            "Useful for modeling, but confirm blanks do not mean unknown or not applicable.",
+        )
+
+    default_actions = [action["id"] for action in actions if action["default"]]
+    cleaned, applied = apply_cleaning_actions(df, default_actions, validate=False)
+    after_quality = build_quality_report(cleaned)
+
+    return {
+        "summary": (
+            f"{len(actions)} recommended cleaning action(s). "
+            f"Safe default export would apply {len(applied)} action(s)."
+        ),
+        "actions": actions,
+        "default_actions": default_actions,
+        "estimated_after_quality": after_quality,
+    }
+
+
+def apply_cleaning_actions(
+    df: pd.DataFrame,
+    actions: list[str],
+    validate: bool = True,
+) -> tuple[pd.DataFrame, list[dict]]:
+    """Apply conservative cleaning actions and return a cleaned copy plus audit log."""
+    unknown = sorted(set(actions) - SUPPORTED_CLEANING_ACTIONS)
+    if validate and unknown:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported cleaning action(s): {', '.join(unknown)}",
+        )
+
+    cleaned = df.copy()
+    applied: list[dict] = []
+
+    if "trim_string_whitespace" in actions:
+        changed_columns: list[str] = []
+        for col in cleaned.select_dtypes(include=["object", "string"]).columns:
+            before = cleaned[col].copy()
+            cleaned[col] = cleaned[col].map(lambda value: value.strip() if isinstance(value, str) else value)
+            if not before.equals(cleaned[col]):
+                changed_columns.append(str(col))
+        if changed_columns:
+            applied.append({
+                "id": "trim_string_whitespace",
+                "title": "Trim text whitespace",
+                "columns": changed_columns,
+                "changed_cells": None,
+            })
+
+    if "drop_empty_columns" in actions:
+        empty_cols = [col for col in cleaned.columns if int(cleaned[col].isna().sum()) == len(cleaned)]
+        if empty_cols:
+            cleaned = cleaned.drop(columns=empty_cols)
+            applied.append({
+                "id": "drop_empty_columns",
+                "title": "Drop empty columns",
+                "columns": [str(col) for col in empty_cols],
+                "changed_cells": len(empty_cols),
+            })
+
+    if "remove_duplicate_rows" in actions:
+        before_rows = len(cleaned)
+        cleaned = cleaned.drop_duplicates().reset_index(drop=True)
+        removed = before_rows - len(cleaned)
+        if removed:
+            applied.append({
+                "id": "remove_duplicate_rows",
+                "title": "Remove duplicate rows",
+                "columns": [],
+                "changed_cells": removed,
+            })
+
+    if "fill_numeric_median" in actions:
+        changed = 0
+        changed_columns: list[str] = []
+        for col in cleaned.select_dtypes(include="number").columns:
+            missing = int(cleaned[col].isna().sum())
+            if missing and cleaned[col].notna().any():
+                cleaned[col] = cleaned[col].fillna(cleaned[col].median())
+                changed += missing
+                changed_columns.append(str(col))
+        if changed:
+            applied.append({
+                "id": "fill_numeric_median",
+                "title": "Fill numeric blanks with median",
+                "columns": changed_columns,
+                "changed_cells": changed,
+            })
+
+    if "fill_categorical_mode" in actions:
+        changed = 0
+        changed_columns: list[str] = []
+        for col in cleaned.columns:
+            if pd.api.types.is_numeric_dtype(cleaned[col]):
+                continue
+            missing = int(cleaned[col].isna().sum())
+            mode = cleaned[col].dropna().mode()
+            if missing and not mode.empty:
+                cleaned[col] = cleaned[col].fillna(mode.iloc[0])
+                changed += missing
+                changed_columns.append(str(col))
+        if changed:
+            applied.append({
+                "id": "fill_categorical_mode",
+                "title": "Fill category blanks with mode",
+                "columns": changed_columns,
+                "changed_cells": changed,
+            })
+
+    return cleaned, applied
+
+
+def _role_for_column(column: str, roles: dict[str, list[str]]) -> str:
+    for role in ("metrics", "time", "dimensions", "ids", "target_candidates", "numeric"):
+        if column in roles.get(role, []):
+            return role[:-1] if role.endswith("s") else role
+    return "feature"
+
+
+def build_column_dictionary(df: pd.DataFrame, roles: dict[str, list[str]]) -> list[dict]:
+    """Create a compact, UI-safe data dictionary for decision planning."""
+    rows = max(len(df), 1)
+    dictionary: list[dict] = []
+    for col in df.columns:
+        series = df[col]
+        missing = int(series.isna().sum())
+        unique_count = int(series.nunique(dropna=True))
+        warnings: list[str] = []
+        if missing:
+            warnings.append(f"{round(missing / rows * 100, 1)}% missing")
+        if col in roles.get("ids", []):
+            warnings.append("identifier-like; exclude from modeling signals")
+        if unique_count > 50 or unique_count > max(rows * 0.8, 20):
+            warnings.append("high cardinality")
+        if pd.api.types.is_numeric_dtype(series):
+            numeric = pd.to_numeric(series, errors="coerce").dropna()
+            if len(numeric) >= 8:
+                skew = numeric.skew()
+                if pd.notna(skew) and abs(float(skew)) >= 1.5:
+                    warnings.append("skewed distribution")
+
+        sample_values = [
+            str(value) for value in series.dropna().astype(str).drop_duplicates().head(3).tolist()
+        ]
+        dictionary.append({
+            "name": str(col),
+            "dtype": str(series.dtype),
+            "role": _role_for_column(str(col), roles),
+            "completeness_pct": round((rows - missing) / rows * 100, 1),
+            "unique_count": unique_count,
+            "sample_values": sample_values,
+            "warnings": warnings[:3],
+        })
+    return dictionary
+
+
+def infer_contract_type(series: pd.Series) -> str:
+    """Infer a portable contract type from a pandas series."""
+    non_null = series.dropna()
+    if non_null.empty:
+        return "string"
+    if pd.api.types.is_bool_dtype(series):
+        return "boolean"
+    if pd.api.types.is_integer_dtype(series):
+        return "integer"
+    if pd.api.types.is_numeric_dtype(series):
+        return "number"
+    lowered = non_null.astype(str).str.strip().str.lower()
+    if lowered.isin(["true", "false", "yes", "no", "0", "1"]).mean() >= 0.9:
+        return "boolean"
+    parsed_dates = pd.to_datetime(non_null, errors="coerce", format="mixed")
+    if parsed_dates.notna().mean() >= 0.8:
+        return "date"
+    parsed_numbers = pd.to_numeric(non_null, errors="coerce")
+    if parsed_numbers.notna().mean() >= 0.9:
+        return "number"
+    return "string"
+
+
+def build_data_contract(df: pd.DataFrame) -> dict:
+    """Infer a practical schema contract for validating future rows."""
+    roles = infer_column_roles(df)
+    profile = build_profile(df)
+    columns: list[dict] = []
+    for col in df.columns:
+        series = df[col]
+        contract_type = infer_contract_type(series)
+        non_null = series.dropna()
+        missing = int(series.isna().sum())
+        spec: dict = {
+            "name": str(col),
+            "type": contract_type,
+            "role": _role_for_column(str(col), roles),
+            "required": missing == 0,
+            "nullable": missing > 0,
+            "completeness_pct": round((len(df) - missing) / max(len(df), 1) * 100, 1),
+            "unique_count": int(series.nunique(dropna=True)),
+            "rules": [],
+        }
+
+        if contract_type in ("integer", "number") and not non_null.empty:
+            numeric = pd.to_numeric(non_null, errors="coerce").dropna()
+            if not numeric.empty:
+                spec["min"] = _num(numeric.min())
+                spec["max"] = _num(numeric.max())
+                spec["rules"].append("must_parse_as_number")
+        elif contract_type == "date" and not non_null.empty:
+            parsed = pd.to_datetime(non_null, errors="coerce", format="mixed").dropna()
+            if not parsed.empty:
+                spec["min"] = parsed.min().date().isoformat()
+                spec["max"] = parsed.max().date().isoformat()
+                spec["rules"].append("must_parse_as_date")
+        elif contract_type == "string":
+            values = non_null.astype(str)
+            if 0 < values.nunique() <= 20:
+                spec["allowed_values"] = sorted(values.drop_duplicates().tolist())[:20]
+                spec["rules"].append("prefer_known_category")
+
+        if spec["required"]:
+            spec["rules"].append("required")
+        columns.append(spec)
+
+    return {
+        "name": "Inferred Data Contract",
+        "version": "1.0",
+        "row_count_observed": profile["rows"],
+        "column_count": len(columns),
+        "required_columns": [col["name"] for col in columns if col["required"]],
+        "columns": columns,
+        "validation_policy": {
+            "missing_required": "error",
+            "type_mismatch": "error",
+            "unknown_category": "warning",
+            "extra_columns": "warning",
+        },
+    }
+
+
+def validate_rows_against_contract(rows: list[dict], contract: dict) -> dict:
+    """Validate user-provided rows against an inferred data contract."""
+    columns = {column["name"]: column for column in contract["columns"]}
+    errors: list[dict] = []
+    warnings: list[dict] = []
+    valid_count = 0
+
+    def is_blank(value: object) -> bool:
+        return value is None or (isinstance(value, str) and value.strip() == "")
+
+    def add_issue(target: list[dict], row_index: int, column: str, code: str, message: str) -> None:
+        target.append({
+            "row": row_index,
+            "column": column,
+            "code": code,
+            "message": message,
+        })
+
+    for index, row in enumerate(rows):
+        row_errors_before = len(errors)
+        for name, spec in columns.items():
+            value = row.get(name)
+            if is_blank(value):
+                if spec["required"]:
+                    add_issue(errors, index, name, "missing_required", "Required value is missing.")
+                continue
+
+            expected = spec["type"]
+            if expected in ("integer", "number"):
+                parsed = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
+                if pd.isna(parsed):
+                    add_issue(errors, index, name, "type_mismatch", "Value must parse as a number.")
+                elif expected == "integer" and float(parsed) % 1 != 0:
+                    add_issue(errors, index, name, "type_mismatch", "Value must be an integer.")
+            elif expected == "date":
+                parsed_date = pd.to_datetime(pd.Series([value]), errors="coerce", format="mixed").iloc[0]
+                if pd.isna(parsed_date):
+                    add_issue(errors, index, name, "type_mismatch", "Value must parse as a date.")
+            elif expected == "boolean":
+                if str(value).strip().lower() not in {"true", "false", "yes", "no", "0", "1"}:
+                    add_issue(errors, index, name, "type_mismatch", "Value must parse as a boolean.")
+
+            allowed = spec.get("allowed_values")
+            if allowed and str(value) not in allowed:
+                add_issue(warnings, index, name, "unknown_category", "Value was not seen in the original dataset.")
+
+        extra_columns = sorted(set(row) - set(columns))
+        for extra in extra_columns:
+            add_issue(warnings, index, extra, "extra_column", "Column is not part of the inferred contract.")
+
+        if len(errors) == row_errors_before:
+            valid_count += 1
+
+    return {
+        "total_rows": len(rows),
+        "valid_rows": valid_count,
+        "invalid_rows": len(rows) - valid_count,
+        "errors": errors,
+        "warnings": warnings,
+        "contract_version": contract["version"],
+    }
+
+
+def build_dashboard_spec(df: pd.DataFrame, category: str = "general") -> dict:
+    """Create a deterministic dashboard blueprint from schema roles and profile."""
+    roles = infer_column_roles(df)
+    quality = build_quality_report(df)
+    metric = roles["metrics"][0] if roles["metrics"] else (roles["numeric"][0] if roles["numeric"] else None)
+    secondary_metric = next((col for col in roles["numeric"] if col != metric), None)
+    dimension = roles["dimensions"][0] if roles["dimensions"] else None
+    secondary_dimension = roles["dimensions"][1] if len(roles["dimensions"]) > 1 else None
+    time_col = roles["time"][0] if roles["time"] else None
+
+    kpis: list[dict] = [
+        {
+            "id": "row_count",
+            "label": "Rows",
+            "value": int(len(df)),
+            "source": "dataframe row count",
+            "format": "integer",
+        },
+        {
+            "id": "data_health",
+            "label": "Data Health",
+            "value": int(quality["score"]),
+            "source": "deterministic quality report",
+            "format": "score",
+        },
+    ]
+    if metric:
+        metric_values = pd.to_numeric(df[metric], errors="coerce")
+        kpis.extend([
+            {
+                "id": f"total_{metric}",
+                "label": f"Total {metric}",
+                "value": _num(metric_values.sum()),
+                "source": metric,
+                "format": "number",
+            },
+            {
+                "id": f"average_{metric}",
+                "label": f"Average {metric}",
+                "value": _num(metric_values.mean()),
+                "source": metric,
+                "format": "number",
+            },
+        ])
+
+    charts: list[dict] = []
+
+    def add_chart(chart_id: str, title: str, chart_type: str, x: str | None,
+                  y: str | None, purpose: str, question: str) -> None:
+        charts.append({
+            "id": chart_id,
+            "title": title,
+            "type": chart_type,
+            "x": x,
+            "y": y,
+            "purpose": purpose,
+            "question": question,
+        })
+
+    if metric and time_col:
+        add_chart(
+            "metric_trend",
+            f"{metric} over time",
+            "line",
+            time_col,
+            metric,
+            "Monitor trend direction, spikes, and drops.",
+            f"Plot {metric} over time using {time_col}.",
+        )
+    if metric and dimension:
+        add_chart(
+            "segment_performance",
+            f"{metric} by {dimension}",
+            "bar",
+            dimension,
+            metric,
+            "Rank business segments by the primary metric.",
+            f"Show {metric} by {dimension} as a bar chart.",
+        )
+    if dimension:
+        add_chart(
+            "segment_volume",
+            f"Records by {dimension}",
+            "bar",
+            dimension,
+            None,
+            "See whether observations are balanced across segments.",
+            f"Show record count by {dimension}.",
+        )
+    if metric:
+        add_chart(
+            "metric_distribution",
+            f"{metric} distribution",
+            "histogram",
+            metric,
+            None,
+            "Understand spread, skew, and unusual values.",
+            f"Plot the distribution of {metric}.",
+        )
+    if metric and secondary_metric:
+        add_chart(
+            "metric_relationship",
+            f"{metric} vs {secondary_metric}",
+            "scatter",
+            secondary_metric,
+            metric,
+            "Check whether two measures move together.",
+            f"Show a scatter plot of {secondary_metric} vs {metric}.",
+        )
+
+    filters = []
+    for col in [time_col, dimension, secondary_dimension]:
+        if col:
+            filters.append({
+                "column": col,
+                "type": "date_range" if col == time_col else "multi_select",
+                "role": _role_for_column(col, roles),
+            })
+
+    return {
+        "title": f"{category.title()} Data Dashboard",
+        "category": category,
+        "layout": {
+            "columns": 12,
+            "density": "analyst_workspace",
+            "sections": ["kpis", "trends", "segments", "quality"],
+        },
+        "kpis": kpis[:6],
+        "charts": charts[:6],
+        "filters": filters,
+        "data_requirements": {
+            "metric": metric,
+            "secondary_metric": secondary_metric,
+            "dimension": dimension,
+            "time": time_col,
+        },
+        "starter_questions": [chart["question"] for chart in charts[:4]],
+        "quality_notes": quality["issues"][:3],
+    }
+
+
+def build_decision_actions(df: pd.DataFrame, category: str = "general") -> list[dict]:
+    """Turn deterministic findings into business actions with evidence and caveats."""
+    roles = infer_column_roles(df)
+    quality = build_quality_report(df)
+    profile = build_profile(df)
+    metric = roles["metrics"][0] if roles["metrics"] else (roles["numeric"][0] if roles["numeric"] else None)
+    dimension = roles["dimensions"][0] if roles["dimensions"] else None
+    time_col = roles["time"][0] if roles["time"] else None
+    actions: list[dict] = []
+
+    def add_action(
+        title: str,
+        priority: str,
+        implication: str,
+        recommended_action: str,
+        estimated_impact: str,
+        confidence: float,
+        evidence: list[str],
+        risks_assumptions: list[str],
+        supporting_columns: list[str],
+        suggested_question: str,
+    ) -> None:
+        actions.append({
+            "title": title,
+            "priority": priority,
+            "category": category,
+            "implication": implication,
+            "recommended_action": recommended_action,
+            "estimated_impact": estimated_impact,
+            "confidence": round(confidence, 2),
+            "evidence": evidence,
+            "risks_assumptions": risks_assumptions,
+            "supporting_columns": supporting_columns,
+            "suggested_question": suggested_question,
+        })
+
+    if metric and dimension:
+        grouped = (
+            df.groupby(dimension)[metric]
+            .sum()
+            .dropna()
+            .sort_values(ascending=False)
+        )
+        if len(grouped) >= 2:
+            leader = str(grouped.index[0])
+            laggard = str(grouped.index[-1])
+            leader_value = float(grouped.iloc[0])
+            laggard_value = float(grouped.iloc[-1])
+            total = float(grouped.sum()) or 1.0
+            leader_share = leader_value / total * 100
+            gap = leader_value - laggard_value
+            add_action(
+                title=f"Prioritize the strongest {dimension}",
+                priority="high" if leader_share >= 40 else "medium",
+                implication=f"{leader} contributes the largest share of {metric}.",
+                recommended_action=(
+                    f"Review what is working in {leader}, then compare it with {laggard} "
+                    "to identify repeatable tactics or operational gaps."
+                ),
+                estimated_impact=f"Top-to-bottom {metric} gap is {gap:,.2f}.",
+                confidence=0.9 if len(grouped) >= 3 else 0.78,
+                evidence=[
+                    f"{leader}: {leader_value:,.2f} {metric}.",
+                    f"{laggard}: {laggard_value:,.2f} {metric}.",
+                    f"{leader} represents {leader_share:.1f}% of grouped total.",
+                ],
+                risks_assumptions=[
+                    "Grouped totals assume each uploaded row is a valid business event.",
+                    "Segment performance may reflect volume differences, not only efficiency.",
+                ],
+                supporting_columns=[dimension, metric],
+                suggested_question=f"Why is {leader} outperforming {laggard} on {metric}?",
+            )
+
+    if metric and time_col:
+        temp = df[[time_col, metric]].copy()
+        temp[time_col] = pd.to_datetime(temp[time_col], errors="coerce", format="mixed")
+        temp[metric] = pd.to_numeric(temp[metric], errors="coerce")
+        temp = temp.dropna()
+        if len(temp) >= 3:
+            trend = temp.sort_values(time_col).groupby(time_col)[metric].sum()
+            if len(trend) >= 3:
+                first = float(trend.iloc[0])
+                last = float(trend.iloc[-1])
+                delta = last - first
+                pct = delta / abs(first) * 100 if first else 0.0
+                if abs(pct) >= 5:
+                    direction = "declined" if pct < 0 else "increased"
+                    add_action(
+                        title=f"Investigate {metric} {direction} over time",
+                        priority="high" if pct < -10 else "medium",
+                        implication=f"{metric} {direction} by {abs(pct):.1f}% from first to latest observed period.",
+                        recommended_action=(
+                            "Break the trend by segment, category, and product to identify where the movement started."
+                        ),
+                        estimated_impact=f"Latest period changed by {delta:,.2f} versus the first observed period.",
+                        confidence=0.84 if len(trend) >= 5 else 0.72,
+                        evidence=[
+                            f"First observed period: {first:,.2f}.",
+                            f"Latest observed period: {last:,.2f}.",
+                            f"Observed periods: {len(trend)}.",
+                        ],
+                        risks_assumptions=[
+                            "The uploaded file may not contain a complete time range.",
+                            "Date granularity and seasonality can affect interpretation.",
+                        ],
+                        supporting_columns=[time_col, metric],
+                        suggested_question=f"Break down the {metric} trend by {dimension or 'category'}.",
+                    )
+
+    for issue in quality["issues"][:2]:
+        if issue["severity"] != "warn":
+            continue
+        add_action(
+            title=f"Fix {issue['title'].lower()} before decisions",
+            priority="high",
+            implication=issue["detail"],
+            recommended_action=issue.get("suggestion") or "Clean this issue before sharing executive metrics.",
+            estimated_impact="Improves reliability of downstream analysis and model training.",
+            confidence=0.95,
+            evidence=[issue["detail"], f"Current quality score: {quality['score']}/100."],
+            risks_assumptions=["Cleaning rules should be confirmed with the data owner before production use."],
+            supporting_columns=issue.get("columns", []),
+            suggested_question="What data quality issues should I fix first?",
+        )
+
+    if metric and len(df) >= 50 and len(roles["numeric"]) >= 2:
+        add_action(
+            title=f"Train a predictive model for {metric}",
+            priority="medium",
+            implication=f"The dataset appears large enough to explore drivers of {metric}.",
+            recommended_action=(
+                f"Train a model for `{metric}`, inspect feature importance, then run scenario tests on controllable drivers."
+            ),
+            estimated_impact="Identifies leading drivers that may be used for planning or simulation.",
+            confidence=0.75,
+            evidence=[
+                f"{len(df):,} rows available.",
+                f"{len(roles['numeric'])} numeric columns detected.",
+                "Predictive modeling feature is available in the workspace.",
+            ],
+            risks_assumptions=[
+                "Predictive relationships are not causal by default.",
+                "Model quality depends on whether the uploaded columns include real driver variables.",
+            ],
+            supporting_columns=[metric] + roles["numeric"][:4],
+            suggested_question=f"Train a predictive model for {metric}.",
+        )
+
+    if not actions:
+        add_action(
+            title="Start with data readiness",
+            priority="medium",
+            implication="The dataset needs clearer metrics, segments, or time fields before strong business actions can be inferred.",
+            recommended_action="Confirm the business meaning of the columns, then add a metric and segment field if available.",
+            estimated_impact="Improves the quality of future insights and dashboard recommendations.",
+            confidence=0.7,
+            evidence=[
+                f"{profile['rows']:,} rows and {len(profile['columns']):,} columns detected.",
+                f"Data health score: {quality['score']}/100.",
+            ],
+            risks_assumptions=["Limited schema context can reduce recommendation specificity."],
+            supporting_columns=[],
+            suggested_question="What are the best next questions for this dataset?",
+        )
+
+    return actions[:6]
+
+
+def build_decision_brief(df: pd.DataFrame, category: str = "general") -> dict:
+    """Turn a dataset profile into a decision-readiness and action brief."""
+    profile = build_profile(df)
+    roles = infer_column_roles(df)
+    quality = build_quality_report(df)
+    decision_actions = build_decision_actions(df, category)
+    metric = roles["metrics"][0] if roles["metrics"] else (roles["numeric"][0] if roles["numeric"] else None)
+    dimension = roles["dimensions"][0] if roles["dimensions"] else None
+    time_col = roles["time"][0] if roles["time"] else None
+
+    readiness_score = int(quality["score"])
+    risk_flags: list[dict] = []
+
+    def risk(severity: str, title: str, detail: str) -> None:
+        risk_flags.append({"severity": severity, "title": title, "detail": detail})
+
+    if not metric:
+        readiness_score -= 20
+        risk("high", "No clear metric", "The dataset has no obvious numeric measure for KPI tracking.")
+    if not dimension:
+        readiness_score -= 10
+        risk("medium", "No clear segment", "The dataset has no obvious categorical dimension for comparison.")
+    if not time_col:
+        risk("info", "No time field", "Trend, seasonality, and forecasting workflows may be limited.")
+    if profile["rows"] < 30:
+        readiness_score -= 10
+        risk("medium", "Small dataset", "Patterns may be unstable because the dataset has fewer than 30 rows.")
+    if quality["status"] == "needs_attention":
+        readiness_score -= 10
+    readiness_score = max(0, min(100, readiness_score))
+
+    use_cases: list[dict] = []
+    blocked_use_cases: list[dict] = []
+    if metric and dimension:
+        use_cases.append({
+            "name": "Performance dashboard",
+            "fit": "strong",
+            "why": f"Use `{metric}` by `{dimension}` to rank segments and monitor performance.",
+        })
+    else:
+        blocked_use_cases.append({
+            "name": "Segment performance dashboard",
+            "missing": "Needs at least one metric and one segment/dimension column.",
+        })
+    if metric and time_col:
+        use_cases.append({
+            "name": "Trend monitoring",
+            "fit": "strong",
+            "why": f"Use `{time_col}` with `{metric}` for movement over time.",
+        })
+    else:
+        blocked_use_cases.append({
+            "name": "Trend monitoring",
+            "missing": "Needs a time column and a numeric metric.",
+        })
+    if profile["rows"] >= 50 and len(roles["numeric"]) >= 2:
+        use_cases.append({
+            "name": "Predictive modeling",
+            "fit": "moderate",
+            "why": "There are enough rows and numeric signals to train an initial model.",
+        })
+    else:
+        blocked_use_cases.append({
+            "name": "Predictive modeling",
+            "missing": "Usually needs at least 50 rows and multiple usable signal columns.",
+        })
+    if quality["issues"]:
+        use_cases.append({
+            "name": "Data quality remediation",
+            "fit": "strong",
+            "why": "Quality issues were detected and can be turned into cleanup tasks.",
+        })
+
+    priority_questions: list[str] = []
+    if metric and dimension:
+        priority_questions.extend([
+            f"Which {dimension} has the highest total {metric}?",
+            f"Show {metric} by {dimension} as a bar chart.",
+        ])
+    if metric and time_col:
+        priority_questions.append(f"Plot {metric} over time using {time_col}.")
+    if len(roles["numeric"]) >= 2:
+        priority_questions.append("Which numeric columns are most strongly correlated?")
+    priority_questions.extend([
+        "What data quality issues should I fix first?",
+        "What story does this dataset tell?",
+    ])
+
+    next_actions: list[dict] = []
+    for issue in quality["issues"][:3]:
+        next_actions.append({
+            "priority": "high" if issue["severity"] == "warn" else "medium",
+            "action": issue["title"],
+            "reason": issue["detail"],
+            "impact": issue.get("suggestion") or "Improves trust in downstream analysis.",
+        })
+    if metric and dimension:
+        next_actions.append({
+            "priority": "high",
+            "action": "Build the first KPI view",
+            "reason": f"`{metric}` and `{dimension}` create an immediate performance breakdown.",
+            "impact": "Gives stakeholders a clear starting point for decisions.",
+        })
+    if metric and time_col:
+        next_actions.append({
+            "priority": "medium",
+            "action": "Add trend monitoring",
+            "reason": f"`{time_col}` enables time-series analysis for `{metric}`.",
+            "impact": "Makes changes, spikes, and drops visible earlier.",
+        })
+
+    automation_opportunities = []
+    if metric:
+        automation_opportunities.append(f"Scheduled KPI digest for `{metric}`")
+    if metric and dimension:
+        automation_opportunities.append(f"Anomaly alerts for unusual `{metric}` by `{dimension}`")
+    if profile["rows"] >= 50:
+        automation_opportunities.append("Recurring model retraining when new rows arrive")
+
+    return {
+        "category": category,
+        "readiness_score": readiness_score,
+        "readiness_label": (
+            "decision_ready" if readiness_score >= 85
+            else "usable_with_caution" if readiness_score >= 65
+            else "needs_cleanup"
+        ),
+        "summary": (
+            f"{profile['rows']:,} rows, {len(profile['columns']):,} columns, "
+            f"{quality['summary'].lower()}"
+        ),
+        "recommended_use_cases": use_cases[:5],
+        "blocked_use_cases": blocked_use_cases[:4],
+        "priority_questions": priority_questions[:6],
+        "next_actions": next_actions[:6],
+        "decision_actions": decision_actions,
+        "risk_flags": risk_flags[:6],
+        "automation_opportunities": automation_opportunities[:4],
+        "column_dictionary": build_column_dictionary(df, roles),
+    }
+
+
+INVESTIGATION_PERSONAS: dict[str, dict] = {
+    "general": {
+        "name": "Analytics Lead",
+        "focus": "reliable statistical evidence, data readiness, and the fastest useful drill-down",
+        "priority_kpis": ["primary metric", "trend", "segment gap", "outliers", "data quality"],
+        "column_terms": ["score", "value", "total", "amount", "date", "category", "segment"],
+        "default_question": "Which finding should become the first operational dashboard?",
+        "risk_language": "statistical uncertainty, sample size, and data completeness",
+    },
+    "financial": {
+        "name": "CFO",
+        "focus": "revenue movement, margin pressure, volatility, cost control, and budget risk",
+        "priority_kpis": ["revenue", "profit", "margin", "cost", "growth", "variance", "cash flow"],
+        "column_terms": ["revenue", "profit", "margin", "cost", "price", "amount", "sales"],
+        "default_question": "What is the financial impact and where should leadership act first?",
+        "risk_language": "forecast risk, margin sensitivity, and incomplete period coverage",
+    },
+    "medical": {
+        "name": "Healthcare Analyst",
+        "focus": "patient cohorts, outcome prevalence, clinical risk factors, and measurement reliability",
+        "priority_kpis": ["outcome", "prevalence", "risk", "age", "cohort", "rate", "measurement"],
+        "column_terms": ["outcome", "diagnosis", "risk", "age", "patient", "rate", "score"],
+        "default_question": "Which cohort or risk factor deserves clinical review first?",
+        "risk_language": "association rather than causation, cohort bias, and clinical validity",
+    },
+    "retail": {
+        "name": "Retail Operator",
+        "focus": "sales growth, product performance, regional gaps, basket behavior, and demand signals",
+        "priority_kpis": ["revenue", "sales", "quantity", "order value", "product", "region", "rating"],
+        "column_terms": ["revenue", "sales", "quantity", "product", "category", "region", "rating"],
+        "default_question": "Which product, category, or region should the team optimize first?",
+        "risk_language": "seasonality, volume mix, returns, and missing customer context",
+    },
+    "marketing": {
+        "name": "Growth Strategist",
+        "focus": "channel performance, conversion, retention, audience segments, and campaign efficiency",
+        "priority_kpis": ["conversion", "retention", "CAC", "ROAS", "channel", "campaign", "segment"],
+        "column_terms": ["conversion", "retention", "channel", "campaign", "segment", "customer", "rate"],
+        "default_question": "Which segment or channel has the clearest growth opportunity?",
+        "risk_language": "attribution limits, funnel leakage, cohort effects, and campaign mix",
+    },
+    "hr": {
+        "name": "People Analytics Lead",
+        "focus": "headcount, attrition, tenure, compensation equity, performance, and workforce fairness",
+        "priority_kpis": ["attrition", "tenure", "salary", "performance", "department", "age", "headcount"],
+        "column_terms": ["attrition", "tenure", "salary", "performance", "department", "employee", "age"],
+        "default_question": "Which workforce segment needs the most urgent people decision?",
+        "risk_language": "fairness, privacy, small-group sensitivity, and confounding variables",
+    },
+}
+
+
+def investigation_persona_for(category: str) -> dict:
+    """Return the deterministic investigation persona for a category lens."""
+    return INVESTIGATION_PERSONAS.get(category, INVESTIGATION_PERSONAS["general"])
+
+
+def persona_relevant_columns(df: pd.DataFrame, persona: dict) -> list[str]:
+    """Find columns that match the current analyst persona's KPI vocabulary."""
+    terms = [str(term).lower() for term in persona.get("column_terms", [])]
+    matches: list[str] = []
+    for column in df.columns:
+        name = str(column).lower()
+        if any(term in name for term in terms):
+            matches.append(str(column))
+    return matches[:6]
+
+
+def build_investigation_report(df: pd.DataFrame, goal: str, category: str = "general") -> dict:
+    """Run a deterministic multi-step investigation over the most decision-useful columns."""
+    profile = build_profile(df)
+    roles = infer_column_roles(df)
+    quality = build_quality_report(df)
+    persona = investigation_persona_for(category)
+    persona_columns = persona_relevant_columns(df, persona)
+    metric = roles["metrics"][0] if roles["metrics"] else (roles["numeric"][0] if roles["numeric"] else None)
+    dimension = roles["dimensions"][0] if roles["dimensions"] else None
+    secondary_dimension = roles["dimensions"][1] if len(roles["dimensions"]) > 1 else None
+    time_col = roles["time"][0] if roles["time"] else None
+    relevant_columns = list(dict.fromkeys([col for col in [metric, dimension, secondary_dimension, time_col] if col] + persona_columns))
+    findings: list[str] = []
+    recommended_actions: list[str] = []
+    investigation_tree: list[dict] = []
+    chart_json: str | None = None
+    trend_payload: dict | None = None
+    segment_payload: dict | None = None
+    outlier_payload: dict | None = None
+    correlation_payload: dict | None = None
+
+    def add_tree(node: str, status: str, finding: str, columns: list[str] | None = None) -> None:
+        investigation_tree.append({
+            "node": node,
+            "status": status,
+            "finding": finding,
+            "columns": columns or [],
+        })
+
+    add_tree(
+        "Dataset profile",
+        "complete",
+        f"{profile['rows']:,} rows, {len(profile['columns']):,} columns, {profile['missing_pct']}% missing cells.",
+        list(profile["columns"])[:6],
+    )
+    add_tree(
+        "Persona focus",
+        "complete",
+        f"{persona['name']} lens prioritizes {persona['focus']}.",
+        persona_columns,
+    )
+
+    if metric and time_col:
+        temp = df[[time_col, metric]].copy()
+        temp[time_col] = pd.to_datetime(temp[time_col], errors="coerce", format="mixed")
+        temp[metric] = pd.to_numeric(temp[metric], errors="coerce")
+        temp = temp.dropna()
+        if len(temp) >= 2:
+            trend = temp.sort_values(time_col).groupby(time_col)[metric].sum()
+            first = float(trend.iloc[0])
+            last = float(trend.iloc[-1])
+            delta = last - first
+            pct = delta / abs(first) * 100 if first else 0.0
+            direction = "increased" if delta >= 0 else "declined"
+            trend_payload = {
+                "time_column": time_col,
+                "metric": metric,
+                "first_period": str(trend.index[0].date()),
+                "latest_period": str(trend.index[-1].date()),
+                "first_value": _num(first),
+                "latest_value": _num(last),
+                "delta": _num(delta),
+                "pct_change": _num(pct),
+                "direction": direction,
+            }
+            finding = (
+                f"{metric} {direction} by {abs(pct):.1f}% from {trend_payload['first_period']} "
+                f"to {trend_payload['latest_period']}."
+            )
+            findings.append(finding)
+            add_tree("Trend scan", "complete", finding, [time_col, metric])
+            if delta < 0:
+                recommended_actions.append(
+                    f"Break the {metric} decline by segment and date to locate the first point of deterioration."
+                )
+            else:
+                recommended_actions.append(
+                    f"Identify what changed during the latest {metric} increase and decide whether it can be repeated."
+                )
+            plot_df = trend.reset_index()
+            fig = px.line(plot_df, x=time_col, y=metric, markers=True, title=f"{metric} investigation trend")
+            chart_json = _chart_to_json(fig)
+        else:
+            add_tree("Trend scan", "limited", f"`{time_col}` and `{metric}` did not contain enough valid paired rows.", [time_col, metric])
+    elif metric:
+        add_tree("Trend scan", "skipped", "No usable time column was detected for trend analysis.", [metric])
+
+    if metric and dimension:
+        grouped = (
+            df[[dimension, metric]]
+            .dropna()
+            .assign(**{metric: pd.to_numeric(df[metric], errors="coerce")})
+            .dropna()
+            .groupby(dimension)[metric]
+            .sum()
+            .sort_values(ascending=False)
+        )
+        if len(grouped) >= 2:
+            leader = str(grouped.index[0])
+            laggard = str(grouped.index[-1])
+            leader_value = float(grouped.iloc[0])
+            laggard_value = float(grouped.iloc[-1])
+            total = float(grouped.sum()) or 1.0
+            gap = leader_value - laggard_value
+            leader_share = leader_value / total * 100
+            segment_payload = {
+                "dimension": dimension,
+                "metric": metric,
+                "leader": leader,
+                "leader_value": _num(leader_value),
+                "laggard": laggard,
+                "laggard_value": _num(laggard_value),
+                "gap": _num(gap),
+                "leader_share_pct": _num(leader_share),
+                "top_segments": [
+                    {"label": str(idx), "value": _num(value)}
+                    for idx, value in grouped.head(5).items()
+                ],
+            }
+            finding = (
+                f"{leader} leads {dimension} with {leader_value:,.2f} {metric}, "
+                f"{gap:,.2f} above {laggard}."
+            )
+            findings.append(finding)
+            add_tree("Segment driver scan", "complete", finding, [dimension, metric])
+            recommended_actions.append(
+                f"Compare operating conditions for {leader} and {laggard}; the gap is the fastest root-cause path."
+            )
+            if not chart_json:
+                fig = px.bar(
+                    pd.DataFrame(segment_payload["top_segments"]),
+                    x="label",
+                    y="value",
+                    title=f"{metric} by {dimension}",
+                    labels={"label": dimension, "value": metric},
+                )
+                chart_json = _chart_to_json(fig)
+        else:
+            add_tree("Segment driver scan", "limited", f"`{dimension}` has fewer than two usable groups.", [dimension, metric])
+    elif metric:
+        add_tree("Segment driver scan", "skipped", "No categorical dimension was detected for segment comparison.", [metric])
+
+    if metric:
+        series = pd.to_numeric(df[metric], errors="coerce").dropna()
+        if len(series) >= 3:
+            std = float(series.std(ddof=0))
+            mean = float(series.mean())
+            if std > 0:
+                z_scores = ((series - mean).abs() / std)
+                outlier_count = int((z_scores >= 2).sum())
+                outlier_payload = {
+                    "metric": metric,
+                    "count": outlier_count,
+                    "threshold": "2 standard deviations from mean",
+                    "max_value": _num(series.max()),
+                    "min_value": _num(series.min()),
+                }
+                finding = (
+                    f"{outlier_count} {metric} value(s) sit at least 2 standard deviations from the mean."
+                )
+                findings.append(finding)
+                add_tree("Anomaly scan", "complete", finding, [metric])
+                if outlier_count:
+                    recommended_actions.append(
+                        f"Audit the extreme {metric} rows before using them for planning or forecasting."
+                    )
+        else:
+            add_tree("Anomaly scan", "limited", f"`{metric}` has too few numeric values for a stable anomaly scan.", [metric])
+
+    numeric = df.select_dtypes(include="number")
+    if numeric.shape[1] >= 2:
+        corr = numeric.corr()
+        pairs: list[dict] = []
+        for i, left in enumerate(corr.columns):
+            for right in corr.columns[i + 1:]:
+                value = corr.loc[left, right]
+                if pd.notna(value):
+                    pairs.append({
+                        "left": str(left),
+                        "right": str(right),
+                        "correlation": _num(value),
+                        "abs_correlation": abs(float(value)),
+                    })
+        if pairs:
+            strongest = sorted(pairs, key=lambda item: item["abs_correlation"], reverse=True)[0]
+            correlation_payload = strongest
+            finding = (
+                f"Strongest numeric relationship: {strongest['left']} vs {strongest['right']} "
+                f"at correlation {strongest['correlation']}."
+            )
+            findings.append(finding)
+            add_tree("Driver relationship scan", "complete", finding, [strongest["left"], strongest["right"]])
+    else:
+        add_tree("Driver relationship scan", "skipped", "At least two numeric columns are needed for correlation analysis.", roles["numeric"])
+
+    if quality["issues"]:
+        issue = quality["issues"][0]
+        finding = f"Data quality risk: {issue['detail']}"
+        findings.append(finding)
+        add_tree("Quality risk scan", "complete", finding, issue.get("columns", []))
+        recommended_actions.append(issue.get("suggestion") or "Resolve the leading data quality issue before executive use.")
+    else:
+        add_tree("Quality risk scan", "complete", "No missing values or duplicate rows were detected.", [])
+
+    if not recommended_actions:
+        recommended_actions.append("Use the dashboard blueprint and priority questions to turn this dataset into a recurring KPI workflow.")
+    recommended_actions.append(f"Run the next drill-down as a {persona['name']} decision review: {persona['default_question']}")
+
+    confidence = 0.94 if metric and (dimension or time_col) else 0.82
+    executive = (
+        f"Autonomous investigation for `{goal}` found {len(findings)} evidence points. "
+        f"The primary lens is `{metric}`" + (f" by `{dimension}`" if dimension else "") + "."
+        if metric else
+        f"Autonomous investigation for `{goal}` focused on data readiness because no clear metric was detected."
+    )
+    report_lines = [
+        "**Executive finding**",
+        executive,
+        "",
+        "**Analyst persona**",
+        f"{persona['name']} lens: prioritizes {', '.join(persona['priority_kpis'][:5])}.",
+        "",
+        "**Evidence**",
+    ]
+    report_lines.extend(f"- {finding}" for finding in findings[:6])
+    report_lines.extend([
+        "",
+        "**Recommended actions**",
+    ])
+    report_lines.extend(f"- {action}" for action in recommended_actions[:5])
+    report_lines.extend([
+        "",
+        "**Risks / assumptions**",
+        "- The investigation uses only the uploaded data and does not infer causality by itself.",
+        "- Segment totals can reflect volume differences as well as performance differences.",
+        f"- Persona-specific caution: {persona['risk_language']}.",
+        f"- Data quality status: {quality['summary']}",
+    ])
+
+    plan = {
+        "strategy": "Autonomous deterministic investigation using profile, trend, segment, anomaly, correlation, and quality scans.",
+        "query_type": "deterministic_investigation",
+        "goal": goal,
+        "category": category,
+        "persona": persona,
+        "persona_columns": persona_columns,
+        "relevant_columns": relevant_columns,
+        "analysis_steps": [
+            "Frame the business goal",
+            f"Apply the {persona['name']} persona lens",
+            "Profile decision readiness",
+            "Scan metric movement over time",
+            "Rank segment drivers",
+            "Detect unusual metric values",
+            "Check numeric relationships",
+            "Convert evidence into recommended actions",
+        ],
+        "investigation_tree": investigation_tree,
+        "chart_type": "line" if trend_payload else "bar" if segment_payload else "none",
+    }
+
+    return {
+        "goal": goal,
+        "category": category,
+        "persona": persona,
+        "persona_columns": persona_columns,
+        "primary_metric": metric,
+        "primary_dimension": dimension,
+        "secondary_dimension": secondary_dimension,
+        "trend": trend_payload,
+        "segment_driver": segment_payload,
+        "outliers": outlier_payload,
+        "correlation": correlation_payload,
+        "quality": {
+            "score": quality["score"],
+            "status": quality["status"],
+            "summary": quality["summary"],
+            "issues": quality["issues"][:3],
+        },
+        "findings": findings[:8],
+        "recommended_actions": recommended_actions[:6],
+        "investigation_tree": investigation_tree,
+        "plan": plan,
+        "report": "\n".join(report_lines),
+        "chart_json": chart_json,
+        "decision_actions": build_decision_actions(df, category),
+        "validation": build_validation_payload(
+            df,
+            method="Autonomous deterministic investigation pipeline",
+            source_columns=relevant_columns,
+            confidence=confidence,
+            reasons=[
+                "Evidence was computed directly from the uploaded dataframe.",
+                "The investigation separated numeric computation from the final narrative.",
+                "Trend, segment, anomaly, correlation, and quality checks are deterministic.",
+            ],
+        ),
+        "meta": {"route": "deterministic_investigation", "facts_first": True},
+    }
+
+
+def build_story_facts(df: pd.DataFrame, category: str = "general") -> dict:
+    """Build a deterministic facts JSON payload before any narrative is written."""
+    profile = build_profile(df)
+    roles = infer_column_roles(df)
+    insights = build_proactive_insights(df)
+    facts: dict = {
+        "category": category,
+        "profile": {
+            "rows": profile["rows"],
+            "columns": len(profile["columns"]),
+            "numeric_features": profile["numeric_features"],
+            "missing_total": profile["missing_total"],
+            "missing_pct": profile["missing_pct"],
+            "duplicate_rows": profile["duplicate_rows"],
+        },
+        "column_roles": roles,
+        "insights": insights,
+        "top_breakdowns": [],
+        "relationships": [],
+    }
+
+    metric = roles["metrics"][0] if roles["metrics"] else None
+    if metric:
+        facts["primary_metric"] = {
+            "name": metric,
+            "total": _num(df[metric].sum()),
+            "mean": _num(df[metric].mean()),
+            "non_missing": int(df[metric].notna().sum()),
+        }
+
+    for dimension in roles["dimensions"][:3]:
+        if metric:
+            grouped = df.groupby(dimension)[metric].sum().sort_values(ascending=False).head(5)
+            facts["top_breakdowns"].append({
+                "dimension": dimension,
+                "metric": metric,
+                "values": [
+                    {"label": str(idx), "value": _num(value)}
+                    for idx, value in grouped.items()
+                ],
+            })
+
+    numeric = df.select_dtypes(include="number")
+    if numeric.shape[1] >= 2:
+        corr = numeric.corr()
+        pairs: list[dict] = []
+        for i, left in enumerate(corr.columns):
+            for right in corr.columns[i + 1:]:
+                value = corr.loc[left, right]
+                if pd.notna(value):
+                    pairs.append({
+                        "left": str(left),
+                        "right": str(right),
+                        "correlation": _num(value),
+                        "abs_correlation": abs(float(value)),
+                    })
+        facts["relationships"] = sorted(pairs, key=lambda p: p["abs_correlation"], reverse=True)[:3]
+
+    return facts
+
+
+def render_story_from_facts(facts: dict) -> str:
+    """Write a concise story from deterministic facts only."""
+    profile = facts["profile"]
+    def fmt(value: float | None) -> str:
+        return "n/a" if value is None else f"{value:,}"
+
+    lines = [
+        "**Headline:** This dataset is ready for analysis, with the strongest first story coming from its primary metrics and segment breakdowns.",
+        "",
+        "**Key Findings:**",
+        f"- The dataset contains {profile['rows']:,} rows and {profile['columns']:,} columns, including {profile['numeric_features']:,} numeric fields.",
+    ]
+
+    metric = facts.get("primary_metric")
+    if metric:
+        lines.append(
+            f"- The primary metric appears to be `{metric['name']}` with total {fmt(metric['total'])} "
+            f"and average {fmt(metric['mean'])} across {metric['non_missing']:,} non-missing rows."
+        )
+
+    if facts["top_breakdowns"] and facts["top_breakdowns"][0]["values"]:
+        top = facts["top_breakdowns"][0]
+        leader = top["values"][0]
+        lines.append(
+            f"- `{leader['label']}` is the leading `{top['dimension']}` by `{top['metric']}` "
+            f"with {fmt(leader['value'])}."
+        )
+
+    if profile["missing_total"] or profile["duplicate_rows"]:
+        lines.append(
+            f"- Data quality needs attention: {profile['missing_total']:,} missing values and "
+            f"{profile['duplicate_rows']:,} duplicate rows were detected."
+        )
+    else:
+        lines.append("- First-pass data quality is clean: no missing values or duplicate rows were detected.")
+
+    if facts["relationships"]:
+        rel = facts["relationships"][0]
+        lines.append(
+            f"- The strongest numeric relationship is `{rel['left']}` vs `{rel['right']}` "
+            f"with correlation {rel['correlation']}."
+        )
+
+    lines.extend([
+        "",
+        "**Recommended Next Actions:**",
+        "- Review the top segment breakdowns to identify what is driving the main metric.",
+        "- Ask for a trend or distribution view to separate normal variation from possible anomalies.",
+        "- If the target column is meaningful, train a predictive model and inspect the explainability tabs.",
+        "",
+        "**Trust Note:** This story is generated from deterministic profile, grouping, quality, and correlation facts before any narrative wording is applied.",
+    ])
+    return "\n".join(lines)
+
+
+def build_story_chart_json(facts: dict) -> str | None:
+    """Create a Plotly chart for the strongest deterministic story breakdown."""
+    if not facts.get("top_breakdowns"):
+        return None
+    top = facts["top_breakdowns"][0]
+    values = top.get("values") or []
+    if not values:
+        return None
+    plot_df = pd.DataFrame(values)
+    fig = px.bar(
+        plot_df,
+        x="label",
+        y="value",
+        title=f"Top {top['dimension']} by {top['metric']}",
+        labels={"label": top["dimension"], "value": top["metric"]},
+    )
+    return _chart_to_json(fig)
+
+
+def suggest_followups(question: str, df: pd.DataFrame,
+                      plan: dict | None = None,
+                      previous_state: dict | None = None) -> list[str]:
+    """Generate lightweight context-aware follow-up questions."""
+    roles = infer_column_roles(df)
+    metric = None
+    dimension = None
+    if plan:
+        spec = plan.get("chart_spec") or {}
+        metric = spec.get("y") if spec.get("y") != "count" else None
+        dimension = spec.get("x")
+    if previous_state:
+        metric = metric or previous_state.get("last_metric")
+        dimension = dimension or previous_state.get("last_grouping")
+    metric = metric if metric in df.columns else (roles["metrics"][0] if roles["metrics"] else None)
+    dimension = dimension if dimension in df.columns else (roles["dimensions"][0] if roles["dimensions"] else None)
+    time_col = roles["time"][0] if roles["time"] else None
+
+    followups: list[str] = []
+    if metric and dimension:
+        followups.append(f"Show {metric} by {dimension} as a bar chart")
+    if metric and time_col:
+        followups.append(f"Plot {metric} over time")
+    if metric:
+        followups.append(f"Show the distribution of {metric}")
+    other_dimension = next((d for d in roles["dimensions"] if d != dimension), None)
+    if metric and other_dimension:
+        followups.append(f"Now split that by {other_dimension}")
+    if len(roles["numeric"]) >= 2:
+        followups.append("Show a correlation heatmap of numeric columns")
+    followups.append("What story does this dataset tell?")
+
+    unique: list[str] = []
+    for item in followups:
+        if item.lower() != _norm_text(question) and item not in unique:
+            unique.append(item)
+    return unique[:3]
+
+
+def build_validation_payload(df: pd.DataFrame, method: str,
+                             source_columns: list[str] | None = None,
+                             confidence: float = 0.95,
+                             reasons: list[str] | None = None) -> dict:
+    """Explain why an insight or answer should be trusted."""
+    clean_columns = [str(c) for c in (source_columns or []) if c in df.columns]
+    row_support = int(len(df.dropna(subset=clean_columns))) if clean_columns else int(len(df))
+    missing_pct = 0.0
+    if clean_columns:
+        cells = max(len(df) * len(clean_columns), 1)
+        missing_pct = round(float(df[clean_columns].isna().sum().sum()) / cells * 100, 1)
+
+    label = "High" if confidence >= 0.9 else "Medium" if confidence >= 0.7 else "Low"
+    return {
+        "confidence": round(confidence, 3),
+        "confidence_label": label,
+        "method": method,
+        "row_support": row_support,
+        "source_columns": clean_columns,
+        "missing_pct": missing_pct,
+        "reasons": reasons or [
+            "Computed directly from the uploaded dataframe.",
+            "No free-form narrative was used for the numeric calculation.",
+        ],
+    }
+
+
+def _norm_text(text: str) -> str:
+    """Normalize user text for deterministic intent matching and cache keys."""
+    return " ".join(text.lower().strip().split())
+
+
+def infer_column_roles(df: pd.DataFrame) -> dict[str, list[str]]:
+    """Infer semantic roles from column names, dtypes, and cardinality."""
+    roles: dict[str, list[str]] = {
+        "metrics": [],
+        "time": [],
+        "dimensions": [],
+        "ids": [],
+        "numeric": [],
+        "target_candidates": [],
+    }
+    metric_terms = ("revenue", "sales", "profit", "cost", "amount", "quantity",
+                    "price", "rating", "score", "value", "total", "margin")
+    time_terms = ("date", "time", "month", "year", "timestamp", "created", "updated")
+    dimension_terms = ("category", "region", "segment", "product", "department",
+                       "channel", "city", "country", "state", "status", "group")
+
+    for col in df.columns:
+        col_str = str(col)
+        name = col_str.lower()
+        series = df[col]
+        nunique = int(series.nunique(dropna=True))
+        is_numeric = pd.api.types.is_numeric_dtype(series)
+
+        if is_numeric:
+            roles["numeric"].append(col_str)
+            if any(term in name for term in metric_terms):
+                roles["metrics"].append(col_str)
+            elif not name.endswith("id") and name != "id" and nunique < max(len(df) * 0.95, 2):
+                roles["target_candidates"].append(col_str)
+
+        if any(term in name for term in time_terms):
+            roles["time"].append(col_str)
+            continue
+
+        if name == "id" or name.endswith("_id") or name.endswith(" id"):
+            roles["ids"].append(col_str)
+            continue
+
+        if is_numeric and nunique > 0.95 * max(len(df), 1):
+            roles["ids"].append(col_str)
+            continue
+
+        if not is_numeric and (any(term in name for term in dimension_terms) or 2 <= nunique <= 50):
+            roles["dimensions"].append(col_str)
+
+    if not roles["metrics"] and roles["numeric"]:
+        roles["metrics"] = [c for c in roles["numeric"] if c not in roles["ids"]][:3]
+    if not roles["target_candidates"]:
+        roles["target_candidates"] = roles["metrics"][:3]
+    return roles
+
+
+def _find_columns_in_question(question: str, columns: list[str]) -> list[str]:
+    q = _norm_text(question)
+    return [c for c in columns if str(c).lower() in q]
+
+
+def choose_chart_spec(question: str, df: pd.DataFrame,
+                      column_roles: dict[str, list[str]]) -> dict:
+    """Choose a deterministic chart type from column roles and question text."""
+    q = _norm_text(question)
+    mentioned = _find_columns_in_question(q, [str(c) for c in df.columns])
+    metric = next((c for c in mentioned if c in column_roles["numeric"]), None)
+    metric = metric or (column_roles["metrics"][0] if column_roles["metrics"] else None)
+    dimension = next((c for c in mentioned if c in column_roles["dimensions"]), None)
+    dimension = dimension or (column_roles["dimensions"][0] if column_roles["dimensions"] else None)
+    explicit_time = any(term in q for term in ("over time", "trend", "timeline", "monthly", "yearly", "daily"))
+    time_col = next((c for c in mentioned if c in column_roles["time"]), None)
+    if not time_col and explicit_time:
+        time_col = column_roles["time"][0] if column_roles["time"] else None
+    numeric_cols = [c for c in mentioned if c in column_roles["numeric"]]
+
+    if "heatmap" in q or "correlation" in q:
+        return {"chart_type": "heatmap", "reason": "Correlation requests are best shown as a heatmap."}
+    if ("distribution" in q or "histogram" in q) and metric:
+        return {"chart_type": "histogram", "x": metric, "reason": "Single numeric distributions are best shown as histograms."}
+    if explicit_time and time_col and metric:
+        return {"chart_type": "line", "x": time_col, "y": metric, "reason": "Time plus a numeric metric is best shown as a line chart."}
+    if len(numeric_cols) >= 2:
+        return {"chart_type": "scatter", "x": numeric_cols[0], "y": numeric_cols[1], "reason": "Two numeric fields are best compared with a scatter plot."}
+    if dimension and metric:
+        return {"chart_type": "bar", "x": dimension, "y": metric, "reason": "A category and numeric metric are best shown as a bar chart."}
+    if time_col and metric:
+        return {"chart_type": "line", "x": time_col, "y": metric, "reason": "Time plus a numeric metric is best shown as a line chart."}
+    if dimension and ("count" in q or "top" in q or "categor" in q):
+        return {"chart_type": "bar", "x": dimension, "y": "count", "reason": "Category counts are best shown as a top-N bar chart."}
+    if metric:
+        return {"chart_type": "histogram", "x": metric, "reason": "A single numeric field is best shown as a histogram."}
+    return {"chart_type": "none", "reason": "No reliable chart mapping was found."}
+
+
+def _plotly_theme(fig: go.Figure) -> go.Figure:
+    fig.update_layout(
+        template="plotly_white",
+        font=dict(family="Inter, Segoe UI, sans-serif", size=12),
+        title_font_size=15,
+        colorway=INDIGO_PALETTE[:8],
+        margin=dict(l=60, r=30, t=60, b=60),
+        hoverlabel=dict(bgcolor="white", font_size=12),
+    )
+    return fig
+
+
+def _chart_to_json(fig: go.Figure) -> str:
+    return _plotly_theme(fig).to_json()
+
+
+def _dataset_fingerprint(df: pd.DataFrame) -> str:
+    """Create a lightweight fingerprint for cache invalidation."""
+    cols = "|".join(str(c) for c in df.columns)
+    dtypes = "|".join(str(v) for v in df.dtypes)
+    sample = pd.util.hash_pandas_object(df.head(50), index=True).sum()
+    return f"{df.shape[0]}x{df.shape[1]}:{cols}:{dtypes}:{int(sample)}"
+
+
+def _cache_key(session_id: str, category: str, question: str, df: pd.DataFrame) -> str:
+    return f"{session_id}:{category}:{_norm_text(question)}:{_dataset_fingerprint(df)}"
+
+
+def _update_conversation_state(session_id: str, question: str, result: str,
+                               plan: dict, code: str | None = None,
+                               code_lang: str | None = None) -> None:
+    conversation_state[session_id] = {
+        "last_question": question,
+        "last_result": result[:1200],
+        "last_metric": (plan.get("chart_spec") or {}).get("y"),
+        "last_grouping": (plan.get("chart_spec") or {}).get("x"),
+        "last_chart_type": plan.get("chart_type"),
+        "last_code": code,
+        "last_code_lang": code_lang,
+    }
+
+
+def deterministic_answer(question: str, df: pd.DataFrame,
+                         category: str = "general",
+                         previous_state: dict | None = None) -> dict | None:
+    """Answer common analytics questions without calling the LLM."""
+    q = _norm_text(question)
+    roles = infer_column_roles(df)
+    chart_spec = choose_chart_spec(question, df, roles)
+    columns = [str(c) for c in df.columns]
+    mentioned = _find_columns_in_question(q, columns)
+
+    plan = {
+        "strategy": "Deterministic pandas analysis for a common analytics request.",
+        "query_type": "deterministic",
+        "relevant_columns": mentioned,
+        "analysis_steps": ["Infer intent", "Compute directly from the DataFrame", "Return JSON-safe result"],
+        "chart_type": chart_spec.get("chart_type", "none"),
+        "chart_spec": chart_spec,
+        "column_roles": roles,
+        "domain_focus": category,
+    }
+
+    def done(result: str, chart_json: str | None = None, code: str | None = None,
+             validation_method: str = "Deterministic pandas computation",
+             validation_reasons: list[str] | None = None) -> dict:
+        source_columns = [c for c in plan.get("relevant_columns", []) if c in df.columns]
+        spec = plan.get("chart_spec") or {}
+        for value in (spec.get("x"), spec.get("y")):
+            if value and value != "count" and value in df.columns and value not in source_columns:
+                source_columns.append(value)
+        return {
+            "result": result,
+            "chart": None,
+            "chart_json": chart_json,
+            "report": result,
+            "critique": {
+                "verdict": "pass",
+                "confidence": 0.98,
+                "issues": [],
+                "strengths": ["Computed deterministically from the uploaded data."],
+                "suggestion": "",
+            },
+            "plan": plan,
+            "code": code,
+            "code_lang": "python" if code else None,
+            "validation": build_validation_payload(
+                df,
+                method=validation_method,
+                source_columns=source_columns,
+                confidence=0.98,
+                reasons=validation_reasons,
+            ),
+            "meta": {"route": "deterministic", "cacheable": True},
+        }
+
+    if any(term in q for term in ("how many rows", "how many columns", "row count", "column count", "shape")):
+        result = f"The dataset has {len(df):,} rows and {df.shape[1]:,} columns."
+        code = "result = f\"The dataset has {len(df):,} rows and {df.shape[1]:,} columns.\""
+        return done(result, code=code, validation_method="Dataset shape read from DataFrame dimensions")
+
+    if any(term in q for term in ("missing", "null", "blank")):
+        missing = df.isna().sum()
+        pct = (missing / max(len(df), 1) * 100).round(1)
+        out = pd.DataFrame({"missing": missing, "missing_pct": pct})
+        out = out[out["missing"] > 0].sort_values(["missing", "missing_pct"], ascending=False)
+        if out.empty:
+            result = "No missing values were found in the dataset."
+        else:
+            result = "Missing values by column:\n" + out.to_string()
+        code = "missing = df.isna().sum(); result = missing.to_string()"
+        return done(result, code=code, validation_method="Missing-value count with pandas isna")
+
+    if "duplicate" in q:
+        duplicates = int(df.duplicated().sum())
+        pct = round(duplicates / max(len(df), 1) * 100, 1)
+        result = f"The dataset has {duplicates:,} duplicate rows ({pct}% of rows)."
+        code = "duplicates = int(df.duplicated().sum())"
+        return done(result, code=code, validation_method="Duplicate-row count with pandas duplicated")
+
+    if any(term in q for term in ("summary statistic", "summary statistics", "describe", "numeric summary")):
+        numeric = df.select_dtypes(include="number")
+        if numeric.empty:
+            return done("No numeric columns were found for summary statistics.")
+        result = numeric.describe().round(2).to_string()
+        code = "result = df.select_dtypes(include='number').describe().round(2).to_string()"
+        return done(result, code=code, validation_method="Numeric summary statistics with pandas describe")
+
+    if "correlation" in q or "heatmap" in q:
+        numeric = df.select_dtypes(include="number")
+        if numeric.shape[1] < 2:
+            return done("At least two numeric columns are needed for a correlation heatmap.")
+        corr = numeric.corr().round(3)
+        fig = go.Figure(data=go.Heatmap(z=corr.values, x=list(corr.columns), y=list(corr.columns),
+                                        colorscale="RdBu", zmid=0))
+        fig.update_layout(title="Correlation Matrix", xaxis_title="Column", yaxis_title="Column")
+        result = "Correlation matrix:\n" + corr.to_string()
+        code = "corr = df.select_dtypes(include='number').corr().round(3)"
+        return done(result, chart_json=_chart_to_json(fig), code=code,
+                    validation_method="Pearson correlation computed from numeric columns")
+
+    if any(term in q for term in ("distribution", "histogram")):
+        metric = chart_spec.get("x") or (roles["metrics"][0] if roles["metrics"] else None)
+        if not metric:
+            return done("No numeric column was found for a distribution chart.")
+        fig = px.histogram(df, x=metric, title=f"Distribution of {metric}")
+        result = f"Distribution chart generated for `{metric}`."
+        code = f"fig = px.histogram(df, x={metric!r})"
+        return done(result, chart_json=_chart_to_json(fig), code=code,
+                    validation_method="Histogram generated from a selected numeric column")
+
+    if any(term in q for term in ("top categor", "categories by count", "count by categor", "count records")):
+        dim = chart_spec.get("x") if chart_spec.get("y") == "count" else None
+        dim = dim or (roles["dimensions"][0] if roles["dimensions"] else None)
+        if not dim:
+            return done("No suitable categorical column was found for category counts.")
+        counts = df[dim].astype(str).value_counts().head(10).reset_index()
+        counts.columns = [dim, "count"]
+        fig = px.bar(counts, x="count", y=dim, orientation="h", title=f"Top {dim} by Count")
+        fig.update_layout(yaxis=dict(autorange="reversed"))
+        result = counts.to_string(index=False)
+        code = f"result = df[{dim!r}].value_counts().head(10).to_string()"
+        return done(result, chart_json=_chart_to_json(fig), code=code,
+                    validation_method="Top-N value counts computed from a categorical column")
+
+    if previous_state and any(term in q for term in ("now split", "split that", "break that", "by product", "by region")):
+        last_metric = previous_state.get("last_metric")
+        if last_metric in df.columns:
+            dim = next((c for c in roles["dimensions"] if c.lower() in q), None) or roles["dimensions"][0] if roles["dimensions"] else None
+            if dim:
+                grouped = df.groupby(dim)[last_metric].sum().sort_values(ascending=False).head(15)
+                result = f"Using the previous metric `{last_metric}`, here is the split by `{dim}`:\n" + grouped.round(2).to_string()
+                plot_df = grouped.reset_index()
+                plot_df.columns = [dim, last_metric]
+                fig = px.bar(plot_df, x=dim, y=last_metric, title=f"Total {last_metric} by {dim}")
+                plan["relevant_columns"] = [dim, last_metric]
+                plan["chart_spec"] = {"chart_type": "bar", "x": dim, "y": last_metric,
+                                      "reason": "Conversation memory supplied the previous metric."}
+                plan["chart_type"] = "bar"
+                code = f"result = df.groupby({dim!r})[{last_metric!r}].sum().sort_values(ascending=False).to_string()"
+                return done(result, chart_json=_chart_to_json(fig), code=code,
+                            validation_method="Follow-up answered with stored previous metric and pandas groupby")
+
+    aggregate_words = (" by ", "group by", "grouped by", "break down", "breakdown", "split by")
+    metric = chart_spec.get("y") if chart_spec.get("y") not in (None, "count") else None
+    dim = chart_spec.get("x")
+    if any(term in q for term in aggregate_words) and dim and metric:
+        agg = "mean" if any(term in q for term in ("average", "avg", "mean")) else "sum"
+        grouped = getattr(df.groupby(dim)[metric], agg)().sort_values(ascending=False).head(15)
+        title_metric = "Average" if agg == "mean" else "Total"
+        result = f"{title_metric} {metric} by {dim}:\n" + grouped.round(2).to_string()
+        plot_df = grouped.reset_index()
+        plot_df.columns = [dim, metric]
+        fig = px.bar(plot_df, x=dim, y=metric, title=f"{title_metric} {metric} by {dim}")
+        code = f"result = df.groupby({dim!r})[{metric!r}].{agg}().sort_values(ascending=False).to_string()"
+        return done(result, chart_json=_chart_to_json(fig), code=code,
+                    validation_method=f"Pandas groupby {agg} aggregation")
+
+    return None
 
 
 def train_predictive_model(df: pd.DataFrame, target: str) -> tuple[str, str, dict]:
@@ -486,6 +2641,23 @@ def train_predictive_model(df: pd.DataFrame, target: str) -> tuple[str, str, dic
     return summary, chart, info
 
 
+def build_predict_payload(session_id: str, df: pd.DataFrame, target: str) -> dict:
+    """Train a model and return the JSON-safe prediction payload."""
+    summary, chart, info = train_predictive_model(df, target)
+    models[session_id] = info
+    return {
+        "message": "Model trained with full explainability",
+        "result": summary,
+        "chart": chart,
+        "shap_chart": info.get("shap_chart"),
+        "perm_chart": info.get("perm_chart"),
+        "pdp_chart": info.get("pdp_chart"),
+        "features": info["features"],
+        "target": info["target"],
+        "is_classification": info["is_classification"],
+    }
+
+
 def get_df_schema(df: pd.DataFrame) -> str:
     schema = f"Shape: {df.shape[0]} rows x {df.shape[1]} columns\n\nColumns:\n"
     for col in df.columns:
@@ -502,11 +2674,41 @@ def get_sql_schema(df: pd.DataFrame) -> str:
     return schema
 
 
+def validate_sql(sql: str) -> str:
+    """Allow only a single read-only SQLite query generated by the SQL analyst."""
+    import re
+
+    cleaned = sql.strip()
+    if cleaned.startswith("```"):
+        cleaned = cleaned.split("\n", 1)[1] if "\n" in cleaned else ""
+    if "```" in cleaned:
+        cleaned = cleaned.rsplit("```", 1)[0]
+    cleaned = cleaned.strip().rstrip(";").strip()
+
+    if not cleaned:
+        raise ValueError("SQL query is empty.")
+    if ";" in cleaned:
+        raise ValueError("Only one SQL statement is allowed.")
+
+    lowered = cleaned.lower()
+    if not (lowered.startswith("select") or lowered.startswith("with")):
+        raise ValueError("Only SELECT queries are allowed.")
+
+    blocked = ("drop", "delete", "insert", "update", "alter", "attach",
+               "detach", "pragma", "replace", "create", "vacuum")
+    tokens = set(re.findall(r"[a-z_]+", lowered))
+    found = sorted(set(blocked) & tokens)
+    if found:
+        raise ValueError(f"Blocked SQL keyword: {found[0]}")
+    return cleaned
+
+
 def execute_sql(sql: str, df: pd.DataFrame) -> str:
     """Load df into in-memory SQLite as table 'data', run sql, return result string."""
     import sqlite3
     conn = sqlite3.connect(":memory:")
     try:
+        sql = validate_sql(sql)
         df.to_sql("data", conn, index=False, if_exists="replace")
         result_df = pd.read_sql_query(sql, conn)
         if result_df.empty:
@@ -747,68 +2949,44 @@ def validate_code_ast(code: str) -> None:
     _ASTSecurityVisitor().visit(tree)
 
 
-def _safe_import(name, globals=None, locals=None, fromlist=(), level=0):
-    """Whitelisted __import__ for the sandbox — blocks os, sys, subprocess, etc."""
-    root = name.split(".")[0]
-    if root in ALLOWED_MODULES:
-        return __import__(name, globals, locals, fromlist, level)
-    raise ImportError(f"Import of '{name}' is not allowed in the sandbox")
-
-
-SAFE_BUILTINS = {
-    "__import__": _safe_import,
-    "len": len, "range": range, "enumerate": enumerate, "zip": zip,
-    "list": list, "dict": dict, "set": set, "frozenset": frozenset, "tuple": tuple,
-    "str": str, "int": int, "float": float, "bool": bool, "complex": complex,
-    "type": type, "print": print, "round": round, "abs": abs, "min": min, "max": max,
-    "sum": sum, "sorted": sorted, "reversed": reversed, "isinstance": isinstance,
-    "map": map, "filter": filter, "any": any, "all": all, "getattr": getattr,
-    "hasattr": hasattr, "repr": repr, "format": format, "slice": slice,
-    "iter": iter, "next": next, "divmod": divmod, "pow": pow, "chr": chr, "ord": ord,
-    "True": True, "False": False, "None": None, "Exception": Exception,
-    "ValueError": ValueError, "KeyError": KeyError, "TypeError": TypeError,
-}
-
-
 def execute_code(code: str, df: pd.DataFrame) -> tuple[str, str | None, str | None]:
     """Execute sandboxed code with three security layers:
     1. AST pre-scan (blocks dangerous attributes / calls / imports)
     2. Restricted __builtins__ (whitelisted only)
-    3. Thread-based execution timeout (MAX_EXEC_SECONDS)
+    3. Process-isolated execution timeout (MAX_EXEC_SECONDS)
     Returns (result, chart_b64, chart_json).
     """
     # Layer 1 — AST security scan (raises SecurityError on violations)
     validate_code_ast(code)
 
-    # Layer 2 — restricted sandbox globals
-    safe_globals = {
-        "__builtins__": SAFE_BUILTINS,
-        "pd": pd, "np": np, "plt": plt, "sns": sns, "io": io, "base64": base64,
-        "px": px, "go": go,
-    }
-    local_vars: dict = {
-        "df": df.copy(),
-        "result": None,
-        "chart_b64": None,
-        "chart_json": None,
-    }
+    ctx = mp.get_context("spawn")
+    output_queue = ctx.Queue(maxsize=1)
+    process = ctx.Process(target=execute_code_worker, args=(code, df, output_queue))
+    process.start()
 
-    # Layer 3 — execution timeout via thread pool
-    def _run():
-        exec(code, safe_globals, local_vars)  # noqa: S102
+    try:
+        payload = output_queue.get(timeout=MAX_EXEC_SECONDS)
+    except queue.Empty as exc:
+        process.terminate()
+        process.join(1)
+        if process.is_alive() and hasattr(process, "kill"):
+            process.kill()
+            process.join(1)
+        raise TimeoutError(
+            f"Code execution exceeded the {MAX_EXEC_SECONDS}s time limit and was terminated."
+        ) from exc
+    finally:
+        process.join(2)
+        output_queue.close()
+        output_queue.join_thread()
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-        future = pool.submit(_run)
-        try:
-            future.result(timeout=MAX_EXEC_SECONDS)
-        except concurrent.futures.TimeoutError:
-            raise TimeoutError(
-                f"Code execution exceeded the {MAX_EXEC_SECONDS}s time limit and was cancelled."
-            )
+    if payload[0] == "error":
+        _, exc_type, exc_message, traceback_text = payload
+        raise RuntimeError(
+            f"Generated code failed with {exc_type}: {exc_message}\n{traceback_text}"
+        )
 
-    result     = local_vars.get("result")
-    chart_b64  = local_vars.get("chart_b64")
-    chart_json = local_vars.get("chart_json")
+    _, result, chart_b64, chart_json = payload
 
     if result is None:
         result = "Done. See chart above." if (chart_b64 or chart_json) else "No result returned."
@@ -829,18 +3007,43 @@ def health() -> dict:
 
 def register_dataframe(df: pd.DataFrame, filename: str) -> dict:
     """Store a DataFrame and return its profile + instant overview charts."""
+    cleanup_expired_sessions()
+    validate_dataframe_limits(df)
     session_id = str(uuid.uuid4())
     dataframes[session_id] = df
+    session_meta[session_id] = {"created_at": _now(), "last_accessed": _now(), "filename": filename}
+    cleanup_expired_sessions()
     profile = build_profile(df)
     overview = build_overview_charts(df)
-    return {"session_id": session_id, "filename": filename, **profile, "overview": overview}
+    proactive_insights = build_proactive_insights(df)
+    column_roles = infer_column_roles(df)
+    quality_report = build_quality_report(df)
+    decision_brief = build_decision_brief(df)
+    cleaning_plan = build_cleaning_plan(df)
+    data_contract = build_data_contract(df)
+    dashboard_spec = build_dashboard_spec(df)
+    decision_actions = decision_brief.get("decision_actions", [])
+    return {
+        "session_id": session_id,
+        "filename": filename,
+        **profile,
+        "overview": overview,
+        "proactive_insights": proactive_insights,
+        "column_roles": column_roles,
+        "quality_report": quality_report,
+        "decision_brief": decision_brief,
+        "decision_actions": decision_actions,
+        "cleaning_plan": cleaning_plan,
+        "data_contract": data_contract,
+        "dashboard_spec": dashboard_spec,
+    }
 
 
 @app.post("/upload")
 async def upload_csv(file: UploadFile = File(...)) -> dict:
     if not file.filename.endswith(".csv"):
         raise HTTPException(status_code=400, detail="Only CSV files are supported")
-    content = await file.read()
+    content = await read_upload_limited(file)
     try:
         df = pd.read_csv(io.BytesIO(content))
     except Exception as e:
@@ -854,6 +3057,11 @@ async def upload_text(req: TextUploadRequest) -> dict:
     text = req.text.strip()
     if not text:
         raise HTTPException(status_code=400, detail="No data was pasted.")
+    if len(text.encode("utf-8")) > MAX_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Pasted data is too large. Maximum size is {MAX_UPLOAD_BYTES // (1024 * 1024)} MB.",
+        )
     try:
         # sep=None + python engine sniffs the delimiter (comma, tab, semicolon, …)
         df = pd.read_csv(
@@ -872,9 +3080,11 @@ async def upload_text(req: TextUploadRequest) -> dict:
 @app.post("/upload_doc")
 async def upload_doc(session_id: str, file: UploadFile = File(...)) -> dict:
     """Upload a PDF, Excel, or text file to enrich analysis with RAG context."""
+    cleanup_expired_sessions()
     if session_id not in dataframes:
         raise HTTPException(status_code=404, detail="Upload a CSV first, then attach documents.")
-    content = await file.read()
+    _touch_session(session_id)
+    content = await read_upload_limited(file)
     try:
         text = _parse_doc(content, file.filename)
     except ValueError as e:
@@ -893,24 +3103,177 @@ async def upload_doc(session_id: str, file: UploadFile = File(...)) -> dict:
 
 @app.get("/docs/{session_id}")
 def get_docs(session_id: str) -> dict:
+    cleanup_expired_sessions()
+    if session_id in dataframes:
+        _touch_session(session_id)
     store = doc_stores.get(session_id)
     if not store:
         return {"filenames": [], "chunks": 0}
     return {"filenames": store.filenames, "chunks": len(store.chunks)}
 
 
-@app.post("/query")
-async def query_csv(req: QueryRequest) -> StreamingResponse:
+@app.get("/quality/{session_id}")
+def quality(session_id: str) -> dict:
+    cleanup_expired_sessions()
+    if session_id not in dataframes:
+        raise HTTPException(status_code=404, detail="Session not found. Upload a CSV first.")
+    _touch_session(session_id)
+    return build_quality_report(dataframes[session_id])
+
+
+@app.get("/brief/{session_id}")
+def decision_brief(session_id: str, category: str = "general") -> dict:
+    cleanup_expired_sessions()
+    if session_id not in dataframes:
+        raise HTTPException(status_code=404, detail="Session not found. Upload a CSV first.")
+    _touch_session(session_id)
+    return build_decision_brief(dataframes[session_id], category)
+
+
+@app.get("/cleaning_plan/{session_id}")
+def cleaning_plan(session_id: str) -> dict:
+    cleanup_expired_sessions()
+    if session_id not in dataframes:
+        raise HTTPException(status_code=404, detail="Session not found. Upload a CSV first.")
+    _touch_session(session_id)
+    return build_cleaning_plan(dataframes[session_id])
+
+
+@app.post("/clean/{session_id}")
+def clean_dataset(session_id: str, req: CleanRequest) -> dict:
+    cleanup_expired_sessions()
+    if session_id not in dataframes:
+        raise HTTPException(status_code=404, detail="Session not found. Upload a CSV first.")
+    _touch_session(session_id)
+
+    df = dataframes[session_id]
+    plan = build_cleaning_plan(df)
+    selected_actions = req.actions if req.actions is not None else plan["default_actions"]
+    cleaned, applied_actions = apply_cleaning_actions(df, selected_actions)
+    before_quality = build_quality_report(df)
+    after_quality = build_quality_report(cleaned)
+
+    csv_bytes = cleaned.to_csv(index=False).encode("utf-8")
+    original_name = session_meta.get(session_id, {}).get("filename", "dataset.csv")
+    stem = str(original_name).rsplit(".", 1)[0] or "dataset"
+    return {
+        "filename": f"{stem}_cleaned.csv",
+        "media_type": "text/csv",
+        "content_base64": base64.b64encode(csv_bytes).decode("ascii"),
+        "size_bytes": len(csv_bytes),
+        "row_delta": int(len(cleaned) - len(df)),
+        "column_delta": int(cleaned.shape[1] - df.shape[1]),
+        "before_quality": before_quality,
+        "after_quality": after_quality,
+        "selected_actions": selected_actions,
+        "applied_actions": applied_actions,
+    }
+
+
+@app.get("/contract/{session_id}")
+def data_contract(session_id: str) -> dict:
+    cleanup_expired_sessions()
+    if session_id not in dataframes:
+        raise HTTPException(status_code=404, detail="Session not found. Upload a CSV first.")
+    _touch_session(session_id)
+    return build_data_contract(dataframes[session_id])
+
+
+@app.post("/validate_rows/{session_id}")
+def validate_rows(session_id: str, req: ValidateRowsRequest) -> dict:
+    cleanup_expired_sessions()
+    if session_id not in dataframes:
+        raise HTTPException(status_code=404, detail="Session not found. Upload a CSV first.")
+    _touch_session(session_id)
+    contract = build_data_contract(dataframes[session_id])
+    return validate_rows_against_contract(req.rows, contract)
+
+
+@app.get("/dashboard/{session_id}")
+def dashboard_spec(session_id: str, category: str = "general") -> dict:
+    cleanup_expired_sessions()
+    if session_id not in dataframes:
+        raise HTTPException(status_code=404, detail="Session not found. Upload a CSV first.")
+    _touch_session(session_id)
+    return build_dashboard_spec(dataframes[session_id], category)
+
+
+@app.post("/investigate")
+async def investigate(req: InvestigationRequest) -> StreamingResponse:
+    """Run an autonomous, deterministic investigation and stream the analyst workflow."""
+    cleanup_expired_sessions()
     if req.session_id not in dataframes:
         raise HTTPException(status_code=404, detail="Session not found. Upload a CSV first.")
+    _touch_session(req.session_id)
+    df = dataframes[req.session_id]
+
+    async def stream():
+        emit = make_sse_emitter("investigate", req.session_id)
+        yield emit({
+            "step": "analyzing",
+            "message": "Scoping the investigation goal against the uploaded dataset...",
+            "meta": {"route": "deterministic_investigation"},
+        })
+        yield emit({"step": "planning", "message": "Building an investigation tree across trends, segments, anomalies, and quality..."})
+        yield emit({"step": "executing", "message": "Computing deterministic evidence from the dataframe..."})
+        investigation = build_investigation_report(df, req.goal, req.category)
+        plan = investigation["plan"]
+        yield emit({"step": "plan", "message": f"Plan: {plan['strategy']}", "plan": plan})
+        yield emit({"step": "reporting", "message": "Writing the autonomous investigation brief from computed evidence..."})
+        done_event = {
+            "step": "done",
+            "message": "Autonomous investigation complete",
+            "result": investigation["report"],
+            "report": investigation["report"],
+            "chart": None,
+            "chart_json": investigation["chart_json"],
+            "critique": {
+                "verdict": "pass",
+                "confidence": investigation["validation"]["confidence"],
+                "issues": [],
+                "strengths": ["Investigation is grounded in deterministic dataframe checks."],
+                "suggestion": "Use the recommended actions to drill into the strongest driver next.",
+            },
+            "plan": plan,
+            "followups": suggest_followups(req.goal, df, plan, conversation_state.get(req.session_id)),
+            "validation": investigation["validation"],
+            "decision_actions": investigation["decision_actions"],
+            "investigation": {
+                "goal": investigation["goal"],
+                "persona": investigation["persona"],
+                "persona_columns": investigation["persona_columns"],
+                "primary_metric": investigation["primary_metric"],
+                "primary_dimension": investigation["primary_dimension"],
+                "trend": investigation["trend"],
+                "segment_driver": investigation["segment_driver"],
+                "outliers": investigation["outliers"],
+                "correlation": investigation["correlation"],
+                "quality": investigation["quality"],
+                "recommended_actions": investigation["recommended_actions"],
+                "investigation_tree": investigation["investigation_tree"],
+            },
+            "meta": investigation["meta"],
+        }
+        _update_conversation_state(req.session_id, req.goal, investigation["report"], plan)
+        yield emit(done_event)
+
+    return StreamingResponse(stream(), media_type="text/event-stream")
+
+
+@app.post("/query")
+async def query_csv(req: QueryRequest) -> StreamingResponse:
+    cleanup_expired_sessions()
+    if req.session_id not in dataframes:
+        raise HTTPException(status_code=404, detail="Session not found. Upload a CSV first.")
+    _touch_session(req.session_id)
 
     df = dataframes[req.session_id]
     schema = get_df_schema(df)
     category_persona = CATEGORY_PERSONAS.get(req.category, CATEGORY_PERSONAS["general"])
+    cache_key = _cache_key(req.session_id, req.category, req.question, df)
 
     async def stream():
-        def emit(payload: dict) -> str:
-            return f"data: {json.dumps(payload)}\n\n"
+        emit = make_sse_emitter("query", req.session_id)
 
         def llm(system: str, user: str, temperature: float = 0) -> str:
             resp = client.models.generate_content(
@@ -963,6 +3326,56 @@ async def query_csv(req: QueryRequest) -> StreamingResponse:
                     else:
                         return code, None, None, None
             return code, None, None, None
+
+        cached = query_cache.get(cache_key)
+        if cached:
+            yield emit({"step": "analyzing", "message": "Using cached analysis result...",
+                        "meta": {"route": "cache", "cache_hit": True}})
+            yield emit({**cached, "message": "Analysis complete (cached)"})
+            return
+
+        deterministic = deterministic_answer(
+            req.question,
+            df,
+            req.category,
+            conversation_state.get(req.session_id),
+        )
+        if deterministic:
+            plan = deterministic["plan"]
+            followups = suggest_followups(req.question, df, plan, conversation_state.get(req.session_id))
+            yield emit({"step": "planning", "message": "Matched a deterministic analytics intent...",
+                        "meta": {"route": "deterministic", "cache_hit": False}})
+            yield emit({"step": "plan", "message": f"Plan: {plan.get('strategy')}", "plan": plan})
+            if deterministic.get("code"):
+                yield emit({"step": "code", "message": "Deterministic pandas code selected",
+                            "code": deterministic["code"], "code_lang": deterministic.get("code_lang")})
+            yield emit({"step": "executing", "message": "Computing directly from your data..."})
+            done_event = {
+                "step": "done",
+                "message": "Analysis complete",
+                "result": deterministic["result"],
+                "chart": deterministic.get("chart"),
+                "chart_json": deterministic.get("chart_json"),
+                "report": deterministic.get("report"),
+                "critique": deterministic.get("critique"),
+                "plan": plan,
+                "code": deterministic.get("code"),
+                "code_lang": deterministic.get("code_lang"),
+                "followups": followups,
+                "validation": deterministic.get("validation"),
+                "meta": deterministic.get("meta"),
+            }
+            _cache_set(cache_key, done_event)
+            _update_conversation_state(
+                req.session_id,
+                req.question,
+                deterministic["result"],
+                plan,
+                deterministic.get("code"),
+                deterministic.get("code_lang"),
+            )
+            yield emit(done_event)
+            return
 
         # ── RAG: retrieve context from uploaded documents ──────────────────
         rag_context = ""
@@ -1098,7 +3511,7 @@ async def query_csv(req: QueryRequest) -> StreamingResponse:
         except Exception:
             report = analyst_result
 
-        yield emit({
+        done_event = {
             "step": "done",
             "message": "Analysis complete",
             "result": analyst_result,
@@ -1107,28 +3520,126 @@ async def query_csv(req: QueryRequest) -> StreamingResponse:
             "report": report,
             "critique": critique,
             "plan": plan,
-        })
+            "code": analyst_code,
+            "code_lang": "sql" if query_type == "sql" else "python",
+            "followups": suggest_followups(req.question, df, plan, conversation_state.get(req.session_id)),
+            "validation": build_validation_payload(
+                df,
+                method="LLM-generated analysis reviewed by critic and executed against the uploaded dataframe",
+                source_columns=[c for c in plan.get("relevant_columns", []) if c in df.columns],
+                confidence=float(critique.get("confidence", 0.85) or 0.85),
+                reasons=[
+                    f"Execution route: {query_type}.",
+                    f"Critic verdict: {critique.get('verdict', 'pass')}.",
+                    "Generated code or SQL was executed against the in-memory dataframe.",
+                ],
+            ),
+            "meta": {"route": "llm", "cacheable": True},
+        }
+        _cache_set(cache_key, done_event)
+        _update_conversation_state(
+            req.session_id,
+            req.question,
+            analyst_result,
+            plan,
+            analyst_code,
+            "sql" if query_type == "sql" else "python",
+        )
+        yield emit(done_event)
+
+    return StreamingResponse(stream(), media_type="text/event-stream")
+
+
+@app.post("/story")
+async def story(req: StoryRequest) -> StreamingResponse:
+    """Generate a fact-first dataset story from deterministic analysis facts."""
+    cleanup_expired_sessions()
+    if req.session_id not in dataframes:
+        raise HTTPException(status_code=404, detail="Session not found. Upload a CSV first.")
+    _touch_session(req.session_id)
+
+    df = dataframes[req.session_id]
+
+    async def stream():
+        emit = make_sse_emitter("story", req.session_id)
+
+        yield emit({"step": "analyzing", "message": "Profiling the dataset for story facts...",
+                    "meta": {"route": "deterministic_story"}})
+        facts = build_story_facts(df, req.category)
+
+        yield emit({"step": "planning", "message": "Ranking deterministic facts into a narrative arc..."})
+        report = render_story_from_facts(facts)
+        chart_json = build_story_chart_json(facts)
+        plan = {
+            "strategy": "Fact-first dataset story generated from deterministic profile, quality, grouping, and correlation facts.",
+            "query_type": "deterministic_story",
+            "relevant_columns": facts.get("column_roles", {}).get("metrics", [])[:1]
+                                + facts.get("column_roles", {}).get("dimensions", [])[:2],
+            "analysis_steps": [
+                "Build data profile",
+                "Infer column roles",
+                "Compute top deterministic insights",
+                "Render story from facts only",
+            ],
+            "chart_type": "bar" if chart_json else "none",
+            "facts": facts,
+        }
+        critique = {
+            "verdict": "pass",
+            "confidence": 0.97,
+            "issues": [],
+            "strengths": ["Story is grounded in deterministic facts before narrative wording."],
+            "suggestion": "Use follow-up questions to drill into the leading segment or metric.",
+        }
+
+        yield emit({"step": "plan", "message": "Plan: Fact-first dataset story", "plan": plan})
+        yield emit({"step": "reporting", "message": "Writing the story from computed facts..."})
+        done_event = {
+            "step": "done",
+            "message": "Dataset story complete",
+            "result": report,
+            "report": report,
+            "chart": None,
+            "chart_json": chart_json,
+            "critique": critique,
+            "plan": plan,
+            "followups": suggest_followups("What story does this dataset tell?", df, plan, conversation_state.get(req.session_id)),
+            "validation": build_validation_payload(
+                df,
+                method="Fact-first deterministic story pipeline",
+                source_columns=plan["relevant_columns"],
+                confidence=0.97,
+                reasons=[
+                    "Dataset story was written from computed facts.",
+                    "Facts include profile, data quality, grouped totals, and correlations.",
+                    "Narrative wording is separated from numeric computation.",
+                ],
+            ),
+            "meta": {"route": "deterministic_story", "facts_first": True},
+        }
+        _update_conversation_state(req.session_id, "What story does this dataset tell?", report, plan)
+        yield emit(done_event)
 
     return StreamingResponse(stream(), media_type="text/event-stream")
 
 
 @app.post("/predict")
 async def predict(req: PredictRequest) -> StreamingResponse:
+    cleanup_expired_sessions()
     if req.session_id not in dataframes:
         raise HTTPException(status_code=404, detail="Session not found. Upload a CSV first.")
+    _touch_session(req.session_id)
     df = dataframes[req.session_id]
     if req.target not in df.columns:
         raise HTTPException(status_code=400, detail=f"Column '{req.target}' not found.")
 
     async def stream():
-        def emit(payload: dict) -> str:
-            return f"data: {json.dumps(payload)}\n\n"
+        emit = make_sse_emitter("predict", req.session_id)
 
         yield emit({"step": "analyzing", "message": f"Preparing features to predict '{req.target}'..."})
         yield emit({"step": "thinking", "message": "Training a Random Forest model on your data..."})
         try:
-            summary, chart, info = train_predictive_model(df, req.target)
-            models[req.session_id] = info  # persist for inference on new input
+            payload = build_predict_payload(req.session_id, df, req.target)
         except Exception as e:
             yield emit({"step": "error", "message": f"Could not train model: {e}"})
             return
@@ -1136,21 +3647,45 @@ async def predict(req: PredictRequest) -> StreamingResponse:
         yield emit({"step": "thinking", "message": "Computing SHAP values and permutation importance..."})
         yield emit({
             "step": "done",
-            "message": "Model trained with full explainability",
-            "result": summary,
-            "chart": chart,
-            "shap_chart":  info.get("shap_chart"),
-            "perm_chart":  info.get("perm_chart"),
-            "pdp_chart":   info.get("pdp_chart"),
-            "features": info["features"],
-            "target":   info["target"],
+            **payload,
         })
 
     return StreamingResponse(stream(), media_type="text/event-stream")
 
 
+def run_predict_job(job_id: str, session_id: str, target: str) -> None:
+    update_job(job_id, "running")
+    try:
+        df = dataframes[session_id]
+        payload = build_predict_payload(session_id, df, target)
+        update_job(job_id, "completed", result=payload)
+    except Exception as exc:
+        update_job(job_id, "failed", error=str(exc))
+
+
+@app.post("/predict_job")
+def predict_job(req: PredictRequest, background_tasks: BackgroundTasks) -> dict:
+    cleanup_expired_sessions()
+    if req.session_id not in dataframes:
+        raise HTTPException(status_code=404, detail="Session not found. Upload a CSV first.")
+    _touch_session(req.session_id)
+    if req.target not in dataframes[req.session_id].columns:
+        raise HTTPException(status_code=400, detail=f"Column '{req.target}' not found.")
+    job = create_job("predict", req.session_id)
+    background_tasks.add_task(run_predict_job, job["job_id"], req.session_id, req.target)
+    return {
+        "job_id": job["job_id"],
+        "status": job["status"],
+        "kind": job["kind"],
+        "poll_url": f"/jobs/{job['job_id']}",
+    }
+
+
 @app.get("/model_info/{session_id}")
 def model_info(session_id: str) -> dict:
+    cleanup_expired_sessions()
+    if session_id in dataframes:
+        _touch_session(session_id)
     info = models.get(session_id)
     if not info:
         return {"trained": False}
@@ -1162,11 +3697,249 @@ def model_info(session_id: str) -> dict:
     }
 
 
+@app.get("/jobs/{job_id}")
+def get_job(job_id: str) -> dict:
+    cleanup_expired_sessions()
+    job = jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found.")
+    if job.get("session_id") in dataframes:
+        _touch_session(str(job["session_id"]))
+    return public_job(job)
+
+
+def prepare_model_features(info: dict, values: dict) -> pd.DataFrame:
+    """Convert user-facing feature values into the model's encoded feature frame."""
+    row: dict = {}
+    for c in info["num_cols"]:
+        v = values.get(c)
+        row[c] = pd.to_numeric(v, errors="coerce") if v not in (None, "") else np.nan
+    for c in info["cat_cols"]:
+        row[c] = values.get(c)
+
+    X_new = pd.DataFrame([row])
+    if info["cat_cols"]:
+        X_new = pd.get_dummies(X_new, columns=info["cat_cols"], drop_first=True)
+    X_new = X_new.reindex(columns=info["feature_cols"], fill_value=0)
+    return X_new.fillna(value=info["medians"]).fillna(0)
+
+
+def predict_model_values(info: dict, values: dict) -> dict:
+    """Predict a single user-facing row and return JSON-safe prediction details."""
+    X_new = prepare_model_features(info, values)
+    model = info["model"]
+    pred = model.predict(X_new)[0]
+    if info["is_classification"]:
+        label = info["classes"][int(pred)]
+        probabilities = {
+            str(info["classes"][idx]): round(float(value), 4)
+            for idx, value in enumerate(model.predict_proba(X_new)[0])
+        }
+        proba = max(probabilities.values()) if probabilities else None
+        return {"target": info["target"], "prediction": str(label),
+                "confidence": round(float(proba), 3) if proba is not None else None,
+                "probabilities": probabilities,
+                "is_classification": True}
+    return {"target": info["target"], "prediction": round(float(pred), 2),
+            "confidence": None, "is_classification": False}
+
+
+def default_model_values(info: dict) -> dict:
+    """Return the median/mode default row exposed by model metadata."""
+    return {feature["name"]: feature.get("default") for feature in info["features"]}
+
+
+def apply_scenario_changes(info: dict, baseline: dict, changes: dict) -> tuple[dict, list[dict]]:
+    """Apply set, delta, or percent changes to a baseline row."""
+    scenario = {**baseline}
+    feature_by_name = {feature["name"]: feature for feature in info["features"]}
+    applied: list[dict] = []
+
+    for name, change in changes.items():
+        if name not in feature_by_name:
+            continue
+        feature = feature_by_name[name]
+        mode = "set"
+        raw_value = change
+        if isinstance(change, dict):
+            mode = str(change.get("mode", "set")).lower()
+            raw_value = change.get("value")
+
+        before = scenario.get(name, feature.get("default"))
+        after = raw_value
+        if feature.get("type") == "number":
+            current = pd.to_numeric(before, errors="coerce")
+            value = pd.to_numeric(raw_value, errors="coerce")
+            current_f = float(current) if pd.notna(current) else 0.0
+            value_f = float(value) if pd.notna(value) else current_f
+            if mode in ("percent", "pct", "percent_delta"):
+                after = current_f * (1 + value_f / 100)
+            elif mode in ("delta", "add"):
+                after = current_f + value_f
+            else:
+                after = value_f
+            after = round(float(after), 4)
+        scenario[name] = after
+        applied.append({"feature": name, "mode": mode, "before": before, "after": after})
+
+    return scenario, applied
+
+
+def parse_scenario_prompt(info: dict, prompt: str) -> dict:
+    """Parse a natural-language what-if prompt into one simulator control change."""
+    text = prompt.strip()
+    normalized = _norm_text(re.sub(r"[^a-zA-Z0-9_.%+-]+", " ", text))
+    if not normalized:
+        raise ValueError("Enter a scenario prompt.")
+
+    feature_matches: list[tuple[int, dict]] = []
+    for feature in info["features"]:
+        name = str(feature["name"])
+        name_norm = _norm_text(re.sub(r"[^a-zA-Z0-9_.%+-]+", " ", name))
+        parts = [part for part in name_norm.split() if part]
+        if name_norm and name_norm in normalized:
+            feature_matches.append((100 + len(name_norm), feature))
+        elif parts and all(part in normalized for part in parts):
+            feature_matches.append((70 + sum(len(part) for part in parts), feature))
+
+    if not feature_matches:
+        return {
+            "parsed": False,
+            "confidence": 0.0,
+            "reason": "No trained-model feature name was found in the prompt.",
+            "candidates": [feature["name"] for feature in info["features"][:8]],
+        }
+
+    feature = sorted(feature_matches, key=lambda item: item[0], reverse=True)[0][1]
+    feature_name = feature["name"]
+    feature_type = feature.get("type", "number")
+
+    if feature_type == "number":
+        feature_norm = _norm_text(re.sub(r"[^a-zA-Z0-9_.%+-]+", " ", str(feature_name)))
+        value_text = normalized.replace(feature_norm, " ", 1)
+        number_match = re.search(r"([-+]?\d+(?:\.\d+)?)\s*(%|percent|percentage)?", value_text)
+        if not number_match:
+            return {
+                "parsed": False,
+                "confidence": 0.35,
+                "feature": feature_name,
+                "reason": "A numeric scenario needs a numeric value.",
+                "candidates": [feature["name"] for feature in info["features"][:8]],
+            }
+        value = float(number_match.group(1))
+        has_percent = bool(number_match.group(2)) or "%" in value_text or "percent" in value_text or "percentage" in value_text
+        decrease_terms = ("decrease", "decreases", "decreased", "reduce", "reduces", "reduced",
+                          "lower", "lowers", "lowered", "drop", "drops", "dropped", "down", "less", "subtract")
+        increase_terms = ("increase", "increases", "increased", "raise", "raises", "raised",
+                          "grow", "grows", "grew", "boost", "boosts", "boosted", "up", "more", "add")
+        set_terms = ("set", "make", "change", "becomes", "to", "=")
+
+        if any(term in normalized for term in decrease_terms):
+            value = -abs(value)
+            mode = "percent" if has_percent else "delta"
+        elif any(term in normalized for term in increase_terms):
+            value = abs(value)
+            mode = "percent" if has_percent else "delta"
+        elif has_percent:
+            mode = "percent"
+        elif any(term in normalized for term in set_terms):
+            mode = "set"
+        else:
+            mode = "set"
+
+        return {
+            "parsed": True,
+            "feature": feature_name,
+            "mode": mode,
+            "value": value,
+            "confidence": 0.88 if feature_matches[0][0] >= 100 else 0.72,
+            "interpretation": f"{mode} {feature_name} by {value:g}" if mode != "set" else f"set {feature_name} to {value:g}",
+            "candidates": [item[1]["name"] for item in sorted(feature_matches, key=lambda item: item[0], reverse=True)[:5]],
+        }
+
+    options = [str(option) for option in feature.get("options", [])]
+    selected = next((option for option in options if option.lower() in normalized), None)
+    if not selected:
+        value_match = re.search(r"(?:to|as|=|is)\s+(.+)$", normalized)
+        selected = value_match.group(1).strip() if value_match else ""
+    if not selected:
+        return {
+            "parsed": False,
+            "confidence": 0.4,
+            "feature": feature_name,
+            "reason": "A categorical scenario needs a target category value.",
+            "candidates": options[:8],
+        }
+
+    return {
+        "parsed": True,
+        "feature": feature_name,
+        "mode": "set",
+        "value": selected,
+        "confidence": 0.82 if selected in options else 0.62,
+        "interpretation": f"set {feature_name} to {selected}",
+        "candidates": options[:8],
+    }
+
+
+def build_scenario_chart(info: dict, baseline_prediction: dict, scenario_prediction: dict) -> str:
+    """Create a compact comparison chart for simulation output."""
+    if info["is_classification"]:
+        scenario_label = str(scenario_prediction["prediction"])
+        baseline_prob = (baseline_prediction.get("probabilities") or {}).get(scenario_label, 0)
+        scenario_prob = (scenario_prediction.get("probabilities") or {}).get(scenario_label, 0)
+        plot_df = pd.DataFrame({
+            "case": ["Baseline", "Scenario"],
+            "probability": [baseline_prob, scenario_prob],
+        })
+        fig = px.bar(plot_df, x="case", y="probability", title=f"Probability of {scenario_label}", text="probability")
+        fig.update_yaxes(range=[0, 1], tickformat=".0%")
+    else:
+        plot_df = pd.DataFrame({
+            "case": ["Baseline", "Scenario"],
+            "prediction": [baseline_prediction["prediction"], scenario_prediction["prediction"]],
+        })
+        fig = px.bar(plot_df, x="case", y="prediction", title=f"Scenario impact on {info['target']}", text="prediction")
+    return _chart_to_json(fig)
+
+
+def scenario_impact(info: dict, baseline_prediction: dict, scenario_prediction: dict) -> dict:
+    """Summarize the difference between baseline and scenario predictions."""
+    if info["is_classification"]:
+        scenario_label = str(scenario_prediction["prediction"])
+        base_prob = (baseline_prediction.get("probabilities") or {}).get(scenario_label, 0)
+        scen_prob = (scenario_prediction.get("probabilities") or {}).get(scenario_label, 0)
+        return {
+            "type": "classification",
+            "label_changed": baseline_prediction["prediction"] != scenario_prediction["prediction"],
+            "baseline_label": baseline_prediction["prediction"],
+            "scenario_label": scenario_prediction["prediction"],
+            "scenario_label_probability_delta": round(float(scen_prob - base_prob), 4),
+            "confidence_delta": round(
+                float((scenario_prediction.get("confidence") or 0) - (baseline_prediction.get("confidence") or 0)),
+                4,
+            ),
+        }
+
+    baseline_value = float(baseline_prediction["prediction"])
+    scenario_value = float(scenario_prediction["prediction"])
+    delta = scenario_value - baseline_value
+    pct = delta / abs(baseline_value) * 100 if baseline_value else None
+    return {
+        "type": "regression",
+        "delta": round(delta, 4),
+        "pct_change": None if pct is None else round(float(pct), 2),
+        "direction": "increase" if delta > 0 else "decrease" if delta < 0 else "no_change",
+    }
+
+
 @app.post("/predict_input")
 def predict_input(req: PredictInputRequest) -> dict:
+    cleanup_expired_sessions()
     info = models.get(req.session_id)
     if not info:
         raise HTTPException(status_code=400, detail="Train a model first using the Predict button.")
+    _touch_session(req.session_id)
 
     row: dict = {}
     for c in info["num_cols"]:
@@ -1194,15 +3967,100 @@ def predict_input(req: PredictInputRequest) -> dict:
 
 # ── Business report export (PDF + PPTX) ──────────────────────────────────────
 
+@app.post("/simulate")
+def simulate_scenario(req: ScenarioRequest) -> dict:
+    cleanup_expired_sessions()
+    info = models.get(req.session_id)
+    if not info:
+        raise HTTPException(status_code=400, detail="Train a model first using the Predict button.")
+    _touch_session(req.session_id)
+
+    baseline_values = {**default_model_values(info), **req.baseline}
+    scenario_values, changes_applied = apply_scenario_changes(info, baseline_values, req.changes)
+    if not changes_applied:
+        raise HTTPException(status_code=400, detail="No valid scenario changes were provided.")
+
+    baseline_prediction = predict_model_values(info, baseline_values)
+    scenario_prediction = predict_model_values(info, scenario_values)
+    impact = scenario_impact(info, baseline_prediction, scenario_prediction)
+
+    return {
+        "target": info["target"],
+        "category": req.category,
+        "is_classification": info["is_classification"],
+        "baseline_values": baseline_values,
+        "scenario_values": scenario_values,
+        "changes_applied": changes_applied,
+        "baseline_prediction": baseline_prediction,
+        "scenario_prediction": scenario_prediction,
+        "impact": impact,
+        "chart_json": build_scenario_chart(info, baseline_prediction, scenario_prediction),
+        "validation": {
+            "confidence_label": "Medium",
+            "method": "What-if simulation using the trained in-session Random Forest model",
+            "reasons": [
+                "The model was not retrained; only the selected input values changed.",
+                "Scenario results are predictive estimates, not causal proof.",
+                "Reliability depends on whether the changed values stay within the training distribution.",
+            ],
+        },
+    }
+
+
+@app.post("/scenario_parse")
+def scenario_parse(req: ScenarioParseRequest) -> dict:
+    cleanup_expired_sessions()
+    info = models.get(req.session_id)
+    if not info:
+        raise HTTPException(status_code=400, detail="Train a model first using the Predict button.")
+    _touch_session(req.session_id)
+    parsed = parse_scenario_prompt(info, req.prompt)
+    return {
+        **parsed,
+        "prompt": req.prompt,
+        "target": info["target"],
+        "category": req.category,
+        "validation": {
+            "method": "Deterministic feature-name and value parser",
+            "reasons": [
+                "The parser only uses trained model feature names and explicit numeric or category values.",
+                "Ambiguous prompts return low confidence or an unparsed response instead of guessing.",
+            ],
+        },
+    }
+
+
 import datetime as _dt
 from fastapi import Query
-from fastapi.responses import Response as FastAPIResponse
 
 
 class ReportRequest(BaseModel):
     messages:  list[dict] = []
     category:  str        = "general"
     filename:  str        = "report"
+
+
+def build_report_payload(session_id: str, req: ReportRequest, format: str) -> dict:
+    """Generate a JSON/base64 report payload for a session."""
+    df = dataframes[session_id]
+    profile = build_profile(df)
+
+    if format == "pdf":
+        content = _generate_pdf(req, profile)
+        media = "application/pdf"
+        ext = "pdf"
+    else:
+        content = _generate_pptx(req, profile)
+        media = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+        ext = "pptx"
+
+    safe_name = "".join(c if c.isalnum() or c in "-_" else "_" for c in req.filename)
+    return {
+        "filename": f"{safe_name}_report.{ext}",
+        "media_type": media,
+        "size_bytes": len(content),
+        "content_base64": base64.b64encode(content).decode("ascii"),
+    }
 
 
 def _plotly_json_to_png(chart_json: str) -> bytes | None:
@@ -1534,29 +4392,45 @@ async def export_report(
     session_id: str,
     req: ReportRequest,
     format: str = Query(default="pdf", pattern="^(pdf|pptx)$"),
-) -> FastAPIResponse:
+) -> dict:
     """Generate a PDF or PPTX report from the session data and conversation messages."""
+    cleanup_expired_sessions()
     if session_id not in dataframes:
         raise HTTPException(status_code=404, detail="Session not found. Upload a CSV first.")
+    _touch_session(session_id)
 
-    df      = dataframes[session_id]
-    profile = build_profile(df)
+    return build_report_payload(session_id, req, format)
 
-    if format == "pdf":
-        content  = _generate_pdf(req, profile)
-        media    = "application/pdf"
-        ext      = "pdf"
-    else:
-        content  = _generate_pptx(req, profile)
-        media    = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
-        ext      = "pptx"
 
-    safe_name = "".join(c if c.isalnum() or c in "-_" else "_" for c in req.filename)
-    return FastAPIResponse(
-        content=content,
-        media_type=media,
-        headers={"Content-Disposition": f'attachment; filename="{safe_name}_report.{ext}"'},
-    )
+def run_report_job(job_id: str, session_id: str, req: ReportRequest, format: str) -> None:
+    update_job(job_id, "running")
+    try:
+        payload = build_report_payload(session_id, req, format)
+        update_job(job_id, "completed", result=payload)
+    except Exception as exc:
+        update_job(job_id, "failed", error=str(exc))
+
+
+@app.post("/report_job/{session_id}")
+async def export_report_job(
+    session_id: str,
+    req: ReportRequest,
+    background_tasks: BackgroundTasks,
+    format: str = Query(default="pdf", pattern="^(pdf|pptx)$"),
+) -> dict:
+    """Queue PDF/PPTX report generation and return a polling URL."""
+    cleanup_expired_sessions()
+    if session_id not in dataframes:
+        raise HTTPException(status_code=404, detail="Session not found. Upload a CSV first.")
+    _touch_session(session_id)
+    job = create_job("report", session_id)
+    background_tasks.add_task(run_report_job, job["job_id"], session_id, req, format)
+    return {
+        "job_id": job["job_id"],
+        "status": job["status"],
+        "kind": job["kind"],
+        "poll_url": f"/jobs/{job['job_id']}",
+    }
 
 
 # ── Benchmark evaluation framework ───────────────────────────────────────────
@@ -1735,46 +4609,79 @@ def _run_agent_pipeline_sync(df: pd.DataFrame, schema: str, question: str,
     }
 
 
-@app.get("/benchmark/{session_id}")
-async def run_benchmark(session_id: str, n: int = 15) -> dict:
-    """Run up to n benchmark questions against the uploaded dataset and return metrics."""
-    if session_id not in dataframes:
-        raise HTTPException(status_code=404, detail="Session not found. Upload a CSV first.")
-
-    df      = dataframes[session_id]
-    schema  = get_df_schema(df)
-    store   = doc_stores.get(session_id)
-    n       = min(n, len(BENCHMARK_QUESTIONS))
-    suite   = BENCHMARK_QUESTIONS[:n]
+def build_benchmark_payload(session_id: str, n: int = 15) -> dict:
+    """Run up to n benchmark questions and return aggregate metrics."""
+    df = dataframes[session_id]
+    schema = get_df_schema(df)
+    store = doc_stores.get(session_id)
+    n = min(n, len(BENCHMARK_QUESTIONS))
+    suite = BENCHMARK_QUESTIONS[:n]
 
     results = []
     for bq in suite:
         m = _run_agent_pipeline_sync(df, schema, bq["question"], bq["category"], store)
         results.append({
-            "question":      bq["question"],
-            "category":      bq["category"],
+            "question": bq["question"],
+            "category": bq["category"],
             "expects_chart": bq["expects_chart"],
-            "expects_sql":   bq["expects_sql"],
+            "expects_sql": bq["expects_sql"],
             **m,
         })
 
-    total          = len(results)
-    n_success      = sum(1 for r in results if r["success"])
-    n_chart_exp    = sum(1 for r in results if r["expects_chart"])
-    n_chart_got    = sum(1 for r in results if r["expects_chart"] and r["has_chart"])
-    n_sql_exp      = sum(1 for r in results if r["expects_sql"])
-    n_sql_routed   = sum(1 for r in results if r["expects_sql"] and r["query_type"] == "sql")
-    n_repair       = sum(1 for r in results if r["used_repair"])
-    n_repair_ok    = sum(1 for r in results if r["used_repair"] and r["success"])
-    avg_time       = round(sum(r["time_s"] for r in results) / total, 2) if total else 0
+    total = len(results)
+    n_success = sum(1 for r in results if r["success"])
+    n_chart_exp = sum(1 for r in results if r["expects_chart"])
+    n_chart_got = sum(1 for r in results if r["expects_chart"] and r["has_chart"])
+    n_sql_exp = sum(1 for r in results if r["expects_sql"])
+    n_sql_routed = sum(1 for r in results if r["expects_sql"] and r["query_type"] == "sql")
+    n_repair = sum(1 for r in results if r["used_repair"])
+    n_repair_ok = sum(1 for r in results if r["used_repair"] and r["success"])
+    avg_time = round(sum(r["time_s"] for r in results) / total, 2) if total else 0
 
     return {
-        "total":                 total,
-        "success_rate":          round(n_success / total, 3),
-        "chart_rate":            round(n_chart_got / max(1, n_chart_exp), 3),
-        "sql_routing_accuracy":  round(n_sql_routed / max(1, n_sql_exp), 3),
-        "repair_rate":           round(n_repair / total, 3),
-        "repair_success_rate":   round(n_repair_ok / max(1, n_repair), 3),
-        "avg_time_s":            avg_time,
-        "results":               results,
+        "total": total,
+        "success_rate": round(n_success / total, 3),
+        "chart_rate": round(n_chart_got / max(1, n_chart_exp), 3),
+        "sql_routing_accuracy": round(n_sql_routed / max(1, n_sql_exp), 3),
+        "repair_rate": round(n_repair / total, 3),
+        "repair_success_rate": round(n_repair_ok / max(1, n_repair), 3),
+        "avg_time_s": avg_time,
+        "results": results,
+    }
+
+
+@app.get("/benchmark/{session_id}")
+async def run_benchmark(session_id: str, n: int = 15) -> dict:
+    """Run up to n benchmark questions against the uploaded dataset and return metrics."""
+    cleanup_expired_sessions()
+    if session_id not in dataframes:
+        raise HTTPException(status_code=404, detail="Session not found. Upload a CSV first.")
+    _touch_session(session_id)
+
+    return build_benchmark_payload(session_id, n)
+
+
+def run_benchmark_job(job_id: str, session_id: str, n: int) -> None:
+    update_job(job_id, "running")
+    try:
+        payload = build_benchmark_payload(session_id, n)
+        update_job(job_id, "completed", result=payload)
+    except Exception as exc:
+        update_job(job_id, "failed", error=str(exc))
+
+
+@app.post("/benchmark_job/{session_id}")
+async def benchmark_job(session_id: str, background_tasks: BackgroundTasks, n: int = 15) -> dict:
+    """Queue benchmark evaluation and return a polling URL."""
+    cleanup_expired_sessions()
+    if session_id not in dataframes:
+        raise HTTPException(status_code=404, detail="Session not found. Upload a CSV first.")
+    _touch_session(session_id)
+    job = create_job("benchmark", session_id)
+    background_tasks.add_task(run_benchmark_job, job["job_id"], session_id, n)
+    return {
+        "job_id": job["job_id"],
+        "status": job["status"],
+        "kind": job["kind"],
+        "poll_url": f"/jobs/{job['job_id']}",
     }

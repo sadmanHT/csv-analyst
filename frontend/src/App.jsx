@@ -5,11 +5,33 @@ import {
   Rows, Columns, AlertDot, Activity, Layers, Code, ChartUp, Brain,
   DollarSign, HeartPulse, ShoppingCart, Megaphone, Users,
 } from './icons.jsx'
-import Plotly from 'plotly.js-dist-min'
 
 // In production VITE_API_BASE_URL points to the Railway backend.
 // In local dev it is empty and Vite proxies all API calls automatically.
 const API = import.meta.env.VITE_API_BASE_URL ?? ''
+
+function downloadBase64Payload(payload, fallbackFilename) {
+  const binary = atob(payload.content_base64)
+  const bytes = new Uint8Array(binary.length)
+  for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i)
+  const blob = new Blob([bytes], { type: payload.media_type || 'application/octet-stream' })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = payload.filename || fallbackFilename
+  a.click()
+  URL.revokeObjectURL(url)
+}
+
+function downloadJsonPayload(payload, filename) {
+  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = filename
+  a.click()
+  URL.revokeObjectURL(url)
+}
 
 // ─── Domain categories (the differentiator) ────────────────────────────────────
 
@@ -511,6 +533,152 @@ function PredictInputCard({ sessionId, modelInfo }) {
   )
 }
 
+function ScenarioSimulatorCard({ sessionId, modelInfo, category }) {
+  const features = modelInfo.features
+  const firstNumeric = features.find((f) => f.type === 'number')?.name || features[0]?.name || ''
+  const [feature, setFeature] = useState(firstNumeric)
+  const activeFeature = features.find((f) => f.name === feature) || features[0]
+  const [mode, setMode] = useState(activeFeature?.type === 'number' ? 'delta' : 'set')
+  const [value, setValue] = useState(activeFeature?.type === 'number' ? 10 : activeFeature?.options?.[0] || '')
+  const [prompt, setPrompt] = useState('')
+  const [parseNote, setParseNote] = useState(null)
+  const [result, setResult] = useState(null)
+  const [busy, setBusy] = useState(false)
+  const [parseBusy, setParseBusy] = useState(false)
+
+  const changeFeature = (name) => {
+    const nextFeature = features.find((f) => f.name === name)
+    setFeature(name)
+    setMode(nextFeature?.type === 'number' ? 'delta' : 'set')
+    setValue(nextFeature?.type === 'number' ? 10 : nextFeature?.options?.[0] || '')
+    setParseNote(null)
+  }
+
+  const parsePrompt = async () => {
+    const text = prompt.trim()
+    if (!text) return
+    setParseBusy(true); setParseNote(null)
+    try {
+      const res = await fetch(`${API}/scenario_parse`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ session_id: sessionId, prompt: text, category }),
+      })
+      const data = await res.json()
+      if (!res.ok) throw new Error(data.detail || 'Could not parse scenario')
+      if (!data.parsed) {
+        setParseNote(data.reason || 'Could not parse that scenario.')
+        return
+      }
+      setFeature(data.feature)
+      setMode(data.mode)
+      setValue(data.value)
+      setResult(null)
+      setParseNote(data.interpretation || 'Scenario parsed.')
+    } catch (e) {
+      alert(e.message)
+    } finally {
+      setParseBusy(false)
+    }
+  }
+
+  const run = async () => {
+    if (!feature) return
+    setBusy(true); setResult(null)
+    try {
+      const res = await fetch(`${API}/simulate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          session_id: sessionId,
+          category,
+          changes: { [feature]: { mode, value } },
+        }),
+      })
+      const data = await res.json()
+      if (!res.ok) throw new Error(data.detail || 'Simulation failed')
+      setResult(data)
+    } catch (e) {
+      alert(e.message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const impactText = result?.impact?.type === 'regression'
+    ? `${result.impact.direction.replace('_', ' ')} ${Math.abs(result.impact.delta).toLocaleString()}`
+    : result?.impact
+      ? `${result.impact.baseline_label} -> ${result.impact.scenario_label}`
+      : null
+
+  return (
+    <div className="insight-card scenario-card">
+      <div className="ic-head"><Activity width={15} height={15} /> Scenario Simulator</div>
+      <p className="predict-hint">Change one driver and estimate the predicted impact on <strong>{modelInfo.target}</strong>.</p>
+      <div className="scenario-prompt">
+        <input
+          value={prompt}
+          onChange={(e) => setPrompt(e.target.value)}
+          onKeyDown={(e) => { if (e.key === 'Enter') parsePrompt() }}
+          placeholder={`Try: increase ${firstNumeric || 'a driver'} by 10%`}
+        />
+        <button disabled={parseBusy || !prompt.trim()} onClick={parsePrompt}>
+          {parseBusy ? <span className="spinner" /> : 'Parse'}
+        </button>
+      </div>
+      {parseNote && <div className="scenario-note">{parseNote}</div>}
+      <div className="scenario-controls">
+        <label>
+          <span>Driver</span>
+          <select value={feature} onChange={(e) => changeFeature(e.target.value)}>
+            {features.map((f) => <option key={f.name} value={f.name}>{f.name}</option>)}
+          </select>
+        </label>
+        {activeFeature?.type === 'number' ? (
+          <>
+            <label>
+              <span>Change</span>
+              <select value={mode} onChange={(e) => setMode(e.target.value)}>
+                <option value="delta">Add/subtract</option>
+                <option value="percent">Percent</option>
+                <option value="set">Set value</option>
+              </select>
+            </label>
+            <label>
+              <span>Value</span>
+              <input type="number" step="any" value={value} onChange={(e) => setValue(e.target.value)} />
+            </label>
+          </>
+        ) : (
+          <label>
+            <span>Value</span>
+            <select value={value} onChange={(e) => setValue(e.target.value)}>
+              {(activeFeature?.options || []).map((o) => <option key={o} value={o}>{o}</option>)}
+            </select>
+          </label>
+        )}
+      </div>
+      <button className="scenario-btn" disabled={busy || !feature} onClick={run}>
+        {busy ? <span className="spinner" /> : <>Run scenario</>}
+      </button>
+      {result && (
+        <div className="scenario-result">
+          <div className="scenario-impact">
+            <span>Impact</span>
+            <strong>{impactText}</strong>
+          </div>
+          <div className="scenario-pair">
+            <div><span>Baseline</span><strong>{String(result.baseline_prediction.prediction)}</strong></div>
+            <div><span>Scenario</span><strong>{String(result.scenario_prediction.prediction)}</strong></div>
+          </div>
+          {result.chart_json && <PlotlyChart json={result.chart_json} />}
+          <p>{result.validation?.reasons?.[1]}</p>
+        </div>
+      )}
+    </div>
+  )
+}
+
 function BenchmarkModal({ sessionId, onClose }) {
   const [n, setN] = useState(10)
   const [running, setRunning] = useState(false)
@@ -620,6 +788,7 @@ function ExportCard({ upload, messages, category }) {
           chart_json: m.chart_json,
           shap_chart: m.shap_chart,
           critique:  m.critique,
+          validation: m.validation,
           code:      m.code,
           code_lang: m.code_lang,
         })),
@@ -632,13 +801,8 @@ function ExportCard({ upload, messages, category }) {
         body: JSON.stringify(body),
       })
       if (!res.ok) { const e = await res.json(); throw new Error(e.detail || 'Export failed') }
-      const blob = await res.blob()
-      const url  = URL.createObjectURL(blob)
-      const a    = document.createElement('a')
-      a.href     = url
-      a.download = `${upload.filename.replace('.csv', '')}_report.${format}`
-      a.click()
-      URL.revokeObjectURL(url)
+      const payload = await res.json()
+      downloadBase64Payload(payload, `${upload.filename.replace('.csv', '')}_report.${format}`)
     } catch (e) {
       alert(e.message)
     } finally {
@@ -663,7 +827,7 @@ function ExportCard({ upload, messages, category }) {
   )
 }
 
-function InsightsPanel({ upload, category, onAsk, onPredict, onOpenPaste, onOpenBenchmark, modelInfo, loading, messages }) {
+function InsightsPanel({ upload, category, onAsk, onStory, onInvestigate, onPredict, onOpenPaste, onOpenBenchmark, onCleanExport, onExportContract, onExportDashboard, cleaningBusy, modelInfo, loading, messages }) {
   const cat = catByKey(category)
   const numericCols = Object.keys(upload.numeric_stats || {})
   const [statCol, setStatCol] = useState(numericCols[0] || '')
@@ -683,9 +847,90 @@ function InsightsPanel({ upload, category, onAsk, onPredict, onOpenPaste, onOpen
     { label: 'Duplicate Rows', ok: upload.duplicate_rows === 0, value: upload.duplicate_rows },
     { label: 'Data Types',     ok: true, value: `${upload.numeric_features} numeric` },
   ]
+  const qualityIssues = upload.quality_report?.issues || []
+  const brief = upload.decision_brief
+  const decisionActions = upload.decision_actions || brief?.decision_actions || []
+  const cleaningPlan = upload.cleaning_plan
+  const contract = upload.data_contract
+  const dashboard = upload.dashboard_spec
 
   return (
     <aside className="insights">
+      {brief && (
+        <div className="insight-card decision-card">
+          <div className="ic-head"><Layers width={15} height={15} /> Decision Brief</div>
+          <div className="decision-top">
+            <div className={`decision-score ${brief.readiness_label}`}>
+              <span>{brief.readiness_score}</span>
+              <small>readiness</small>
+            </div>
+            <div>
+              <div className="decision-label">{(brief.readiness_label || '').replaceAll('_', ' ')}</div>
+              <p className="decision-summary">{brief.summary}</p>
+            </div>
+          </div>
+          {brief.recommended_use_cases?.length > 0 && (
+            <div className="brief-section">
+              <div className="brief-kicker">Best use cases</div>
+              {brief.recommended_use_cases.slice(0, 3).map((item) => (
+                <div key={item.name} className="brief-use">
+                  <span>{item.name}</span>
+                  <em>{item.fit}</em>
+                </div>
+              ))}
+            </div>
+          )}
+          {brief.next_actions?.length > 0 && (
+            <div className="brief-section">
+              <div className="brief-kicker">Next actions</div>
+              {brief.next_actions.slice(0, 3).map((item, i) => (
+                <div key={`${item.action}-${i}`} className={`brief-action ${item.priority}`}>
+                  <strong>{item.action}</strong>
+                  <span>{item.impact}</span>
+                </div>
+              ))}
+            </div>
+          )}
+          {brief.priority_questions?.length > 0 && (
+            <div className="brief-question-row">
+              {brief.priority_questions.slice(0, 2).map((q) => (
+                <button key={q} className="brief-question" disabled={loading} onClick={() => onAsk(q)}>
+                  <Sparkles width={12} height={12} /> {q}
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
+      {decisionActions.length > 0 && (
+        <div className="insight-card action-card">
+          <div className="ic-head"><Sparkles width={15} height={15} /> Decision Actions</div>
+          <div className="action-list">
+            {decisionActions.slice(0, 3).map((action, i) => (
+              <div key={`${action.title}-${i}`} className={`decision-action ${action.priority}`}>
+                <div className="action-top">
+                  <strong>{action.title}</strong>
+                  <em>{Math.round((action.confidence || 0) * 100)}%</em>
+                </div>
+                <p>{action.recommended_action}</p>
+                <div className="action-impact">{action.estimated_impact}</div>
+                {action.evidence?.length > 0 && (
+                  <ul className="action-evidence">
+                    {action.evidence.slice(0, 2).map((item) => <li key={item}>{item}</li>)}
+                  </ul>
+                )}
+                {action.suggested_question && (
+                  <button className="action-investigate" disabled={loading} onClick={() => onInvestigate(action.suggested_question)}>
+                    Investigate
+                  </button>
+                )}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
       <div className="insight-card health">
         <div className="ic-head"><Activity width={15} height={15} /> Dataset Health</div>
         <div className="health-score">
@@ -700,7 +945,80 @@ function InsightsPanel({ upload, category, onAsk, onPredict, onOpenPaste, onOpen
             ))}
           </div>
         </div>
+        {qualityIssues.length > 0 && (
+          <div className="quality-list">
+            {qualityIssues.slice(0, 4).map((issue, i) => (
+              <div key={`${issue.title}-${i}`} className={`quality-item ${issue.severity}`}>
+                <div className="qi-title">{issue.title}</div>
+                <div className="qi-detail">{issue.detail}</div>
+                {issue.suggestion && <div className="qi-suggestion">{issue.suggestion}</div>}
+              </div>
+            ))}
+          </div>
+        )}
       </div>
+
+      {cleaningPlan?.actions?.length > 0 && (
+        <div className="insight-card cleaning-card">
+          <div className="ic-head"><Check width={15} height={15} /> Cleaning Plan</div>
+          <p className="predict-hint">{cleaningPlan.summary}</p>
+          <div className="cleaning-actions">
+            {cleaningPlan.actions.slice(0, 4).map((action) => (
+              <div key={action.id} className={`cleaning-action ${action.default ? 'default' : ''}`}>
+                <strong>{action.title}</strong>
+                <span>{action.impact}</span>
+              </div>
+            ))}
+          </div>
+          <button className="clean-export-btn" disabled={cleaningBusy} onClick={onCleanExport}>
+            {cleaningBusy ? <span className="spinner" /> : <Check width={14} height={14} />}
+            Download cleaned CSV
+          </button>
+        </div>
+      )}
+
+      {contract && (
+        <div className="insight-card contract-card">
+          <div className="ic-head"><Columns width={15} height={15} /> Data Contract</div>
+          <div className="contract-stats">
+            <div><strong>{contract.column_count}</strong><span>columns</span></div>
+            <div><strong>{contract.required_columns?.length || 0}</strong><span>required</span></div>
+          </div>
+          <div className="contract-cols">
+            {contract.columns.slice(0, 5).map((col) => (
+              <div key={col.name} className="contract-col">
+                <span>{col.name}</span>
+                <em>{col.type}</em>
+              </div>
+            ))}
+          </div>
+          <button className="contract-export-btn" onClick={onExportContract}>
+            <Code width={14} height={14} /> Export contract JSON
+          </button>
+        </div>
+      )}
+
+      {dashboard && (
+        <div className="insight-card dashboard-card">
+          <div className="ic-head"><ChartUp width={15} height={15} /> Dashboard Blueprint</div>
+          <div className="dashboard-stats">
+            <div><strong>{dashboard.kpis?.length || 0}</strong><span>KPIs</span></div>
+            <div><strong>{dashboard.charts?.length || 0}</strong><span>charts</span></div>
+            <div><strong>{dashboard.filters?.length || 0}</strong><span>filters</span></div>
+          </div>
+          <div className="dashboard-charts">
+            {dashboard.charts?.slice(0, 4).map((chart) => (
+              <button key={chart.id} disabled={loading} onClick={() => onAsk(chart.question)}>
+                <span>{chart.title}</span>
+                <em>{chart.type}</em>
+              </button>
+            ))}
+          </div>
+          <button className="dashboard-export-btn" onClick={onExportDashboard}>
+            <Code width={14} height={14} /> Export dashboard JSON
+          </button>
+        </div>
+      )}
 
       {numericCols.length > 0 && (
         <div className="insight-card">
@@ -731,6 +1049,14 @@ function InsightsPanel({ upload, category, onAsk, onPredict, onOpenPaste, onOpen
         </button>
       </div>
 
+      <div className="insight-card story-card">
+        <div className="ic-head"><Sparkles width={15} height={15} /> Dataset Story</div>
+        <p className="predict-hint">Generate a fact-first narrative from computed profile, quality, segment, and relationship facts.</p>
+        <button className="custom-btn" disabled={loading} onClick={onStory}>
+          <Sparkles width={14} height={14} /> Generate dataset story
+        </button>
+      </div>
+
       <div className="insight-card predict-card">
         <div className="ic-head"><Brain width={15} height={15} /> Predictive Model</div>
         <p className="predict-hint">Train a model to predict a column and see what drives it.</p>
@@ -746,7 +1072,10 @@ function InsightsPanel({ upload, category, onAsk, onPredict, onOpenPaste, onOpen
       </div>
 
       {modelInfo?.trained && (
-        <PredictInputCard sessionId={upload.session_id} modelInfo={modelInfo} />
+        <>
+          <PredictInputCard sessionId={upload.session_id} modelInfo={modelInfo} />
+          <ScenarioSimulatorCard sessionId={upload.session_id} modelInfo={modelInfo} category={category} />
+        </>
       )}
 
       <div className="insight-card benchmark-card">
@@ -789,18 +1118,31 @@ function PlotlyChart({ json }) {
   const ref = useRef()
   useEffect(() => {
     if (!ref.current || !json) return
-    let fig
-    try { fig = JSON.parse(json) } catch { return }
-    Plotly.newPlot(ref.current, fig.data, {
-      ...fig.layout,
-      paper_bgcolor: 'white',
-      plot_bgcolor: 'white',
-      font: { family: 'Inter, Segoe UI, Helvetica Neue, Arial, sans-serif', size: 12 },
-      margin: fig.layout?.margin ?? { l: 60, r: 30, t: 60, b: 60 },
-      autosize: true,
-    }, { responsive: true, displayModeBar: true, displaylogo: false,
-         modeBarButtonsToRemove: ['select2d', 'lasso2d'] })
-    return () => { if (ref.current) Plotly.purge(ref.current) }
+    let alive = true
+    let PlotlyLib = null
+
+    const render = async () => {
+      let fig
+      try { fig = JSON.parse(json) } catch { return }
+      const mod = await import('plotly.js-dist-min')
+      PlotlyLib = mod.default ?? mod
+      if (!alive || !ref.current) return
+      PlotlyLib.newPlot(ref.current, fig.data, {
+        ...fig.layout,
+        paper_bgcolor: 'white',
+        plot_bgcolor: 'white',
+        font: { family: 'Inter, Segoe UI, Helvetica Neue, Arial, sans-serif', size: 12 },
+        margin: fig.layout?.margin ?? { l: 60, r: 30, t: 60, b: 60 },
+        autosize: true,
+      }, { responsive: true, displayModeBar: true, displaylogo: false,
+           modeBarButtonsToRemove: ['select2d', 'lasso2d'] })
+    }
+
+    render()
+    return () => {
+      alive = false
+      if (ref.current && PlotlyLib) PlotlyLib.purge(ref.current)
+    }
   }, [json])
   return <div ref={ref} className="plotly-chart" />
 }
@@ -809,10 +1151,26 @@ function PlotlyChart({ json }) {
 
 function AgentStep({ step }) {
   const meta = STEP_META[step.step] || { icon: '•', color: '#94A3B8' }
+  const trace = step.meta || {}
+  const elapsed = trace.elapsed_ms != null
+    ? trace.elapsed_ms < 1000
+      ? `${trace.elapsed_ms} ms`
+      : `${(trace.elapsed_ms / 1000).toFixed(1)} s`
+    : null
+  const requestShort = trace.request_id ? trace.request_id.slice(0, 8) : null
   return (
     <div className="step-row" style={{ '--step-color': meta.color }}>
       <span className="step-icon">{meta.icon}</span>
-      <span className="step-label">{step.message}</span>
+      <span className="step-content">
+        <span className="step-label">{step.message}</span>
+        {(trace.route || elapsed || requestShort) && (
+          <span className="step-trace">
+            {trace.route && <span>{trace.route}</span>}
+            {elapsed && <span>{elapsed}</span>}
+            {requestShort && <span>req {requestShort}</span>}
+          </span>
+        )}
+      </span>
     </div>
   )
 }
@@ -844,6 +1202,64 @@ function CritiqueBadge({ critique }) {
   )
 }
 
+function ValidationPanel({ validation }) {
+  if (!validation) return null
+  return (
+    <div className="validation-panel">
+      <div className="vp-head">
+        <Check width={13} height={13} />
+        <span>{validation.confidence_label || 'High'} trust</span>
+        {validation.confidence != null && (
+          <em>{Math.round(validation.confidence * 100)}%</em>
+        )}
+      </div>
+      <div className="vp-method">{validation.method}</div>
+      <div className="vp-meta">
+        <span>{Number(validation.row_support || 0).toLocaleString()} rows checked</span>
+        {validation.source_columns?.length > 0 && (
+          <span>{validation.source_columns.join(', ')}</span>
+        )}
+        {validation.missing_pct != null && validation.missing_pct > 0 && (
+          <span>{validation.missing_pct}% missing in source fields</span>
+        )}
+      </div>
+      {validation.reasons?.length > 0 && (
+        <ul className="vp-reasons">
+          {validation.reasons.slice(0, 3).map((reason, i) => <li key={i}>{reason}</li>)}
+        </ul>
+      )}
+    </div>
+  )
+}
+
+function AnswerTrustBadge({ route, validation, critique }) {
+  const normalized = (route || '').replaceAll('_', ' ')
+  const routeLabel = route === 'deterministic'
+    ? 'Deterministic'
+    : route === 'llm'
+      ? 'AI Agent'
+      : route === 'cache'
+        ? 'Cached'
+        : normalized
+          ? normalized.replace(/\b\w/g, (c) => c.toUpperCase())
+          : 'Analysis'
+  const confidence = validation?.confidence ?? critique?.confidence
+  const confidenceText = confidence != null ? `${Math.round(confidence * 100)}%` : validation?.confidence_label
+  const level = validation?.confidence_label || (confidence >= 0.9 ? 'High' : confidence >= 0.7 ? 'Medium' : 'Review')
+  const variant = route === 'deterministic' || route?.includes('deterministic')
+    ? 'deterministic'
+    : route === 'cache'
+      ? 'cache'
+      : 'agent'
+
+  return (
+    <span className={`answer-trust-badge ${variant}`} title={validation?.method || critique?.suggestion || routeLabel}>
+      <span>{routeLabel}</span>
+      {(level || confidenceText) && <em>{level}{confidenceText ? ` · ${confidenceText}` : ''}</em>}
+    </span>
+  )
+}
+
 function PlanBadge({ plan }) {
   const [open, setOpen] = useState(false)
   if (!plan?.strategy) return null
@@ -855,6 +1271,19 @@ function PlanBadge({ plan }) {
       </button>
       {open && (
         <div className="plan-detail">
+          {plan.persona && (
+            <div className="persona-strip">
+              <div>
+                <strong>{plan.persona.name}</strong>
+                <span>{plan.persona.focus}</span>
+              </div>
+              {plan.persona.priority_kpis?.length > 0 && (
+                <div className="persona-kpis">
+                  {plan.persona.priority_kpis.slice(0, 5).map((kpi) => <em key={kpi}>{kpi}</em>)}
+                </div>
+              )}
+            </div>
+          )}
           {plan.analysis_steps?.length > 0 && (
             <ol className="plan-steps">
               {plan.analysis_steps.map((s, i) => <li key={i}>{s}</li>)}
@@ -903,12 +1332,14 @@ function ExplainPanel({ msg }) {
   )
 }
 
-function ChatMessage({ msg }) {
+function ChatMessage({ msg, onAsk }) {
   const [showCode, setShowCode] = useState(false)
   const isDone = msg.steps.some((s) => s.step === 'done')
   const isError = msg.steps.some((s) => s.step === 'error')
   const cat = catByKey(msg.category)
   const hasExplain = msg.shap_chart || msg.perm_chart || msg.pdp_chart
+  const latestMeta = [...msg.steps].reverse().find((s) => s.meta)?.meta
+  const route = latestMeta?.route || msg.plan?.query_type
 
   // Filter display steps — hide internal plan/critique/code steps from the track
   const displaySteps = msg.steps.filter(s => !['plan', 'critique', 'code'].includes(s.step))
@@ -921,6 +1352,17 @@ function ChatMessage({ msg }) {
         <div className="agent-head">
           <Sparkles width={14} height={14} /> Multi-Agent Analyst
           <span className="agent-lens"><cat.icon width={11} height={11} /> {cat.label}</span>
+          {msg.plan?.persona?.name && (
+            <span className="persona-head-badge">{msg.plan.persona.name}</span>
+          )}
+          {isDone && !isError && (
+            <AnswerTrustBadge route={route} validation={msg.validation} critique={msg.critique} />
+          )}
+          {latestMeta?.request_id && (
+            <span className="trace-badge" title={`Request ${latestMeta.request_id}`}>
+              {latestMeta.endpoint || 'stream'} #{latestMeta.request_id.slice(0, 8)}
+            </span>
+          )}
           <span className="security-badge" title="AST-validated · sandboxed execution · 30s timeout">🔒</span>
         </div>
 
@@ -964,12 +1406,24 @@ function ChatMessage({ msg }) {
         )}
 
         {msg.critique && isDone && <CritiqueBadge critique={msg.critique} />}
+
+        {msg.validation && isDone && !isError && <ValidationPanel validation={msg.validation} />}
+
+        {msg.followups?.length > 0 && isDone && !isError && (
+          <div className="followup-row">
+            {msg.followups.map((text) => (
+              <button key={text} className="followup-chip" onClick={() => onAsk(text)}>
+                <Sparkles width={12} height={12} /> {text}
+              </button>
+            ))}
+          </div>
+        )}
       </div>
     </div>
   )
 }
 
-function ChatArea({ upload, category, messages, onAsk, loading, question, setQuestion, inputRef }) {
+function ChatArea({ upload, category, messages, onAsk, onStory, onInvestigate, onCleanExport, onExportContract, onExportDashboard, cleaningBusy, loading, question, setQuestion, inputRef }) {
   const cat = catByKey(category)
   const bottomRef = useRef()
   useEffect(() => { bottomRef.current?.scrollIntoView({ behavior: 'smooth' }) }, [messages])
@@ -987,6 +1441,84 @@ function ChatArea({ upload, category, messages, onAsk, loading, question, setQue
               </div>
             </div>
 
+            {upload.proactive_insights?.length > 0 && (
+              <div className="proactive-grid">
+                {upload.proactive_insights.map((insight, i) => (
+                  <article key={`${insight.title}-${i}`} className={`proactive-card ${insight.kind || 'profile'}`}>
+                    <div className="pi-top">
+                      <span className="pi-kind">{insight.kind || 'insight'}</span>
+                      <span className="pi-confidence">{insight.confidence || 'High'} confidence</span>
+                    </div>
+                    <h3>{insight.title}</h3>
+                    <p>{insight.finding}</p>
+                    {insight.validation && <div className="pi-validation">{insight.validation}</div>}
+                  </article>
+                ))}
+              </div>
+            )}
+
+            {upload.decision_brief && (
+              <section className="overview-brief">
+                <div className="overview-brief-score">
+                  <span>{upload.decision_brief.readiness_score}</span>
+                  <small>readiness</small>
+                </div>
+                <div className="overview-brief-body">
+                  <h3>Decision readiness: {(upload.decision_brief.readiness_label || '').replaceAll('_', ' ')}</h3>
+                  <p>{upload.decision_brief.summary}</p>
+                  <div className="overview-brief-actions">
+                    {upload.decision_brief.priority_questions?.slice(0, 3).map((q) => (
+                      <button key={q} disabled={loading} onClick={() => onAsk(q)}>
+                        <Sparkles width={12} height={12} /> {q}
+                      </button>
+                    ))}
+                    {upload.cleaning_plan?.default_actions?.length > 0 && (
+                      <button disabled={cleaningBusy} onClick={onCleanExport}>
+                        <Check width={12} height={12} /> {cleaningBusy ? 'Preparing cleaned CSV' : 'Download cleaned CSV'}
+                      </button>
+                    )}
+                    {upload.data_contract && (
+                      <button onClick={onExportContract}>
+                        <Code width={12} height={12} /> Export data contract
+                      </button>
+                    )}
+                    {upload.dashboard_spec && (
+                      <button onClick={onExportDashboard}>
+                        <ChartUp width={12} height={12} /> Export dashboard JSON
+                      </button>
+                    )}
+                  </div>
+                </div>
+              </section>
+            )}
+
+            {(upload.decision_actions || upload.decision_brief?.decision_actions)?.length > 0 && (
+              <section className="overview-actions">
+                <div className="overview-actions-head">
+                  <Sparkles width={15} height={15} />
+                  <h3>What to do next</h3>
+                </div>
+                <div className="overview-action-grid">
+                  {(upload.decision_actions || upload.decision_brief.decision_actions).slice(0, 3).map((action, i) => (
+                    <article key={`${action.title}-${i}`} className={`overview-action ${action.priority}`}>
+                      <div className="oa-top">
+                        <span>{action.priority}</span>
+                        <em>{Math.round((action.confidence || 0) * 100)}% confidence</em>
+                      </div>
+                      <h4>{action.title}</h4>
+                      <p>{action.implication}</p>
+                      <strong>{action.estimated_impact}</strong>
+                      {action.suggested_question && (
+                        <button disabled={loading} onClick={() => onInvestigate(action.suggested_question)}>
+                          Investigate this
+                        </button>
+                      )}
+                    </article>
+                  ))}
+                </div>
+              </section>
+            )}
+
             <div className="overview-grid">
               {upload.overview.map((oc) => (
                 <figure key={oc.title} className="overview-card">
@@ -999,6 +1531,9 @@ function ChatArea({ upload, category, messages, onAsk, loading, question, setQue
             <div className="overview-examples">
               <div className="oe-label">Try a {cat.label} question</div>
               <div className="oe-chips">
+                <button className="oe-chip story" disabled={loading} onClick={onStory}>
+                  <Sparkles width={13} height={13} /> Generate dataset story
+                </button>
                 {cat.examples.map((text) => (
                   <button key={text} className="oe-chip" disabled={loading} onClick={() => onAsk(text)}>
                     <Sparkles width={13} height={13} /> {text}
@@ -1024,7 +1559,7 @@ function ChatArea({ upload, category, messages, onAsk, loading, question, setQue
         )
       ) : (
         <div className="message-list">
-          {messages.map((m) => <ChatMessage key={m.id} msg={m} />)}
+          {messages.map((m) => <ChatMessage key={m.id} msg={m} onAsk={onAsk} />)}
           <div ref={bottomRef} />
         </div>
       )}
@@ -1067,6 +1602,7 @@ export default function App() {
   const [showBenchmark, setShowBenchmark] = useState(false)
   const [modelInfo, setModelInfo] = useState(null)
   const [docs, setDocs] = useState([])
+  const [cleaningBusy, setCleaningBusy] = useState(false)
   const inputRef = useRef()
 
   const handlePasteSubmit = useCallback(async (text, hasHeader) => {
@@ -1092,12 +1628,12 @@ export default function App() {
     }
   }, [])
 
-  // Shared SSE consumer used by both /query and /predict.
+  // Shared SSE consumer used by streaming analysis endpoints.
   const streamInto = useCallback(async (url, body, label) => {
     if (!upload || loading) return
     setLoading(true)
     const msgId = Date.now()
-    setMessages((prev) => [...prev, { id: msgId, question: label, category, steps: [], code: null, code_lang: null, result: null, chart: null, chart_json: null, report: null, critique: null, plan: null, shap_chart: null, perm_chart: null, pdp_chart: null }])
+    setMessages((prev) => [...prev, { id: msgId, question: label, category, steps: [], code: null, code_lang: null, result: null, chart: null, chart_json: null, report: null, critique: null, validation: null, plan: null, followups: [], shap_chart: null, perm_chart: null, pdp_chart: null }])
 
     try {
       const res = await fetch(url, {
@@ -1129,7 +1665,9 @@ export default function App() {
             chart_json: event.chart_json ?? m.chart_json,
             report: event.report ?? m.report,
             critique: event.critique ?? m.critique,
+            validation: event.validation ?? m.validation,
             plan: event.plan ?? m.plan,
+            followups: event.followups ?? m.followups,
             shap_chart: event.shap_chart ?? m.shap_chart,
             perm_chart: event.perm_chart ?? m.perm_chart,
             pdp_chart:  event.pdp_chart  ?? m.pdp_chart,
@@ -1164,6 +1702,17 @@ export default function App() {
     return streamInto(`${API}/query`, { session_id: upload.session_id, question: text, category }, text)
   }, [question, upload, category, streamInto])
 
+  const story = useCallback(() => {
+    if (!upload) return
+    return streamInto(`${API}/story`, { session_id: upload.session_id, category }, 'Dataset Story')
+  }, [upload, category, streamInto])
+
+  const investigate = useCallback((goal) => {
+    if (!upload) return
+    const text = (goal || 'Investigate the strongest decision opportunity in this dataset.').trim()
+    return streamInto(`${API}/investigate`, { session_id: upload.session_id, goal: text, category }, `Investigation: ${text}`)
+  }, [upload, category, streamInto])
+
   const predict = useCallback(async (target) => {
     if (!target) return
     await streamInto(`${API}/predict`, { session_id: upload.session_id, target, category }, `🔮 Predict "${target}"`)
@@ -1176,6 +1725,35 @@ export default function App() {
       }
     } catch (_) {}
   }, [upload, category, streamInto])
+
+  const exportCleanedCsv = useCallback(async () => {
+    if (!upload || cleaningBusy) return
+    setCleaningBusy(true)
+    try {
+      const res = await fetch(`${API}/clean/${upload.session_id}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({}),
+      })
+      const payload = await res.json()
+      if (!res.ok) throw new Error(payload.detail || 'Could not clean dataset')
+      downloadBase64Payload(payload, `${upload.filename.replace('.csv', '')}_cleaned.csv`)
+    } catch (e) {
+      alert(e.message)
+    } finally {
+      setCleaningBusy(false)
+    }
+  }, [upload, cleaningBusy])
+
+  const exportDataContract = useCallback(() => {
+    if (!upload?.data_contract) return
+    downloadJsonPayload(upload.data_contract, `${upload.filename.replace('.csv', '')}_data_contract.json`)
+  }, [upload])
+
+  const exportDashboardSpec = useCallback(() => {
+    if (!upload?.dashboard_spec) return
+    downloadJsonPayload(upload.dashboard_spec, `${upload.filename.replace('.csv', '')}_dashboard_blueprint.json`)
+  }, [upload])
 
   return (
     <div className="app">
@@ -1204,6 +1782,12 @@ export default function App() {
             category={category}
             messages={messages}
             onAsk={ask}
+            onStory={story}
+            onInvestigate={investigate}
+            onCleanExport={exportCleanedCsv}
+            onExportContract={exportDataContract}
+            onExportDashboard={exportDashboardSpec}
+            cleaningBusy={cleaningBusy}
             loading={loading}
             question={question}
             setQuestion={setQuestion}
@@ -1213,9 +1797,15 @@ export default function App() {
             upload={upload}
             category={category}
             onAsk={ask}
+            onStory={story}
+            onInvestigate={investigate}
             onPredict={predict}
             onOpenPaste={() => setShowPaste(true)}
             onOpenBenchmark={() => setShowBenchmark(true)}
+            onCleanExport={exportCleanedCsv}
+            onExportContract={exportDataContract}
+            onExportDashboard={exportDashboardSpec}
+            cleaningBusy={cleaningBusy}
             modelInfo={modelInfo}
             loading={loading}
             messages={messages}
