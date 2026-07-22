@@ -35,6 +35,8 @@ export default defineConfig({
       '/infer_join': 'http://localhost:8001',
       '/join': 'http://localhost:8001',
       '/forecast': 'http://localhost:8001',
+      '/import_url': 'http://localhost:8001',
+      '/compare': 'http://localhost:8001',
       '/health': 'http://localhost:8001',
     }
   }

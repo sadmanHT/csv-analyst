@@ -292,6 +292,16 @@ class ForecastRequest(BaseModel):
     freq: str = "auto"
 
 
+class UrlImportRequest(BaseModel):
+    url: str
+    filename: str = "imported_dataset.csv"
+
+
+class CompareRequest(BaseModel):
+    session_id_1: str
+    session_id_2: str
+
+
 class PredictInputRequest(BaseModel):
     session_id: str
     values: dict
@@ -3169,10 +3179,10 @@ async def upload_file(
     sheet_name: str | None = None,
 ) -> dict:
     ext = file.filename.rsplit(".", 1)[-1].lower() if "." in file.filename else ""
-    if ext not in ("csv", "xlsx", "xls", "parquet"):
+    if ext not in ("csv", "xlsx", "xls", "parquet", "json", "jsonl"):
         raise HTTPException(
             status_code=400,
-            detail="Unsupported file format. Supported formats: .csv, .xlsx, .xls, .parquet",
+            detail="Unsupported file format. Supported formats: .csv, .xlsx, .xls, .parquet, .json, .jsonl",
         )
 
     content = await read_upload_limited(file)
@@ -3186,6 +3196,17 @@ async def upload_file(
             df = pd.read_excel(excel_file, sheet_name=target_sheet)
         elif ext == "parquet":
             df = pd.read_parquet(io.BytesIO(content))
+        elif ext == "json":
+            raw = json.loads(content.decode("utf-8"))
+            if isinstance(raw, list):
+                df = pd.json_normalize(raw)
+            elif isinstance(raw, dict):
+                df = pd.json_normalize(raw.get("data", [raw]))
+            else:
+                df = pd.DataFrame(raw)
+        elif ext == "jsonl":
+            lines = [json.loads(line) for line in content.decode("utf-8").splitlines() if line.strip()]
+            df = pd.json_normalize(lines)
         else:
             df = pd.read_csv(io.BytesIO(content))
     except Exception as e:
@@ -3195,6 +3216,118 @@ async def upload_file(
     if sheets:
         result["sheets"] = sheets
     return result
+
+
+@app.post("/import_url")
+async def import_from_url(req: UrlImportRequest) -> dict:
+    raw_url = req.url.strip()
+    if not raw_url:
+        raise HTTPException(status_code=400, detail="URL cannot be empty.")
+
+    target_url = raw_url
+    if "docs.google.com/spreadsheets/d/" in raw_url:
+        match = re.search(r"docs\.google\.com/spreadsheets/d/([a-zA-Z0-9-_]+)", raw_url)
+        if match:
+            sheet_id = match.group(1)
+            target_url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv"
+
+    try:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=15.0) as client:
+            resp = await client.get(target_url)
+            if resp.status_code != 200:
+                raise HTTPException(status_code=400, detail=f"Failed to fetch dataset from URL (HTTP {resp.status_code}). Ensure link is publicly accessible.")
+            content = resp.content
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Could not download dataset from URL: {e}")
+
+    try:
+        df = pd.read_csv(io.BytesIO(content))
+    except Exception:
+        try:
+            df = pd.read_excel(io.BytesIO(content))
+        except Exception as e:
+            raise HTTPException(status_code=422, detail=f"Could not parse imported dataset: {e}")
+
+    filename = req.filename if req.filename.endswith(".csv") else f"{req.filename}.csv"
+    return register_dataframe(df, filename)
+
+
+def build_dataset_comparison(df1: pd.DataFrame, df2: pd.DataFrame) -> dict:
+    """Compare version 1 vs version 2 of a dataset to detect schema changes, row delta, and distribution drift."""
+    cols1 = set(df1.columns)
+    cols2 = set(df2.columns)
+
+    added_cols = sorted(list(cols2 - cols1))
+    removed_cols = sorted(list(cols1 - cols2))
+    common_cols = sorted(list(cols1 & cols2))
+
+    type_changes: list[dict] = []
+    for c in common_cols:
+        t1 = str(df1[c].dtype)
+        t2 = str(df2[c].dtype)
+        if t1 != t2:
+            type_changes.append({"column": c, "v1_type": t1, "v2_type": t2})
+
+    row_delta = len(df2) - len(df1)
+    row_pct_change = round((row_delta / max(1, len(df1))) * 100, 1)
+
+    numeric_drift: list[dict] = []
+    for c in common_cols:
+        if pd.api.types.is_numeric_dtype(df1[c]) and pd.api.types.is_numeric_dtype(df2[c]):
+            s1 = df1[c].dropna()
+            s2 = df2[c].dropna()
+            if len(s1) > 0 and len(s2) > 0:
+                m1, m2 = float(s1.mean()), float(s2.mean())
+                med1, med2 = float(s1.median()), float(s2.median())
+                std1, std2 = float(s1.std()), float(s2.std())
+                mean_delta = m2 - m1
+                pct_shift = round((mean_delta / max(1e-5, abs(m1))) * 100, 1)
+
+                drift_score = min(1.0, round(abs(m2 - m1) / max(1e-5, (std1 + std2) / 2), 2))
+                numeric_drift.append({
+                    "column": c,
+                    "v1_mean": round(m1, 2),
+                    "v2_mean": round(m2, 2),
+                    "v1_median": round(med1, 2),
+                    "v2_median": round(med2, 2),
+                    "mean_delta": round(mean_delta, 2),
+                    "pct_shift": pct_shift,
+                    "drift_score": drift_score,
+                    "drift_level": "Significant" if drift_score > 0.5 else "Moderate" if drift_score > 0.2 else "Low",
+                })
+
+    numeric_drift.sort(key=lambda x: x["drift_score"], reverse=True)
+
+    summary = (
+        f"Comparison of v1 ({len(df1):,} rows) vs v2 ({len(df2):,} rows): "
+        f"{len(added_cols)} columns added, {len(removed_cols)} columns removed, "
+        f"and {len([d for d in numeric_drift if d['drift_level'] == 'Significant'])} numeric columns showing significant distribution drift."
+    )
+
+    return {
+        "summary": summary,
+        "v1_rows": len(df1),
+        "v2_rows": len(df2),
+        "row_delta": row_delta,
+        "row_pct_change": row_pct_change,
+        "schema_changes": {
+            "added_columns": added_cols,
+            "removed_columns": removed_cols,
+            "common_columns_count": len(common_cols),
+            "type_changes": type_changes,
+        },
+        "numeric_drift": numeric_drift,
+    }
+
+
+@app.post("/compare")
+def compare_datasets_endpoint(req: CompareRequest) -> dict:
+    cleanup_expired_sessions()
+    df1 = get_session_df(req.session_id_1)
+    df2 = get_session_df(req.session_id_2)
+    _touch_session(req.session_id_1)
+    _touch_session(req.session_id_2)
+    return build_dataset_comparison(df1, df2)
 
 
 @app.post("/infer_join")

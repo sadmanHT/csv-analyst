@@ -1381,5 +1381,47 @@ def test_time_series_forecast():
     assert "chart_json" in body
 
 
+def test_upload_json_and_jsonl():
+    json_bytes = io.BytesIO(json.dumps([{"id": 1, "user": {"name": "Alice"}}, {"id": 2, "user": {"name": "Bob"}}]).encode("utf-8"))
+    res = client.post(
+        "/upload",
+        files={"file": ("users.json", json_bytes, "application/json")},
+    )
+    assert res.status_code == 200
+    b = res.json()
+    assert b["rows"] == 2
+    assert "user.name" in b["columns"]
+
+    jsonl_bytes = io.BytesIO(b'{"a": 10, "b": 20}\n{"a": 30, "b": 40}\n')
+    res2 = client.post(
+        "/upload",
+        files={"file": ("logs.jsonl", jsonl_bytes, "application/x-ndjson")},
+    )
+    assert res2.status_code == 200
+    assert res2.json()["rows"] == 2
+
+
+def test_compare_datasets_drift():
+    df1 = pd.DataFrame({"revenue": [100, 110, 105, 95, 100], "cost": [50, 52, 51, 49, 50]})
+    df2 = pd.DataFrame({"revenue": [200, 210, 205, 195, 200], "cost": [50, 52, 51, 49, 50], "new_col": [1, 2, 3, 4, 5]})
+
+    up1 = client.post("/upload_text", json={"text": df1.to_csv(index=False), "has_header": True, "filename": "v1.csv"})
+    up2 = client.post("/upload_text", json={"text": df2.to_csv(index=False), "has_header": True, "filename": "v2.csv"})
+    sid1 = up1.json()["session_id"]
+    sid2 = up2.json()["session_id"]
+
+    res = client.post("/compare", json={"session_id_1": sid1, "session_id_2": sid2})
+    assert res.status_code == 200
+    body = res.json()
+    assert body["v1_rows"] == 5
+    assert body["v2_rows"] == 5
+    assert "new_col" in body["schema_changes"]["added_columns"]
+    assert len(body["numeric_drift"]) >= 1
+    rev_drift = next(d for d in body["numeric_drift"] if d["column"] == "revenue")
+    assert rev_drift["drift_level"] == "Significant"
+    assert rev_drift["mean_delta"] == 100.0
+
+
+
 
 

@@ -297,10 +297,10 @@ function UploadScreen({ onUpload, uploading, setUploading, category, setCategory
           onDragLeave={() => setDragging(false)}
           onDrop={(e) => { e.preventDefault(); setDragging(false); handleFile(e.dataTransfer.files[0]) }}
         >
-          <input ref={inputRef} type="file" accept=".csv,.xlsx,.xls,.parquet" hidden onChange={(e) => handleFile(e.target.files[0])} />
+          <input ref={inputRef} type="file" accept=".csv,.xlsx,.xls,.parquet,.json,.jsonl" hidden onChange={(e) => handleFile(e.target.files[0])} />
           <div className="dropzone-icon">{uploading ? <span className="spinner big" /> : <FileIcon width={26} height={26} />}</div>
-          <p className="dropzone-title">{uploading ? 'Analyzing your dataset…' : 'Drop a CSV, Excel, or Parquet file here'}</p>
-          <p className="dropzone-sub">{uploading ? 'Building data profile' : 'or click to browse · .csv, .xlsx, .parquet up to 25MB'}</p>
+          <p className="dropzone-title">{uploading ? 'Analyzing your dataset…' : 'Drop a CSV, Excel, Parquet, or JSON file here'}</p>
+          <p className="dropzone-sub">{uploading ? 'Building data profile' : 'or click to browse · .csv, .xlsx, .parquet, .json up to 25MB'}</p>
         </div>
         <div className="paste-divider"><span>or</span></div>
         <button className="paste-trigger" onClick={onOpenPaste} disabled={uploading}>
