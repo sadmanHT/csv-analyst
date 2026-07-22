@@ -284,6 +284,14 @@ class JoinRequest(BaseModel):
     how: str = "inner"
 
 
+class ForecastRequest(BaseModel):
+    session_id: str
+    date_column: str
+    target_column: str
+    periods: int = 12
+    freq: str = "auto"
+
+
 class PredictInputRequest(BaseModel):
     session_id: str
     values: dict
@@ -3245,6 +3253,126 @@ def join_datasets(req: JoinRequest) -> dict:
         "rows_after": len(joined_df),
     }
     return res
+
+
+def build_time_series_forecast(
+    df: pd.DataFrame,
+    date_col: str,
+    target_col: str,
+    periods: int = 12,
+    freq: str = "auto",
+) -> dict:
+    """Perform time-series trend forecasting with 95% confidence bounds."""
+    if date_col not in df.columns or target_col not in df.columns:
+        raise HTTPException(status_code=400, detail="Specified date or target column not found in dataset.")
+
+    ts_df = df[[date_col, target_col]].dropna().copy()
+    ts_df[date_col] = pd.to_datetime(ts_df[date_col], errors="coerce")
+    ts_df[target_col] = pd.to_numeric(ts_df[target_col], errors="coerce")
+    ts_df = ts_df.dropna().sort_values(by=date_col)
+
+    if len(ts_df) < 5:
+        raise HTTPException(status_code=400, detail="At least 5 valid date-target rows are required for forecasting.")
+
+    span_days = (ts_df[date_col].max() - ts_df[date_col].min()).days
+    if freq == "auto":
+        if span_days > 730:
+            resample_freq = "MS"
+        elif span_days > 60:
+            resample_freq = "W"
+        else:
+            resample_freq = "D"
+    else:
+        resample_freq = freq
+
+    try:
+        series = ts_df.set_index(date_col)[target_col].resample(resample_freq).mean().interpolate(method="linear")
+    except Exception:
+        series = ts_df.set_index(date_col)[target_col]
+
+    series = series.dropna()
+    if len(series) < 3:
+        raise HTTPException(status_code=400, detail="Insufficient time series resolution for forecasting.")
+
+    n_hist = len(series)
+    hist_dates = [d.strftime("%Y-%m-%d") for d in series.index]
+    hist_values = [round(float(v), 2) for v in series.values]
+
+    try:
+        future_dates = pd.date_range(start=series.index[-1], periods=periods + 1, freq=resample_freq)[1:]
+    except Exception:
+        future_dates = pd.date_range(start=series.index[-1], periods=periods + 1, freq="D")[1:]
+
+    future_date_strs = [d.strftime("%Y-%m-%d") for d in future_dates]
+
+    forecast_vals: list[float] = []
+    std_err: float = 0.0
+
+    try:
+        from statsmodels.tsa.api import ExponentialSmoothing
+        model = ExponentialSmoothing(series.values, trend="add", seasonal=None, initialization_method="estimated")
+        fit_model = model.fit()
+        pred = fit_model.forecast(periods)
+        forecast_vals = [float(v) for v in pred]
+        residuals = series.values - fit_model.fittedvalues
+        std_err = float(np.std(residuals)) if len(residuals) > 0 else float(np.std(series.values) * 0.1)
+    except Exception:
+        x = np.arange(n_hist)
+        slope, intercept = np.polyfit(x, series.values, 1)
+        x_future = np.arange(n_hist, n_hist + periods)
+        forecast_vals = [float(slope * xi + intercept) for xi in x_future]
+        residuals = series.values - (slope * x + intercept)
+        std_err = float(np.std(residuals)) if len(residuals) > 0 else float(np.std(series.values) * 0.1)
+
+    lower_95 = [round(float(v - 1.96 * std_err), 2) for v in forecast_vals]
+    upper_95 = [round(float(v + 1.96 * std_err), 2) for v in forecast_vals]
+    forecast_rounded = [round(float(v), 2) for v in forecast_vals]
+
+    start_val = hist_values[0] if hist_values else 1.0
+    end_forecast = forecast_rounded[-1] if forecast_rounded else start_val
+    growth_rate = round(((end_forecast - hist_values[-1]) / max(1e-5, abs(hist_values[-1]))) * 100, 1)
+    direction = "upward" if growth_rate > 2.0 else "downward" if growth_rate < -2.0 else "flat"
+
+    plot_hist_df = pd.DataFrame({"Date": hist_dates, "Value": hist_values, "Type": "Historical"})
+    plot_fc_df = pd.DataFrame({"Date": future_date_strs, "Value": forecast_rounded, "Type": "Forecast"})
+    full_plot_df = pd.concat([plot_hist_df, plot_fc_df])
+
+    fig = px.line(
+        full_plot_df,
+        x="Date",
+        y="Value",
+        color="Type",
+        title=f"Time-Series Forecast: {target_col} ({periods} {resample_freq} periods)",
+        color_discrete_map={"Historical": "#4F46E5", "Forecast": "#10B981"},
+    )
+    chart_json = _chart_to_json(fig)
+
+    return {
+        "date_column": date_col,
+        "target_column": target_col,
+        "frequency": resample_freq,
+        "periods": periods,
+        "historical": [{"date": d, "value": v} for d, v in zip(hist_dates, hist_values)],
+        "forecast": [
+            {"date": d, "forecast": f, "lower_95": l, "upper_95": u}
+            for d, f, l, u in zip(future_date_strs, forecast_rounded, lower_95, upper_95)
+        ],
+        "metrics": {
+            "trend_direction": direction,
+            "growth_rate_pct": growth_rate,
+            "last_historical_value": hist_values[-1],
+            "projected_final_value": end_forecast,
+        },
+        "chart_json": chart_json,
+    }
+
+
+@app.post("/forecast")
+def forecast_endpoint(req: ForecastRequest) -> dict:
+    cleanup_expired_sessions()
+    df = get_session_df(req.session_id)
+    _touch_session(req.session_id)
+    return build_time_series_forecast(df, req.date_column, req.target_column, req.periods, req.freq)
 
 
 @app.post("/upload_text")

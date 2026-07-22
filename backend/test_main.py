@@ -1357,4 +1357,29 @@ def test_infer_join_keys_and_join_datasets():
     assert jbody["join_metadata"]["right_rows_before"] == 3
 
 
+def test_time_series_forecast():
+    dates = pd.date_range(start="2024-01-01", periods=30, freq="D")
+    values = np.linspace(100, 400, 30) + np.random.randn(30) * 5
+    df = pd.DataFrame({"date": dates.strftime("%Y-%m-%d"), "sales": values})
+
+    up = client.post("/upload_text", json={"text": df.to_csv(index=False), "has_header": True})
+    sid = up.json()["session_id"]
+
+    res = client.post("/forecast", json={
+        "session_id": sid,
+        "date_column": "date",
+        "target_column": "sales",
+        "periods": 7,
+    })
+    assert res.status_code == 200
+    body = res.json()
+    assert body["date_column"] == "date"
+    assert body["target_column"] == "sales"
+    assert len(body["forecast"]) == 7
+    assert "metrics" in body
+    assert body["metrics"]["trend_direction"] == "upward"
+    assert "chart_json" in body
+
+
+
 
