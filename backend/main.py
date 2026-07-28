@@ -2,6 +2,14 @@ import ast
 import sys
 import io
 import os
+
+_backend_dir = os.path.dirname(os.path.abspath(__file__))
+_parent_dir = os.path.dirname(_backend_dir)
+if _parent_dir not in sys.path:
+    sys.path.insert(0, _parent_dir)
+if _backend_dir not in sys.path:
+    sys.path.insert(0, _backend_dir)
+
 import re
 import uuid
 import json
@@ -97,7 +105,7 @@ import storage
 
 load_dotenv(override=True)
 
-app = FastAPI(title="CSV Analyst AI ÃÂ¢ÃÂÃÂ Agentic Data Scientist")
+app = FastAPI(title="Analytico AI — Agentic Data Scientist")
 
 # ALLOWED_ORIGINS: comma-separated list, e.g. "https://your-app.vercel.app"
 # Falls back to "*" in local dev (when env var is not set).

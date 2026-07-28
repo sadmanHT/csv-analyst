@@ -5,6 +5,7 @@ Budgeted LLM Client Wrapper with Explicit Deadlines, Request Accounting, Retries
 import os
 import time
 import logging
+import concurrent.futures
 from typing import Any
 from google import genai
 from google.genai import types
