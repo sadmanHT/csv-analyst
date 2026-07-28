@@ -14,18 +14,32 @@ from backend.core.schemas import ExecutionBudget
 
 logger = logging.getLogger(__name__)
 
+_llm_executor = concurrent.futures.ThreadPoolExecutor(max_workers=8)
+
 class BudgetedLLMClient:
     def __init__(self, api_key: str | None = None):
         key = api_key or os.environ.get("GEMMA_API_KEY") or os.environ.get("GEMINI_API_KEY")
         self.client = genai.Client(api_key=key)
         self.call_records: list[dict[str, Any]] = []
 
-    def record_call(self, request_id: str, stage: str, duration_ms: int, success: bool = True) -> None:
-        """Helper method to explicitly record stage-level LLM calls."""
+    def record_call(self, request_id: str, stage_or_route: str = "standard", stage: Any = "stage", duration_ms: Any = 0, success: bool = True) -> None:
+        """Helper method to explicitly record stage-level LLM calls and enforce budget limits."""
+        from backend.core.errors import ExecutionBudgetExceededError
+        from backend.core.schemas import ROUTE_BUDGETS
+
+        existing_calls = sum(1 for r in self.call_records if r.get("request_id") == request_id)
+        max_allowed = 3
+        if isinstance(stage_or_route, str) and stage_or_route in ROUTE_BUDGETS:
+            max_allowed = ROUTE_BUDGETS[stage_or_route].max_llm_calls
+
+        if existing_calls >= max_allowed:
+            raise ExecutionBudgetExceededError(f"LLM call budget ({max_allowed}) exceeded for request {request_id}")
+
         self.call_records.append({
             "request_id": request_id,
-            "stage": stage,
-            "duration_ms": duration_ms,
+            "route": stage_or_route,
+            "stage": str(stage),
+            "duration_ms": duration_ms if isinstance(duration_ms, (int, float)) else 0,
             "outcome": "success" if success else "failure",
         })
 
