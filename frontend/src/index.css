@@ -1,52 +1,64 @@
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500;600;700&family=Fira+Code:wght@400;500&display=swap');
 
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
 :root {
-  /* Surfaces */
-  --bg:        #F8FAFC;
-  --panel:     #FFFFFF;
-  --card:      #FFFFFF;
-  --inset:     #F1F5F9;
-  --inset2:    #F8FAFC;
+  --font-base: 'Space Grotesk', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  --font-heading: 'Space Grotesk', sans-serif;
+  --font-mono: 'Fira Code', monospace;
+
+  /* Surfaces — Apple Minimalist Monochrome Base */
+  --bg:           #FAFAFA;
+  --bg-subtle:     #F4F4F5;
+  --panel:        #FFFFFF;
+  --card:         #FFFFFF;
+  --card-dark:    #09090B;
+  --card-dark-sub:#18181B;
+  --inset:        #F4F4F5;
+  --inset2:       #FAFAFA;
 
   /* Borders */
-  --border:    #E2E8F0;
-  --border-lt: #EEF2F6;
+  --border:       #E4E4E7;
+  --border-lt:    #F4F4F5;
+  --border-dark:  #27272A;
 
-  /* Brand — indigo */
-  --primary:      #4F46E5;
-  --primary-hover:#4338CA;
-  --primary-soft: #EEF2FF;
-  --primary-ring: rgba(79,70,229,0.16);
+  /* Brand — Rich Charcoal & Electric Emerald */
+  --primary:        #09090B;
+  --primary-hover:  #18181B;
+  --primary-soft:   #ECFDF5;
+  --primary-ring:   rgba(16,185,129,0.22);
+  --accent-emerald: #10B981;
+  --emerald-light:  #34D399;
+  --emerald-hover:  #059669;
 
   /* Semantic */
-  --success: #10B981;
+  --success:      #10B981;
   --success-soft: #ECFDF5;
-  --warning: #F59E0B;
-  --danger:  #EF4444;
+  --warning:      #F59E0B;
+  --danger:       #EF4444;
 
   /* Text */
-  --text:       #0F172A;
-  --text-soft:  #475569;
-  --text-muted: #64748B;
-  --text-faint: #94A3B8;
+  --text:         #09090B;
+  --text-soft:    #52525B;
+  --text-muted:   #71717A;
+  --text-faint:   #A1A1AA;
+  --text-on-dark: #FFFFFF;
 
-  /* Radius */
-  --r-lg: 16px;
-  --r:    12px;
-  --r-sm: 9px;
+  /* Radius — Apple Squircles & Pills */
+  --r-lg:   20px;
+  --r:      14px;
+  --r-sm:   10px;
+  --r-pill: 9999px;
 
-  /* Shadows — soft, layered */
-  --sh-sm: 0 1px 2px rgba(15,23,42,0.04), 0 1px 3px rgba(15,23,42,0.06);
-  --sh:    0 1px 3px rgba(15,23,42,0.04), 0 4px 12px rgba(15,23,42,0.06);
-  --sh-md: 0 4px 16px rgba(15,23,42,0.08), 0 12px 32px rgba(15,23,42,0.08);
-  --sh-lg: 0 12px 40px rgba(15,23,42,0.14);
+  /* Shadows — Soft, Multi-layered Apple Drop Shadows */
+  --sh-sm: 0 1px 2px rgba(9,9,11,0.03), 0 1px 3px rgba(9,9,11,0.04);
+  --sh:    0 2px 6px rgba(9,9,11,0.04), 0 8px 24px rgba(9,9,11,0.05);
+  --sh-md: 0 4px 12px rgba(9,9,11,0.05), 0 16px 32px rgba(9,9,11,0.06);
+  --sh-lg: 0 20px 40px -12px rgba(9,9,11,0.10), 0 1px 4px rgba(9,9,11,0.04);
 }
 
-html, body, #root {
-  height: 100%;
-  font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+html, body, #root, button, input, select, textarea, p, h1, h2, h3, h4, h5, h6, span, label {
+  font-family: var(--font-base);
   color: var(--text);
   font-size: 14px;
   line-height: 1.55;

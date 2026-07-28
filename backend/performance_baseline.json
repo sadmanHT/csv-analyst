@@ -1,0 +1,137 @@
+{
+  "upload_time_ms": 612.2,
+  "benchmark_results": [
+    {
+      "type": "model_recommendation",
+      "question": "What model algorithm should I train for this dataset?",
+      "success": true,
+      "duration_ms": 20375.8,
+      "events_count": 3,
+      "complexity_route": "DEEP",
+      "pipeline_branch": "deep",
+      "llm_calls": 0,
+      "planner_ms": 0,
+      "synthesis_ms": 0
+    },
+    {
+      "type": "unclear_query",
+      "question": "gg",
+      "success": true,
+      "duration_ms": 20613.0,
+      "events_count": 3,
+      "complexity_route": "DIRECT",
+      "pipeline_branch": "direct",
+      "llm_calls": 1,
+      "planner_ms": 0,
+      "synthesis_ms": 20602
+    },
+    {
+      "type": "dataset_purpose",
+      "question": "What is this dataset about?",
+      "success": true,
+      "duration_ms": 19860.3,
+      "events_count": 3,
+      "complexity_route": "DIRECT",
+      "pipeline_branch": "direct",
+      "llm_calls": 1,
+      "planner_ms": 0,
+      "synthesis_ms": 19848
+    },
+    {
+      "type": "direct_row_lookup",
+      "question": "Show me row 5",
+      "success": true,
+      "duration_ms": 21968.9,
+      "events_count": 4,
+      "complexity_route": "DIRECT",
+      "pipeline_branch": "direct",
+      "llm_calls": 1,
+      "planner_ms": 0,
+      "synthesis_ms": 21957
+    },
+    {
+      "type": "deterministic",
+      "question": "How many rows are in this dataset?",
+      "success": true,
+      "duration_ms": 12073.7,
+      "events_count": 4,
+      "complexity_route": "DIRECT",
+      "pipeline_branch": "direct",
+      "llm_calls": 1,
+      "planner_ms": 0,
+      "synthesis_ms": 12060
+    },
+    {
+      "type": "data_quality_guidance",
+      "question": "How can I improve this dataset?",
+      "success": true,
+      "duration_ms": 24325.6,
+      "events_count": 6,
+      "complexity_route": "STANDARD",
+      "pipeline_branch": "standard_quality",
+      "llm_calls": 1,
+      "planner_ms": 0,
+      "synthesis_ms": 0
+    },
+    {
+      "type": "lookup",
+      "question": "Find employee with highest PerformanceScore",
+      "success": true,
+      "duration_ms": 38123.3,
+      "events_count": 8,
+      "complexity_route": "DIRECT",
+      "pipeline_branch": "direct",
+      "llm_calls": 1,
+      "planner_ms": 22777,
+      "synthesis_ms": 0
+    },
+    {
+      "type": "aggregation",
+      "question": "What is the average Salary by Department?",
+      "success": true,
+      "duration_ms": 22584.9,
+      "events_count": 4,
+      "complexity_route": "DIRECT",
+      "pipeline_branch": "direct",
+      "llm_calls": 1,
+      "planner_ms": 0,
+      "synthesis_ms": 22059
+    },
+    {
+      "type": "comparison",
+      "question": "Compare Salary across Department",
+      "success": true,
+      "duration_ms": 34133.3,
+      "events_count": 9,
+      "complexity_route": "STANDARD",
+      "pipeline_branch": "standard",
+      "llm_calls": 1,
+      "planner_ms": 17574,
+      "synthesis_ms": 0
+    },
+    {
+      "type": "visualization",
+      "question": "Do a pie chart of employees by Department",
+      "success": true,
+      "duration_ms": 24314.4,
+      "events_count": 4,
+      "complexity_route": "STANDARD",
+      "pipeline_branch": "standard",
+      "llm_calls": 1,
+      "planner_ms": 0,
+      "synthesis_ms": 24258
+    },
+    {
+      "type": "modeling",
+      "question": "Predict PerformanceScore based on Salary",
+      "success": true,
+      "duration_ms": 47765.4,
+      "events_count": 9,
+      "complexity_route": "DEEP",
+      "pipeline_branch": "deep",
+      "llm_calls": 1,
+      "planner_ms": 22716,
+      "synthesis_ms": 0
+    }
+  ]
+}

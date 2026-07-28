@@ -1,9 +1,11 @@
-import { useState, useRef, useEffect, useCallback, useMemo } from 'react'
+import React, { Component, useState, useRef, useEffect, useCallback, useMemo } from 'react'
 import './App.css'
 import {
   Logo, Sparkles, FileIcon, Search, Send, Paperclip, Check, X,
   Rows, Columns, AlertDot, Activity, Layers, Code, ChartUp, Brain,
   DollarSign, HeartPulse, ShoppingCart, Megaphone, Users,
+  Zap, Terminal, Lock, Award, Eye, Download, FileText,
+  Sliders, SlidersHorizontal, TrendingUp,
 } from './icons.jsx'
 
 // In production VITE_API_BASE_URL points to the Railway backend.
@@ -166,13 +168,23 @@ const STEP_META = {
 
 // ─── Top Navigation ────────────────────────────────────────────────────────────
 
-function TopNav({ upload, category }) {
+function TopNav({ upload, category, leftPanelCollapsed, setLeftPanelCollapsed, rightPanelCollapsed, setRightPanelCollapsed }) {
   const cat = catByKey(category)
   return (
     <header className="topnav">
       <div className="nav-left">
+        {upload && (
+          <button
+            className={`panel-toggle-btn ${leftPanelCollapsed ? 'active' : ''}`}
+            title={leftPanelCollapsed ? "Expand Left Panel" : "Collapse Left Panel"}
+            onClick={() => setLeftPanelCollapsed?.(prev => !prev)}
+            style={{ marginRight: 8, padding: '4px 8px', fontSize: 11, cursor: 'pointer', borderRadius: 4, border: '1px solid var(--border-color, #CBD5E1)', background: 'var(--bg-subtle, #F8FAFC)' }}
+          >
+            {leftPanelCollapsed ? '▶ Schema' : '◀ Schema'}
+          </button>
+        )}
         <span className="brand-logo"><Logo width={20} height={20} /></span>
-        <span className="brand-name">CSV Analyst <span className="brand-ai">AI</span></span>
+        <span className="brand-name">Analytico <span className="brand-ai">AI</span></span>
       </div>
 
       <div className="nav-center">
@@ -193,6 +205,14 @@ function TopNav({ upload, category }) {
             <span className={`stat-pill ${upload.missing_pct > 0 ? 'warn' : 'ok'}`}>
               <AlertDot width={13} height={13} /> {upload.missing_pct}% <em>missing</em>
             </span>
+            <button
+              className={`panel-toggle-btn ${rightPanelCollapsed ? 'active' : ''}`}
+              title={rightPanelCollapsed ? "Expand Insights Panel" : "Collapse Insights Panel"}
+              onClick={() => setRightPanelCollapsed?.(prev => !prev)}
+              style={{ marginLeft: 8, padding: '4px 8px', fontSize: 11, cursor: 'pointer', borderRadius: 4, border: '1px solid var(--border-color, #CBD5E1)', background: 'var(--bg-subtle, #F8FAFC)' }}
+            >
+              {rightPanelCollapsed ? 'Insights ◀' : 'Insights ▶'}
+            </button>
           </div>
         ) : (
           <span className="nav-tag">Domain-aware data analysis</span>
@@ -239,12 +259,595 @@ function PasteModal({ uploading, onClose, onSubmit }) {
   )
 }
 
-function UploadScreen({ onUpload, uploading, setUploading, category, setCategory, onOpenPaste }) {
+
+function UrlImportModal({ uploading, onClose, onSubmit }) {
+  const [url, setUrl] = useState('')
+
+  return (
+    <div className="modal-overlay" onClick={() => !uploading && onClose()}>
+      <div className="modal" onClick={(e) => e.stopPropagation()}>
+        <div className="modal-head">
+          <div>
+            <h3>Import Google Sheets or Public CSV URL</h3>
+            <p>Paste a public Google Sheets sharing link or a direct CSV download URL.</p>
+          </div>
+          <button className="icon-btn" onClick={onClose}><X width={16} height={16} /></button>
+        </div>
+        <input
+          className="paste-row-input"
+          style={{ width: '100%', marginTop: '12px', padding: '10px 14px' }}
+          placeholder="https://docs.google.com/spreadsheets/d/1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgvE2upms/edit"
+          value={url}
+          onChange={(e) => setUrl(e.target.value)}
+          autoFocus
+        />
+        <div className="modal-foot">
+          <button className="paste-submit" onClick={() => onSubmit(url)} disabled={uploading || !url.trim()}>
+            {uploading ? <span className="spinner" /> : <>Import & Profile →</>}
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function JoinModal({ datasets, activeSessionId, onClose, onJoined }) {
+  const [session1, setSession1] = useState(activeSessionId || datasets[0]?.session_id)
+  const [session2, setSession2] = useState(datasets.find(d => d.session_id !== (activeSessionId || datasets[0]?.session_id))?.session_id || datasets[1]?.session_id)
+  const [candidates, setCandidates] = useState([])
+  const [key1, setKey1] = useState('')
+  const [key2, setKey2] = useState('')
+  const [how, setHow] = useState('inner')
+  const [loading, setLoading] = useState(false)
+  const [joining, setJoining] = useState(false)
+  const [error, setError] = useState(null)
+
+  const ds1 = datasets.find(d => d.session_id === session1)
+  const ds2 = datasets.find(d => d.session_id === session2)
+
+  useEffect(() => {
+    if (!session1 || !session2 || session1 === session2) return
+    let isMounted = true
+    setLoading(true)
+    setError(null)
+    const token = ds1?.token || ''
+    fetch(`${API}/infer_join`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Session-Token': token },
+      body: JSON.stringify({ session_id_1: session1, session_id_2: session2 }),
+    })
+      .then(res => res.json())
+      .then(data => {
+        if (!isMounted) return
+        if (data.candidates && data.candidates.length > 0) {
+          setCandidates(data.candidates)
+          setKey1(data.candidates[0].column_1)
+          setKey2(data.candidates[0].column_2)
+        } else {
+          setCandidates([])
+          if (ds1?.columns?.[0] && ds2?.columns?.[0]) {
+            setKey1(ds1.columns[0])
+            setKey2(ds2.columns[0])
+          }
+        }
+      })
+      .catch(e => { if (isMounted) setError(e.message) })
+      .finally(() => { if (isMounted) setLoading(false) })
+    return () => { isMounted = false }
+  }, [session1, session2])
+
+  const executeJoin = async () => {
+    if (!key1 || !key2) return
+    setJoining(true)
+    setError(null)
+    try {
+      const res = await fetch(`${API}/join`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Session-Token': ds1?.token || '' },
+        body: JSON.stringify({
+          session_id_1: session1,
+          session_id_2: session2,
+          join_key_1: key1,
+          join_key_2: key2,
+          how,
+        }),
+      })
+      const data = await res.json()
+      if (!res.ok) throw new Error(data.detail || 'Join execution failed')
+      onJoined({ ...data, uploadedAt: new Date() })
+      onClose()
+    } catch (e) {
+      setError(e.message)
+    } finally {
+      setJoining(false)
+    }
+  }
+
+  return (
+    <div className="modal-overlay" onClick={() => !joining && onClose()}>
+      <div className="modal" style={{ maxWidth: '640px' }} onClick={(e) => e.stopPropagation()}>
+        <div className="modal-head">
+          <div>
+            <h3>🔗 Multi-Table Relational Join</h3>
+            <p>Infer join keys and merge two datasets into a unified session.</p>
+          </div>
+          <button className="icon-btn" onClick={onClose} disabled={joining}><X width={16} height={16} /></button>
+        </div>
+
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px', margin: '16px 0' }}>
+          <div>
+            <label className="scenario-prompt" style={{ fontSize: '12px', fontWeight: 600 }}>Table 1 (Left)</label>
+            <select className="paste-row-input" value={session1} onChange={(e) => setSession1(e.target.value)}>
+              {datasets.map(d => <option key={d.session_id} value={d.session_id}>{d.filename}</option>)}
+            </select>
+          </div>
+          <div>
+            <label className="scenario-prompt" style={{ fontSize: '12px', fontWeight: 600 }}>Table 2 (Right)</label>
+            <select className="paste-row-input" value={session2} onChange={(e) => setSession2(e.target.value)}>
+              {datasets.map(d => <option key={d.session_id} value={d.session_id}>{d.filename}</option>)}
+            </select>
+          </div>
+        </div>
+
+        {loading ? (
+          <p className="predict-hint"><span className="spinner" /> Analyzing foreign key pairs & value overlaps…</p>
+        ) : (
+          <>
+            {candidates.length > 0 && (
+              <div style={{ background: 'var(--bg-card)', padding: '10px', borderRadius: '8px', marginBottom: '12px' }}>
+                <span style={{ fontSize: '12px', fontWeight: 600 }}>Suggested Join Key Candidate:</span>
+                <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap', marginTop: '6px' }}>
+                  {candidates.map((c, idx) => (
+                    <button
+                      key={idx}
+                      className={`stat-pill ${key1 === c.column_1 && key2 === c.column_2 ? 'ok' : ''}`}
+                      onClick={() => { setKey1(c.column_1); setKey2(c.column_2) }}
+                      style={{ cursor: 'pointer' }}
+                    >
+                      {c.column_1} = {c.column_2} ({c.confidence} overlap: {c.overlap_pct}%)
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 120px', gap: '10px' }}>
+              <label>
+                <span style={{ fontSize: '12px' }}>Left Key</span>
+                <select className="paste-row-input" value={key1} onChange={(e) => setKey1(e.target.value)}>
+                  {(ds1?.columns || []).map(c => <option key={c} value={c}>{c}</option>)}
+                </select>
+              </label>
+              <label>
+                <span style={{ fontSize: '12px' }}>Right Key</span>
+                <select className="paste-row-input" value={key2} onChange={(e) => setKey2(e.target.value)}>
+                  {(ds2?.columns || []).map(c => <option key={c} value={c}>{c}</option>)}
+                </select>
+              </label>
+              <label>
+                <span style={{ fontSize: '12px' }}>Join Type</span>
+                <select className="paste-row-input" value={how} onChange={(e) => setHow(e.target.value)}>
+                  <option value="inner">Inner</option>
+                  <option value="left">Left</option>
+                  <option value="right">Right</option>
+                  <option value="outer">Outer</option>
+                </select>
+              </label>
+            </div>
+          </>
+        )}
+
+        {error && <p style={{ color: '#EF4444', fontSize: '13px', marginTop: '10px' }}>{error}</p>}
+
+        <div className="modal-foot">
+          <button className="paste-submit" onClick={executeJoin} disabled={joining || !key1 || !key2 || session1 === session2}>
+            {joining ? <span className="spinner" /> : <>Execute Join →</>}
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function CompareModal({ datasets, activeSessionId, onClose }) {
+  const [session1, setSession1] = useState(activeSessionId || datasets[0]?.session_id)
+  const [session2, setSession2] = useState(datasets.find(d => d.session_id !== (activeSessionId || datasets[0]?.session_id))?.session_id || datasets[1]?.session_id)
+  const [loading, setLoading] = useState(false)
+  const [comparison, setComparison] = useState(null)
+  const [error, setError] = useState(null)
+
+  const ds1 = datasets.find(d => d.session_id === session1)
+
+  const runCompare = async () => {
+    if (!session1 || !session2 || session1 === session2) return
+    setLoading(true)
+    setError(null)
+    setComparison(null)
+    try {
+      const res = await fetch(`${API}/compare`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Session-Token': ds1?.token || '' },
+        body: JSON.stringify({ session_id_1: session1, session_id_2: session2 }),
+      })
+      const data = await res.json()
+      if (!res.ok) throw new Error(data.detail || 'Comparison failed')
+      setComparison(data)
+    } catch (e) {
+      setError(e.message)
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  useEffect(() => {
+    runCompare()
+  }, [session1, session2])
+
+  return (
+    <div className="modal-overlay" onClick={() => !loading && onClose()}>
+      <div className="modal" style={{ maxWidth: '720px' }} onClick={(e) => e.stopPropagation()}>
+        <div className="modal-head">
+          <div>
+            <h3>📊 Dataset Comparison & Distribution Drift</h3>
+            <p>Compare schema changes and statistical distribution shifts between versions.</p>
+          </div>
+          <button className="icon-btn" onClick={onClose} disabled={loading}><X width={16} height={16} /></button>
+        </div>
+
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px', margin: '16px 0' }}>
+          <div>
+            <label className="scenario-prompt" style={{ fontSize: '12px', fontWeight: 600 }}>Base Dataset (v1)</label>
+            <select className="paste-row-input" value={session1} onChange={(e) => setSession1(e.target.value)}>
+              {datasets.map(d => <option key={d.session_id} value={d.session_id}>{d.filename}</option>)}
+            </select>
+          </div>
+          <div>
+            <label className="scenario-prompt" style={{ fontSize: '12px', fontWeight: 600 }}>Target Dataset (v2)</label>
+            <select className="paste-row-input" value={session2} onChange={(e) => setSession2(e.target.value)}>
+              {datasets.map(d => <option key={d.session_id} value={d.session_id}>{d.filename}</option>)}
+            </select>
+          </div>
+        </div>
+
+        {loading && <p className="predict-hint"><span className="spinner" /> Computing schema diff and statistical distribution drift…</p>}
+        {error && <p style={{ color: '#EF4444', fontSize: '13px' }}>{error}</p>}
+
+        {comparison && (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '14px', maxHeight: '420px', overflowY: 'auto' }}>
+            <div className="stat-pill ok" style={{ padding: '8px 12px', fontSize: '13px' }}>
+              {comparison.summary}
+            </div>
+
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: '10px' }}>
+              <div className="stat-pill">Added Cols: <strong>{comparison.schema_changes.added_columns.join(', ') || 'None'}</strong></div>
+              <div className="stat-pill">Removed Cols: <strong>{comparison.schema_changes.removed_columns.join(', ') || 'None'}</strong></div>
+              <div className="stat-pill">Row Delta: <strong>{comparison.row_delta > 0 ? `+${comparison.row_delta}` : comparison.row_delta} ({comparison.row_pct_change}%)</strong></div>
+            </div>
+
+            {comparison.numeric_drift.length > 0 && (
+              <div>
+                <h4 style={{ margin: '8px 0', fontSize: '13px' }}>Numeric Distribution Drift Ranking</h4>
+                <table className="bm-table">
+                  <thead>
+                    <tr>
+                      <th>Column</th>
+                      <th>v1 Mean</th>
+                      <th>v2 Mean</th>
+                      <th>Shift %</th>
+                      <th>Drift Level</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {comparison.numeric_drift.map(d => (
+                      <tr key={d.column}>
+                        <td><strong>{d.column}</strong></td>
+                        <td>{d.v1_mean}</td>
+                        <td>{d.v2_mean}</td>
+                        <td>{d.pct_shift}%</td>
+                        <td>
+                          <span className={`stat-pill ${d.drift_level === 'Significant' ? 'warn' : d.drift_level === 'Moderate' ? '' : 'ok'}`}>
+                            {d.drift_level}
+                          </span>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
+
+function ExcelDataViewerModal({ upload, onClose }) {
+  const [page, setPage] = useState(1)
+  const [pageSize, setPageSize] = useState(50)
+  const [search, setSearch] = useState('')
+  const [sortCol, setSortCol] = useState('')
+  const [sortDir, setSortDir] = useState('asc')
+  const [selectedCell, setSelectedCell] = useState(null)
+  const [data, setData] = useState(null)
+  const [loading, setLoading] = useState(true)
+
+  const fetchData = useCallback(async () => {
+    if (!upload) return
+    setLoading(true)
+    let fetched = null
+
+    if (upload.session_id) {
+      try {
+        const q = new URLSearchParams({
+          page: String(page),
+          page_size: String(pageSize),
+          search: search.trim(),
+          sort_col: sortCol,
+          sort_dir: sortDir,
+        })
+        if (upload.token) q.set('token', upload.token)
+
+        const headers = {}
+        if (upload.token) headers['X-Session-Token'] = upload.token
+
+        const res = await fetch(`${API}/dataset_rows/${upload.session_id}?${q}`, { headers })
+        if (res.ok) {
+          fetched = await res.json()
+        }
+      } catch (e) {
+        console.warn('Dataset rows endpoint fallback:', e)
+      }
+    }
+
+    // Fallback: build from upload object (preview or sample rows) so data ALWAYS renders
+    if (!fetched || !fetched.rows || fetched.rows.length === 0) {
+      const rawCols = upload.columns || []
+      const rawRows = upload.preview || upload.sample_rows || []
+      const totalCount = upload.rows || rawRows.length
+      
+      let filteredRows = rawRows
+      if (search.trim()) {
+        const qStr = search.toLowerCase().trim()
+        filteredRows = rawRows.filter(r => Object.values(r || {}).some(v => String(v ?? '').toLowerCase().includes(qStr)))
+      }
+
+      if (sortCol && rawCols.includes(sortCol)) {
+        filteredRows = [...filteredRows].sort((a, b) => {
+          const valA = a[sortCol]
+          const valB = b[sortCol]
+          if (valA == null) return 1
+          if (valB == null) return -1
+          if (typeof valA === 'number' && typeof valB === 'number') {
+            return sortDir === 'asc' ? valA - valB : valB - valA
+          }
+          return sortDir === 'asc' 
+            ? String(valA).localeCompare(String(valB)) 
+            : String(valB).localeCompare(String(valA))
+        })
+      }
+
+      const pSize = pageSize > 0 ? pageSize : filteredRows.length
+      const start = (page - 1) * pSize
+      const end = start + pSize
+      const sliced = filteredRows.slice(start, end)
+
+      const colDtypes = {}
+      rawCols.forEach(c => {
+        const sampleVal = rawRows.find(r => r[c] != null)?.[c]
+        colDtypes[c] = typeof sampleVal === 'number' ? (Number.isInteger(sampleVal) ? 'int64' : 'float64') : 'object'
+      })
+
+      fetched = {
+        session_id: upload.session_id || 'local',
+        total_rows: totalCount,
+        filtered_count: filteredRows.length,
+        page: page,
+        page_size: pageSize,
+        total_pages: Math.max(1, Math.ceil(filteredRows.length / (pSize || 1))),
+        columns: rawCols,
+        dtypes: colDtypes,
+        row_indices: sliced.map((_, i) => start + i + 1),
+        rows: sliced,
+      }
+    }
+
+    setData(fetched)
+    setLoading(false)
+  }, [upload, page, pageSize, search, sortCol, sortDir])
+
+  useEffect(() => {
+    fetchData()
+  }, [fetchData])
+
+  const handleSort = (col) => {
+    if (sortCol === col) {
+      setSortDir((prev) => (prev === 'asc' ? 'desc' : 'asc'))
+    } else {
+      setSortCol(col)
+      setSortDir('asc')
+    }
+  }
+
+  const exportCsv = () => {
+    if (!data?.rows || !data?.columns) return
+    const headers = data.columns.join(',')
+    const rowsText = data.rows.map(r => data.columns.map(c => JSON.stringify(r[c] ?? '')).join(',')).join('\n')
+    const blob = new Blob([`${headers}\n${rowsText}`], { type: 'text/csv' })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = `${upload.filename || 'dataset'}_view.csv`
+    a.click()
+  }
+
+  const getColLetter = (idx) => {
+    let letter = ''
+    let n = idx
+    while (n >= 0) {
+      letter = String.fromCharCode((n % 26) + 65) + letter
+      n = Math.floor(n / 26) - 1
+    }
+    return letter
+  }
+
+  return (
+    <div className="modal-overlay excel-modal-overlay" onClick={onClose}>
+      <div className="modal excel-viewer-modal" onClick={(e) => e.stopPropagation()}>
+        {/* Header */}
+        <div className="excel-header">
+          <div className="excel-title-group">
+            <div className="excel-icon-box"><Rows width={18} height={18} /></div>
+            <div>
+              <h3>Spreadsheet Data Viewer — {upload.filename}</h3>
+              <p>{upload.rows ? upload.rows.toLocaleString() : (data?.total_rows || 0)} total rows · {upload.columns?.length || 0} columns · Full File Inspection</p>
+            </div>
+          </div>
+
+          <div className="excel-actions">
+            <button className="btn-secondary-action" onClick={exportCsv}>
+              <Download width={14} height={14} /> Download CSV
+            </button>
+            <button className="icon-btn" onClick={onClose} title="Close (Esc)"><X width={18} height={18} /></button>
+          </div>
+        </div>
+
+        {/* Excel Formula & Filter Bar */}
+        <div className="excel-toolbar">
+          <div className="excel-search-box">
+            <Search width={14} height={14} />
+            <input
+              placeholder="Filter values across all rows & columns..."
+              value={search}
+              onChange={(e) => { setSearch(e.target.value); setPage(1); }}
+            />
+          </div>
+
+          <div className="excel-formula-box">
+            <span className="cell-ref-label">{selectedCell ? `${selectedCell.colLetter}${selectedCell.rowIndex}` : 'fx'}</span>
+            <input
+              readOnly
+              className="cell-value-input"
+              value={selectedCell ? `${selectedCell.colName} = ${selectedCell.value}` : 'Click any cell to inspect or copy value'}
+            />
+          </div>
+
+          <div className="excel-page-size">
+            <span>Show:</span>
+            <select value={pageSize} onChange={(e) => { setPageSize(Number(e.target.value)); setPage(1); }}>
+              <option value={50}>50 rows</option>
+              <option value={100}>100 rows</option>
+              <option value={250}>250 rows</option>
+              <option value={1000}>1,000 max</option>
+              <option value={0}>All Rows ({upload.rows || data?.total_rows || 'All'})</option>
+            </select>
+          </div>
+        </div>
+
+        {/* Grid Table */}
+        <div className="excel-table-container">
+          {loading ? (
+            <div className="excel-loading">
+              <span className="spinner big" style={{ borderTopColor: '#107C41', borderColor: 'rgba(16,124,65,0.2)' }} />
+              <span>Loading spreadsheet data...</span>
+            </div>
+          ) : (
+            <table className="excel-table">
+              <thead>
+                <tr className="excel-col-letters-row">
+                  <th className="excel-corner-hdr">#</th>
+                  {data?.columns.map((col, idx) => (
+                    <th key={idx} className="excel-col-letter">{getColLetter(idx)}</th>
+                  ))}
+                </tr>
+                <tr className="excel-col-names-row">
+                  <th className="excel-row-num-hdr">Row</th>
+                  {data?.columns.map((col) => (
+                    <th key={col} className="excel-col-hdr" onClick={() => handleSort(col)}>
+                      <div className="col-hdr-content">
+                        <span>{col}</span>
+                        <em className="col-type-tag">{data.dtypes?.[col] || ''}</em>
+                        {sortCol === col && <span className="sort-arrow">{sortDir === 'asc' ? '▲' : '▼'}</span>}
+                      </div>
+                    </th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {data?.rows.length === 0 ? (
+                  <tr>
+                    <td colSpan={(data?.columns.length || 0) + 1} className="excel-empty-td">
+                      No matching records found for "{search}".
+                    </td>
+                  </tr>
+                ) : (
+                  data?.rows.map((row, rIdx) => {
+                    const actualRowIndex = data.row_indices?.[rIdx] || (page - 1) * pageSize + rIdx + 1
+                    return (
+                      <tr key={rIdx}>
+                        <td className="excel-row-num">{actualRowIndex}</td>
+                        {data.columns.map((col, cIdx) => {
+                          const val = row[col]
+                          const valStr = val == null ? '—' : String(val)
+                          const isSelected = selectedCell?.rowIndex === actualRowIndex && selectedCell?.colName === col
+                          return (
+                            <td
+                              key={col}
+                              className={`excel-cell ${isSelected ? 'selected' : ''}`}
+                              onClick={() => setSelectedCell({
+                                rowIndex: actualRowIndex,
+                                colName: col,
+                                colLetter: getColLetter(cIdx),
+                                value: valStr
+                              })}
+                            >
+                              {valStr}
+                            </td>
+                          )
+                        })}
+                      </tr>
+                    )
+                  })
+                )}
+              </tbody>
+            </table>
+          )}
+        </div>
+
+        {/* Footer Status Bar */}
+        <div className="excel-footer">
+          <div className="excel-footer-info">
+            <span>Ready</span>
+            <span>Rows: <strong>{data?.filtered_count?.toLocaleString() || 0}</strong> of <strong>{data?.total_rows?.toLocaleString() || 0}</strong></span>
+            <span>Columns: <strong>{data?.columns?.length || 0}</strong></span>
+          </div>
+
+          <div className="excel-pagination">
+            <button disabled={page <= 1} onClick={() => setPage(1)}>|&lt;</button>
+            <button disabled={page <= 1} onClick={() => setPage(p => p - 1)}>&lt; Prev</button>
+            <span className="page-indicator">Page <strong>{page}</strong> of <strong>{data?.total_pages || 1}</strong></span>
+            <button disabled={page >= (data?.total_pages || 1)} onClick={() => setPage(p => p + 1)}>Next &gt;</button>
+            <button disabled={page >= (data?.total_pages || 1)} onClick={() => setPage(data?.total_pages || 1)}>&gt;|</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function UploadScreen({ onUpload, uploading, setUploading, category, setCategory, onOpenPaste, onOpenUrlImport }) {
   const [dragging, setDragging] = useState(false)
   const inputRef = useRef()
 
   const handleFile = useCallback(async (file) => {
-    if (!file || !file.name.endsWith('.csv')) return
+    if (!file) return
+    // Accept case-insensitively so .CSV, .XLSX, etc. are not rejected
+    const ext = file.name.split('.').pop()?.toLowerCase() || ''
+    const ACCEPTED_EXTS = ['csv', 'xlsx', 'xls', 'parquet', 'json', 'jsonl']
+    if (!ACCEPTED_EXTS.includes(ext)) {
+      alert(`Unsupported file type: .${ext}\nAccepted: .csv, .xlsx, .xls, .parquet, .json, .jsonl`)
+      return
+    }
     setUploading(true)
     const fd = new FormData()
     fd.append('file', file)
@@ -252,7 +855,7 @@ function UploadScreen({ onUpload, uploading, setUploading, category, setCategory
       const res = await fetch(`${API}/upload`, { method: 'POST', body: fd })
       const data = await res.json()
       if (!res.ok) throw new Error(data.detail || 'Upload failed')
-      onUpload({ ...data, uploadedAt: new Date() })
+      onUpload(data)
     } catch (e) {
       alert(e.message)
     } finally {
@@ -262,50 +865,125 @@ function UploadScreen({ onUpload, uploading, setUploading, category, setCategory
 
   return (
     <div className="upload-screen">
-      <div className="upload-hero">
-        <div className="hero-badge"><Sparkles width={14} height={14} /> Domain-aware AI Data Analyst</div>
+      {/* ── Centered Full-Width Hero Title Section ────────────────────── */}
+      <div className="hero-center-header">
         <h1 className="hero-title">Analysis tuned to your domain</h1>
         <p className="hero-sub">
-          Pick an analysis lens, upload a CSV, and ask in plain English. The agent reasons like a
-          domain expert — financial, medical, retail and more — not a generic chatbot.
+          Pick an analysis lens, upload a CSV, and ask in plain English. The multi-agent pipeline reasons like a domain expert — financial, medical, retail, marketing, or HR — not a generic chatbot.
         </p>
-      </div>
 
-      <div className="category-picker">
-        <div className="cp-label">1 · Choose an analysis lens</div>
-        <div className="category-grid">
-          {CATEGORIES.map((c) => (
-            <button
-              key={c.key}
-              className={`category-card ${category === c.key ? 'active' : ''}`}
-              onClick={() => setCategory(c.key)}
-            >
-              <span className="cc-icon"><c.icon width={18} height={18} /></span>
-              <span className="cc-label">{c.label}</span>
-              <span className="cc-blurb">{c.blurb}</span>
-            </button>
-          ))}
+        <div className="hero-highlights">
+          <span className="hh-pill"><Zap width={12} height={12} /> Multi-Agent Pipeline</span>
+          <span className="hh-pill"><Lock width={12} height={12} /> AST Sandboxed Python</span>
+          <span className="hh-pill"><Check width={12} height={12} /> Evidence-Backed Answers</span>
         </div>
       </div>
 
-      <div className="upload-step">
-        <div className="cp-label">2 · Upload your dataset</div>
-        <div
-          className={`dropzone ${dragging ? 'drag-over' : ''} ${uploading ? 'uploading' : ''}`}
-          onClick={() => !uploading && inputRef.current.click()}
-          onDragOver={(e) => { e.preventDefault(); setDragging(true) }}
-          onDragLeave={() => setDragging(false)}
-          onDrop={(e) => { e.preventDefault(); setDragging(false); handleFile(e.dataTransfer.files[0]) }}
-        >
-          <input ref={inputRef} type="file" accept=".csv,.xlsx,.xls,.parquet,.json,.jsonl" hidden onChange={(e) => handleFile(e.target.files[0])} />
-          <div className="dropzone-icon">{uploading ? <span className="spinner big" /> : <FileIcon width={26} height={26} />}</div>
-          <p className="dropzone-title">{uploading ? 'Analyzing your dataset…' : 'Drop a CSV, Excel, Parquet, or JSON file here'}</p>
-          <p className="dropzone-sub">{uploading ? 'Building data profile' : 'or click to browse · .csv, .xlsx, .parquet, .json up to 25MB'}</p>
+      {/* ── 2-Column Split: Lens Grid + Offset Upload Card ──────────────── */}
+      <div className="upload-hero-layout">
+        {/* Left Column: Lens Selector */}
+        <div className="hero-left-col">
+          <div className="category-picker-left">
+            <div className="cp-label">1 · Select an analysis lens</div>
+            <div className="category-grid-left">
+              {CATEGORIES.map((c) => (
+                <button
+                  key={c.key}
+                  className={`category-card ${category === c.key ? 'active' : ''}`}
+                  onClick={() => setCategory(c.key)}
+                >
+                  <span className="cc-icon"><c.icon width={22} height={22} /></span>
+                  <div className="cc-text-group">
+                    <span className="cc-label">{c.label}</span>
+                    <span className="cc-blurb">{c.blurb}</span>
+                  </div>
+                </button>
+              ))}
+            </div>
+          </div>
         </div>
-        <div className="paste-divider"><span>or</span></div>
-        <button className="paste-trigger" onClick={onOpenPaste} disabled={uploading}>
-          <Code width={15} height={15} /> Paste data / rows instead
-        </button>
+
+        {/* Right Column: Upload Target Card with Background Image Artwork */}
+        <div className="hero-right-col">
+          <div className="upload-card-wrapper">
+            <div className="upload-artwork-banner" style={{ backgroundImage: `url(/background.jpg)` }}>
+              <div className="artwork-overlay" />
+              <div className="artwork-badge"><ChartUp width={14} height={14} /> 3D Data Engine</div>
+            </div>
+
+            <div className="upload-step-inner">
+              <div className="cp-label">2 · Upload your dataset</div>
+              <div
+                className={`dropzone ${dragging ? 'drag-over' : ''} ${uploading ? 'uploading' : ''}`}
+                onClick={() => !uploading && inputRef.current.click()}
+                onDragOver={(e) => { e.preventDefault(); setDragging(true) }}
+                onDragLeave={() => setDragging(false)}
+                onDrop={(e) => { e.preventDefault(); setDragging(false); handleFile(e.dataTransfer.files[0]) }}
+              >
+                <input ref={inputRef} type="file" accept=".csv,.xlsx,.xls,.parquet,.json,.jsonl" hidden onChange={(e) => handleFile(e.target.files[0])} />
+                <div className="dropzone-icon">{uploading ? <span className="spinner big" /> : <FileIcon width={24} height={24} />}</div>
+                <p className="dropzone-title">{uploading ? 'Analyzing your dataset…' : 'Drop CSV, Excel, Parquet, or JSON file'}</p>
+                <p className="dropzone-sub">{uploading ? 'Building data profile & overview' : 'or click to browse · .csv, .xlsx, .parquet up to 25MB'}</p>
+              </div>
+
+              <div className="paste-divider"><span>or alternative inputs</span></div>
+              
+              <div className="upload-action-row">
+                <button className="paste-trigger" onClick={onOpenPaste} disabled={uploading}>
+                  <Code width={14} height={14} /> Paste rows
+                </button>
+                <button className="paste-trigger" onClick={onOpenUrlImport} disabled={uploading}>
+                  <Sparkles width={14} height={14} /> Import Sheet / URL
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* ── Scrollable Showcase Section ───────────────────────────────────── */}
+      <div className="upload-showcase-section">
+        <div className="showcase-banner" style={{ backgroundImage: `linear-gradient(180deg, rgba(9,9,11,0.85) 0%, rgba(9,9,11,0.96) 100%), url(/piqsels.com-id-jrreu.jpg)` }}>
+          <div className="sb-content">
+            <h2 className="sb-title">Deterministic precision & domain-aware intelligence</h2>
+            <p className="sb-sub">Combining LLM intent mapping, AST-sandboxed execution, and self-auditing critic agents.</p>
+          </div>
+
+          <div className="sb-stats-right">
+            <div className="sb-stat-box">
+              <span className="sb-stat-num">100%</span>
+              <span className="sb-stat-lbl">Deterministic Python</span>
+            </div>
+            <div className="sb-stat-box">
+              <span className="sb-stat-num">&lt;30s</span>
+              <span className="sb-stat-lbl">Execution Timeout</span>
+            </div>
+            <div className="sb-stat-box">
+              <span className="sb-stat-num">0%</span>
+              <span className="sb-stat-lbl">Hallucination Audit</span>
+            </div>
+          </div>
+        </div>
+
+        <div className="showcase-grid">
+          <div className="showcase-card">
+            <div className="sc-icon"><Layers width={20} height={20} /></div>
+            <h3>Domain Lenses</h3>
+            <p>Tailors computations, group comparisons, and key performance ratios to your specific domain (financial margins, clinical cohorts, retail conversions, HR tenure).</p>
+          </div>
+
+          <div className="showcase-card">
+            <div className="sc-icon"><Terminal width={20} height={20} /></div>
+            <h3>AST Sandboxed Python</h3>
+            <p>Generated code is parsed via AST pre-scanners, executed under restricted builtins with 30s hard wall-clock timeouts to prevent memory or execution abuse.</p>
+          </div>
+
+          <div className="showcase-card">
+            <div className="sc-icon"><Eye width={20} height={20} /></div>
+            <h3>Self-Auditing Critic Agent</h3>
+            <p>Every analysis step is cross-checked by an independent critic agent before presentation to flag domain mismatches and preserve 100% data trust.</p>
+          </div>
+        </div>
       </div>
     </div>
   )
@@ -328,7 +1006,7 @@ function DocUploadPanel({ sessionId, docs, onDocsUpdated }) {
     const fd = new FormData()
     fd.append('file', file)
     try {
-      const res = await fetch(`${API}/upload_doc?session_id=${sessionId}`, { method: 'POST', body: fd })
+      const res = await fetch(`${API}/upload_doc?session_id=${sessionId}`, { method: 'POST', headers: { 'X-Session-Token': upload?.token || '' }, body: fd })
       const data = await res.json()
       if (!res.ok) throw new Error(data.detail || 'Upload failed')
       onDocsUpdated(data.filenames)
@@ -362,7 +1040,7 @@ function DocUploadPanel({ sessionId, docs, onDocsUpdated }) {
   )
 }
 
-function Sidebar({ upload, category, setCategory, onReset, docs, onDocsUpdated }) {
+function Sidebar({ upload, category, setCategory, onReset, docs, onDocsUpdated, datasets, onSelectDataset, onOpenAddDataset, onOpenJoin, onOpenCompare, onOpenDataViewer, style }) {
   const [q, setQ] = useState('')
   const filtered = useMemo(
     () => upload.columns.filter((c) => c.toLowerCase().includes(q.toLowerCase())),
@@ -381,20 +1059,20 @@ function Sidebar({ upload, category, setCategory, onReset, docs, onDocsUpdated }
   }
 
   return (
-    <aside className="sidebar">
-      <div className="dataset-card">
+    <aside className="sidebar" style={style}>
+      <div className="dataset-card dataset-card-interactive" onClick={onOpenDataViewer} title="Click to open Excel Spreadsheet Viewer">
         <div className="dataset-card-top">
           <span className="ds-icon"><FileIcon width={18} height={18} /></span>
           <div className="ds-info">
             <div className="ds-name">{upload.filename}</div>
             <div className="ds-meta">{upload.rows.toLocaleString()} rows · {upload.columns.length} columns</div>
           </div>
-          <button className="icon-btn" onClick={onReset} title="Change file"><X width={15} height={15} /></button>
+          <button className="icon-btn" onClick={(e) => { e.stopPropagation(); onReset() }} title="Change file"><X width={15} height={15} /></button>
         </div>
         <div className="ds-tags">
           <span className="ds-tag">{upload.numeric_features} numeric</span>
           <span className="ds-tag">{upload.columns.length - upload.numeric_features} categorical</span>
-          {ts && <span className="ds-tag muted">Uploaded {ts}</span>}
+          <span className="ds-tag excel-viewer-tag">📊 Open Excel Viewer →</span>
         </div>
       </div>
 
@@ -451,13 +1129,42 @@ function Sidebar({ upload, category, setCategory, onReset, docs, onDocsUpdated }
           </table>
         </div>
       </div>
+    
+      {datasets && datasets.length > 0 && (
+        <div className="panel-section">
+          <div className="panel-head">Datasets ({datasets.length})</div>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
+            {datasets.map(d => (
+              <button
+                key={d.session_id}
+                className={`stat-pill ${d.session_id === upload.session_id ? 'ok' : ''}`}
+                style={{ cursor: 'pointer', textAlign: 'left', justifyContent: 'space-between' }}
+                onClick={() => onSelectDataset(d)}
+              >
+                <span>{d.filename}</span>
+                <em>{d.rows}r</em>
+              </button>
+            ))}
+            <div style={{ display: 'flex', gap: '6px', marginTop: '6px' }}>
+              <button className="doc-upload-btn" style={{ flex: 1 }} onClick={onOpenAddDataset}>+ Add file</button>
+              {datasets.length >= 2 && (
+                <>
+                  <button className="doc-upload-btn" style={{ flex: 1 }} onClick={onOpenJoin}>🔗 Join</button>
+                  <button className="doc-upload-btn" style={{ flex: 1 }} onClick={onOpenCompare}>📊 Compare</button>
+                </>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
     </aside>
   )
 }
 
 // ─── Insights Panel ────────────────────────────────────────────────────────────
 
-export function PredictInputCard({ sessionId, modelInfo }) {
+export function PredictInputCard({ sessionId, modelInfo, upload }) {
   const features = modelInfo.features
   const [values, setValues] = useState(() =>
     Object.fromEntries(features.map((f) => [f.name, f.default ?? ''])))
@@ -481,7 +1188,7 @@ export function PredictInputCard({ sessionId, modelInfo }) {
     try {
       const res = await fetch(`${API}/predict_input`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', 'X-Session-Token': upload?.token || '' },
         body: JSON.stringify({ session_id: sessionId, values }),
       })
       const data = await res.json()
@@ -533,7 +1240,7 @@ export function PredictInputCard({ sessionId, modelInfo }) {
   )
 }
 
-export function ScenarioSimulatorCard({ sessionId, modelInfo, category }) {
+export function ScenarioSimulatorCard({ sessionId, modelInfo, category, upload }) {
   const features = modelInfo.features
   const firstNumeric = features.find((f) => f.type === 'number')?.name || features[0]?.name || ''
   const [feature, setFeature] = useState(firstNumeric)
@@ -561,7 +1268,7 @@ export function ScenarioSimulatorCard({ sessionId, modelInfo, category }) {
     try {
       const res = await fetch(`${API}/scenario_parse`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', 'X-Session-Token': upload?.token || '' },
         body: JSON.stringify({ session_id: sessionId, prompt: text, category }),
       })
       const data = await res.json()
@@ -588,7 +1295,7 @@ export function ScenarioSimulatorCard({ sessionId, modelInfo, category }) {
     try {
       const res = await fetch(`${API}/simulate`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', 'X-Session-Token': upload?.token || '' },
         body: JSON.stringify({
           session_id: sessionId,
           category,
@@ -688,7 +1395,7 @@ function BenchmarkModal({ sessionId, onClose }) {
   const run = async () => {
     setRunning(true); setData(null); setError(null)
     try {
-      const res = await fetch(`${API}/benchmark/${sessionId}?n=${n}`)
+      const res = await fetch(`${API}/benchmark/${sessionId}?n=${n}`, { headers: { 'X-Session-Token': upload?.token || '' } })
       const json = await res.json()
       if (!res.ok) throw new Error(json.detail || 'Benchmark failed')
       setData(json)
@@ -773,36 +1480,66 @@ function BenchmarkModal({ sessionId, onClose }) {
   )
 }
 
-function ExportCard({ upload, messages, category }) {
+export function ExportCard({
+  upload = {},
+  messages = [],
+  category = 'general',
+  items = [],
+  formats = [],
+  files = [],
+  exportResult = null,
+  status = 'idle',
+  onExport,
+  dashboardBlueprint = null,
+}) {
   const [busy, setBusy] = useState(null) // 'pdf' | 'pptx' | null
+
+  const safeMessages = Array.isArray(messages) ? messages : []
+  const safeItems = Array.isArray(items) ? items : []
+  const safeFormats = Array.isArray(formats) ? formats : []
+  const safeFiles = Array.isArray(files) ? files : []
+  const safeKpis = Array.isArray(dashboardBlueprint?.kpis) ? dashboardBlueprint.kpis : []
+  const safeCharts = Array.isArray(dashboardBlueprint?.charts) ? dashboardBlueprint.charts : []
+  const safeFilters = Array.isArray(dashboardBlueprint?.filters) ? dashboardBlueprint.filters : []
+
+  console.debug("[ExportCard] props", {
+    upload,
+    messagesCount: safeMessages.length,
+    itemsCount: safeItems.length,
+    formatsCount: safeFormats.length,
+    status,
+    exportResult,
+  })
 
   const exportReport = async (format) => {
     setBusy(format)
     try {
+      const filename = String(upload?.filename || 'dataset.csv').replace('.csv', '')
       const body = {
-        messages: messages.map(m => ({
-          question:  m.question,
-          report:    m.report,
-          result:    m.result,
-          chart:     m.chart,
-          chart_json: m.chart_json,
-          shap_chart: m.shap_chart,
-          critique:  m.critique,
-          validation: m.validation,
-          code:      m.code,
-          code_lang: m.code_lang,
+        messages: safeMessages.map(m => ({
+          question:  m?.question,
+          report:    m?.report,
+          result:    m?.result,
+          chart:     m?.chart,
+          chart_json: m?.chart_json,
+          shap_chart: m?.shap_chart,
+          critique:  m?.critique,
+          validation: m?.validation,
+          code:      m?.code,
+          code_lang: m?.code_lang,
         })),
         category,
-        filename: upload.filename.replace('.csv', ''),
+        filename,
       }
-      const res = await fetch(`${API}/report/${upload.session_id}?format=${format}`, {
+      const sessionId = upload?.session_id || 'default'
+      const res = await fetch(`${API}/report/${sessionId}?format=${format}`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', 'X-Session-Token': upload?.token || '' },
         body: JSON.stringify(body),
       })
-      if (!res.ok) { const e = await res.json(); throw new Error(e.detail || 'Export failed') }
+      if (!res.ok) { const e = await res.json(); throw new Error(e?.detail || 'Export failed') }
       const payload = await res.json()
-      downloadBase64Payload(payload, `${upload.filename.replace('.csv', '')}_report.${format}`)
+      downloadBase64Payload(payload, `${filename}_report.${format}`)
     } catch (e) {
       alert(e.message)
     } finally {
@@ -810,19 +1547,35 @@ function ExportCard({ upload, messages, category }) {
     }
   }
 
+  const isGenerating = status === 'generating' || !!busy
+
   return (
     <div className="insight-card export-card">
       <div className="ic-head">📄 Export Report</div>
       <p className="predict-hint">Download the full analytics report with all charts, summaries, and insights.</p>
       <div className="export-btns">
-        <button className="export-btn pdf" onClick={() => exportReport('pdf')} disabled={!!busy || messages.length === 0}>
-          {busy === 'pdf' ? <span className="spinner" style={{borderTopColor:'#EF4444',borderColor:'#FECACA'}} /> : '⬇ PDF'}
+        <button
+          type="button"
+          className="export-btn pdf"
+          onClick={() => (onExport ? onExport('pdf') : exportReport('pdf'))}
+          disabled={isGenerating || safeMessages.length === 0}
+        >
+          {busy === 'pdf' ? <span className="spinner" style={{ borderTopColor: '#EF4444', borderColor: '#FECACA' }} /> : '⬇ PDF'}
         </button>
-        <button className="export-btn pptx" onClick={() => exportReport('pptx')} disabled={!!busy || messages.length === 0}>
-          {busy === 'pptx' ? <span className="spinner" style={{borderTopColor:'#F59E0B',borderColor:'#FDE68A'}} /> : '⬇ PPTX'}
+        <button
+          type="button"
+          className="export-btn pptx"
+          onClick={() => (onExport ? onExport('pptx') : exportReport('pptx'))}
+          disabled={isGenerating || safeMessages.length === 0}
+        >
+          {busy === 'pptx' ? <span className="spinner" style={{ borderTopColor: '#F59E0B', borderColor: '#FDE68A' }} /> : '⬇ PPTX'}
         </button>
       </div>
-      {messages.length === 0 && <p className="predict-hint" style={{marginTop:4}}>Ask a question first to generate content for the report.</p>}
+      {safeMessages.length === 0 && (
+        <p className="predict-hint" style={{ marginTop: 4 }}>
+          Export options will appear here when the dataset analysis is ready. Ask a question first to generate content for the report.
+        </p>
+      )}
     </div>
   )
 }
@@ -848,7 +1601,7 @@ export function TimeSeriesForecastCard({ sessionId, upload }) {
     try {
       const res = await fetch(`${API}/forecast`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', 'X-Session-Token': upload?.token || '' },
         body: JSON.stringify({ session_id: sessionId, date_column: dateCol, target_column: targetCol, periods }),
       })
       const data = await res.json()
@@ -903,283 +1656,688 @@ export function TimeSeriesForecastCard({ sessionId, upload }) {
   )
 }
 
-function InsightsPanel({ upload, category, onAsk, onStory, onInvestigate, onPredict, onOpenPaste, onOpenBenchmark, onCleanExport, onExportContract, onExportDashboard, cleaningBusy, modelInfo, loading, messages }) {
-  const cat = catByKey(category)
-  const numericCols = Object.keys(upload.numeric_stats || {})
+// ─── Dataset Insights Error Boundary & Helpers ─────────────────────────────────
+
+export class InsightsErrorBoundary extends React.Component {
+  constructor(props) {
+    super(props)
+    this.state = { hasError: false, error: null }
+  }
+
+  static getDerivedStateFromError(error) {
+    return { hasError: true, error }
+  }
+
+  componentDidCatch(error, info) {
+    console.error("[DatasetInsights] render error", {
+      error,
+      componentStack: info?.componentStack,
+    })
+  }
+
+  render() {
+    if (this.state.hasError) {
+      return (
+        <section role="alert" className="insights-panel-error" style={{ padding: '16px', background: '#FEF2F2', border: '1px solid #FCA5A5', borderRadius: '8px', margin: '12px' }}>
+          <strong style={{ display: 'block', fontSize: '14px', color: '#991B1B', marginBottom: '4px' }}>Dataset Insights could not be displayed</strong>
+          <p style={{ margin: '0 0 12px', fontSize: '12px', color: '#7F1D1D' }}>The rest of the workspace is still available.</p>
+          <button
+            type="button"
+            style={{ padding: '4px 10px', fontSize: '12px', borderRadius: '4px', border: '1px solid #DC2626', background: '#FFFFFF', color: '#DC2626', cursor: 'pointer' }}
+            onClick={() => this.setState({ hasError: false, error: null })}
+          >
+            Try again
+          </button>
+        </section>
+      )
+    }
+
+    return this.props.children
+  }
+}
+
+export const InsightsPanelErrorBoundary = InsightsErrorBoundary
+
+export function formatNumber(value, digits = 1) {
+  if (value == null || value === '') return "Not available"
+  const number = Number(value)
+  if (!Number.isFinite(number)) {
+    return "Not available"
+  }
+  return number.toFixed(digits)
+}
+
+function InsightsTabPanel({ active, tabId, children }) {
+  if (!active) return null
+  return (
+    <section
+      role="tabpanel"
+      id={`panel-${tabId}`}
+      aria-labelledby={`tab-${tabId}`}
+      tabIndex={0}
+      className="tab-content-panel"
+    >
+      {children}
+    </section>
+  )
+}
+
+const TAB_CONFIG = [
+  { id: 'overview', label: 'Overview' },
+  { id: 'quality', label: 'Data Quality' },
+  { id: 'analyze', label: 'Analyze & Model' },
+  { id: 'export', label: 'Export & Build' },
+]
+
+export function DatasetInsightsPanel({ upload, category, onAsk, onStory, onInvestigate, onPredict, onOpenPaste, onOpenBenchmark, onCleanExport, onExportContract, onExportDashboard, cleaningBusy, modelInfo, loading, messages, datasets, onSelectDataset, onOpenAddDataset, onOpenJoin, onOpenCompare, style }) {
+  const columns = Array.isArray(upload?.columns) ? upload.columns : []
+  const numericCols = Object.keys(upload?.numeric_stats ?? {})
   const [statCol, setStatCol] = useState(numericCols[0] || '')
-  const stats = upload.numeric_stats?.[statCol]
-  // default the prediction target to the last column (commonly the outcome/target)
-  const [target, setTarget] = useState(upload.columns[upload.columns.length - 1] || '')
+  const stats = upload?.numeric_stats?.[statCol]
+  const [target, setTarget] = useState(columns[columns.length - 1] || '')
+  const [activeTab, setActiveTab] = useState('overview')
+  const [predictConfigured, setPredictConfigured] = useState(false)
+  const [contractOpen, setContractOpen] = useState(false)
+  const [statsOpen, setStatsOpen] = useState(false)
+  const [advancedOpen, setAdvancedOpen] = useState(false)
+  const [showAllQuestions, setShowAllQuestions] = useState(false)
 
-  const healthScore = useMemo(() => {
-    let score = 100
-    score -= Math.min(40, upload.missing_pct * 2)
-    score -= Math.min(30, (upload.duplicate_rows / Math.max(1, upload.rows)) * 100)
-    return Math.max(40, Math.round(score))
-  }, [upload])
+  useEffect(() => {
+    if (!target || !columns.includes(target)) {
+      setTarget(columns[columns.length - 1] || '')
+    }
+  }, [columns, target])
 
-  const healthItems = [
-    { label: 'Missing Values', ok: upload.missing_pct < 5, value: `${upload.missing_pct}%` },
-    { label: 'Duplicate Rows', ok: upload.duplicate_rows === 0, value: upload.duplicate_rows },
-    { label: 'Data Types',     ok: true, value: `${upload.numeric_features} numeric` },
+  const handleTabChange = (nextTab) => {
+    console.debug("[insights-tab] changing tab", {
+      previousTab: activeTab,
+      nextTab,
+      currentUrl: window.location.href,
+    })
+    setActiveTab(nextTab)
+  }
+
+  // Unified Dataset Score Model
+  const datasetScores = useMemo(() => {
+    if (!upload) {
+      return {
+        readinessScore: 0,
+        healthScore: 0,
+        readinessLabel: 'not_ready',
+        healthLabel: 'No dataset',
+        totalRows: 0,
+        totalCols: 0,
+        totalIssueCount: 0,
+        missingPct: 0,
+        dupRows: 0,
+        outlierColsCount: 0,
+        totalOutliers: 0,
+        numericColsCount: 0,
+        rawIssues: [],
+        outlierIssues: [],
+      }
+    }
+
+    const totalRows = upload.rows || 0
+    const totalCols = columns.length
+    const missingPct = upload.missing_pct || 0
+    const dupRows = upload.duplicate_rows || 0
+    const dupPct = totalRows > 0 ? (dupRows / totalRows) * 100 : 0
+    const rawIssues = upload.quality_report?.issues || []
+
+    const outlierIssues = rawIssues.filter(i => i.type === 'outliers' || (i.title && i.title.toLowerCase().includes('outlier')))
+    const outlierColsCount = outlierIssues.length
+    const totalOutliers = outlierIssues.reduce((acc, curr) => acc + (curr.count || 1), 0)
+
+    let healthScore = 100
+    if (missingPct > 0) healthScore -= Math.min(30, Math.round(missingPct * 2))
+    if (dupPct > 0) healthScore -= Math.min(25, Math.round(dupPct))
+    if (outlierColsCount > 0) healthScore -= Math.min(25, outlierColsCount * 5)
+    if (rawIssues.length > 0 && healthScore === 100) healthScore = 90
+    healthScore = Math.max(35, healthScore)
+
+    let readinessScore = upload.decision_brief?.readiness_score
+    if (readinessScore == null) {
+      readinessScore = Math.max(40, healthScore - 10)
+    }
+
+    let readinessLabel = 'usable_with_caution'
+    if (healthScore >= 90 && readinessScore >= 85) readinessLabel = 'ready_for_analysis'
+    else if (healthScore >= 70) readinessLabel = 'usable_with_caution'
+    else readinessLabel = 'requires_remediation'
+
+    let healthLabel = 'Healthy schema'
+    if (healthScore < 70) healthLabel = 'Multiple quality issues'
+    else if (healthScore < 90) healthLabel = 'Several values require review'
+
+    const totalIssueCount = rawIssues.length + (dupRows > 0 ? 1 : 0) + (missingPct > 0 ? 1 : 0)
+
+    return {
+      readinessScore,
+      healthScore,
+      readinessLabel: readinessLabel.replaceAll('_', ' '),
+      healthLabel,
+      totalRows,
+      totalCols,
+      totalIssueCount,
+      missingPct,
+      dupRows,
+      outlierColsCount,
+      totalOutliers,
+      numericColsCount: upload.numeric_features ?? 0,
+      rawIssues,
+      outlierIssues,
+    }
+  }, [upload, columns])
+
+  // Deduplicated Recommended Actions (Max 3)
+  const deduplicatedActions = useMemo(() => {
+    if (!upload) return []
+    const actions = []
+    const seenTitles = new Set()
+
+    if (upload.decision_brief?.next_actions) {
+      for (const a of upload.decision_brief.next_actions) {
+        if (!seenTitles.has(a.action.toLowerCase())) {
+          seenTitles.add(a.action.toLowerCase())
+          actions.push({
+            id: `brief-${a.action}`,
+            title: a.action,
+            explanation: a.impact || 'Recommended to improve model reliability.',
+            priority: a.priority || 'medium',
+            actionLabel: 'Investigate',
+            question: `Investigate ${a.action}`
+          })
+        }
+      }
+    }
+
+    if (datasetScores.totalOutliers > 0 && !seenTitles.has('outliers')) {
+      seenTitles.add('outliers')
+      actions.push({
+        id: 'action-outliers',
+        title: `Review ${datasetScores.totalOutliers} potential outliers across ${datasetScores.outlierColsCount} columns`,
+        explanation: 'Unusual extreme values may skew linear statistical summaries and tree splits.',
+        priority: 'high',
+        actionLabel: 'Inspect Outliers',
+        question: 'Inspect columns with potential outliers and statistical ranges'
+      })
+    }
+
+    return actions.slice(0, 3)
+  }, [upload, datasetScores])
+
+  // Date column detection for time-series forecasting
+  const dateCol = useMemo(() => {
+    if (!columns.length) return null
+    const timeKeywords = ['date', 'time', 'timestamp', 'created_at', 'updated_at']
+    return columns.find(c => timeKeywords.some(k => String(c).toLowerCase().includes(k)))
+  }, [columns])
+
+  const brief = upload?.decision_brief
+  const cleaningPlan = upload?.cleaning_plan
+  const contract = upload?.data_contract
+  const dashboard = upload?.dashboard_spec
+
+  const priorityQuestions = brief?.priority_questions || [
+    'Which numeric columns are most strongly correlated?',
+    'What data-quality issues should I fix first?',
+    'Which columns have the most unusual distributions?'
   ]
-  const qualityIssues = upload.quality_report?.issues || []
-  const brief = upload.decision_brief
-  const decisionActions = upload.decision_actions || brief?.decision_actions || []
-  const cleaningPlan = upload.cleaning_plan
-  const contract = upload.data_contract
-  const dashboard = upload.dashboard_spec
+
+  if (!upload) {
+    return (
+      <aside className="insights" style={style}>
+        <div style={{ padding: '20px', textAlign: 'center', color: 'var(--text-muted)' }}>
+          Upload a dataset to view insights and modeling tools.
+        </div>
+      </aside>
+    )
+  }
 
   return (
-    <aside className="insights">
-      {brief && (
-        <div className="insight-card decision-card">
-          <div className="ic-head"><Layers width={15} height={15} /> Decision Brief</div>
-          <div className="decision-top">
-            <div className={`decision-score ${brief.readiness_label}`}>
-              <span>{brief.readiness_score}</span>
-              <small>readiness</small>
-            </div>
-            <div>
-              <div className="decision-label">{(brief.readiness_label || '').replaceAll('_', ' ')}</div>
-              <p className="decision-summary">{brief.summary}</p>
-            </div>
-          </div>
-          {brief.recommended_use_cases?.length > 0 && (
-            <div className="brief-section">
-              <div className="brief-kicker">Best use cases</div>
-              {brief.recommended_use_cases.slice(0, 3).map((item) => (
-                <div key={item.name} className="brief-use">
-                  <span>{item.name}</span>
-                  <em>{item.fit}</em>
-                </div>
-              ))}
-            </div>
-          )}
-          {brief.next_actions?.length > 0 && (
-            <div className="brief-section">
-              <div className="brief-kicker">Next actions</div>
-              {brief.next_actions.slice(0, 3).map((item, i) => (
-                <div key={`${item.action}-${i}`} className={`brief-action ${item.priority}`}>
-                  <strong>{item.action}</strong>
-                  <span>{item.impact}</span>
-                </div>
-              ))}
-            </div>
-          )}
-          {brief.priority_questions?.length > 0 && (
-            <div className="brief-question-row">
-              {brief.priority_questions.slice(0, 2).map((q) => (
-                <button key={q} className="brief-question" disabled={loading} onClick={() => onAsk(q)}>
-                  <Sparkles width={12} height={12} /> {q}
-                </button>
-              ))}
-            </div>
-          )}
-        </div>
-      )}
-
-      {decisionActions.length > 0 && (
-        <div className="insight-card action-card">
-          <div className="ic-head"><Sparkles width={15} height={15} /> Decision Actions</div>
-          <div className="action-list">
-            {decisionActions.slice(0, 3).map((action, i) => (
-              <div key={`${action.title}-${i}`} className={`decision-action ${action.priority}`}>
-                <div className="action-top">
-                  <strong>{action.title}</strong>
-                  <em>{Math.round((action.confidence || 0) * 100)}%</em>
-                </div>
-                <p>{action.recommended_action}</p>
-                <div className="action-impact">{action.estimated_impact}</div>
-                {action.evidence?.length > 0 && (
-                  <ul className="action-evidence">
-                    {action.evidence.slice(0, 2).map((item) => <li key={item}>{item}</li>)}
-                  </ul>
-                )}
-                {action.suggested_question && (
-                  <button className="action-investigate" disabled={loading} onClick={() => onInvestigate(action.suggested_question)}>
-                    Investigate
-                  </button>
-                )}
-              </div>
-            ))}
+    <aside className="insights" style={style}>
+      {/* Sticky Panel Header & Filename */}
+      <div className="insights-header-sticky">
+        <div className="insights-title-row">
+          <div>
+            <h3 className="insights-main-title">Dataset Insights</h3>
+            <span className="insights-filename">{upload.filename || 'dataset.csv'}</span>
           </div>
         </div>
-      )}
 
-      <div className="insight-card health">
-        <div className="ic-head"><Activity width={15} height={15} /> Dataset Health</div>
-        <div className="health-score">
-          <div className="ring" style={{ '--score': healthScore }}><span>{healthScore}</span></div>
-          <div className="health-list">
-            {healthItems.map((h) => (
-              <div key={h.label} className="health-item">
-                <span className={`dot ${h.ok ? 'good' : 'warn'}`} />
-                <span className="hi-label">{h.label}</span>
-                <span className="hi-value">{h.value}</span>
-              </div>
-            ))}
-          </div>
-        </div>
-        {qualityIssues.length > 0 && (
-          <div className="quality-list">
-            {qualityIssues.slice(0, 4).map((issue, i) => (
-              <div key={`${issue.title}-${i}`} className={`quality-item ${issue.severity}`}>
-                <div className="qi-title">{issue.title}</div>
-                <div className="qi-detail">{issue.detail}</div>
-                {issue.suggestion && <div className="qi-suggestion">{issue.suggestion}</div>}
-              </div>
-            ))}
-          </div>
-        )}
-      </div>
-
-      {cleaningPlan?.actions?.length > 0 && (
-        <div className="insight-card cleaning-card">
-          <div className="ic-head"><Check width={15} height={15} /> Cleaning Plan</div>
-          <p className="predict-hint">{cleaningPlan.summary}</p>
-          <div className="cleaning-actions">
-            {cleaningPlan.actions.slice(0, 4).map((action) => (
-              <div key={action.id} className={`cleaning-action ${action.default ? 'default' : ''}`}>
-                <strong>{action.title}</strong>
-                <span>{action.impact}</span>
-              </div>
-            ))}
-          </div>
-          <button className="clean-export-btn" disabled={cleaningBusy} onClick={onCleanExport}>
-            {cleaningBusy ? <span className="spinner" /> : <Check width={14} height={14} />}
-            Download cleaned CSV
-          </button>
-        </div>
-      )}
-
-      {contract && (
-        <div className="insight-card contract-card">
-          <div className="ic-head"><Columns width={15} height={15} /> Data Contract</div>
-          <div className="contract-stats">
-            <div><strong>{contract.column_count}</strong><span>columns</span></div>
-            <div><strong>{contract.required_columns?.length || 0}</strong><span>required</span></div>
-          </div>
-          <div className="contract-cols">
-            {contract.columns.slice(0, 5).map((col) => (
-              <div key={col.name} className="contract-col">
-                <span>{col.name}</span>
-                <em>{col.type}</em>
-              </div>
-            ))}
-          </div>
-          <button className="contract-export-btn" onClick={onExportContract}>
-            <Code width={14} height={14} /> Export contract JSON
-          </button>
-        </div>
-      )}
-
-      {dashboard && (
-        <div className="insight-card dashboard-card">
-          <div className="ic-head"><ChartUp width={15} height={15} /> Dashboard Blueprint</div>
-          <div className="dashboard-stats">
-            <div><strong>{dashboard.kpis?.length || 0}</strong><span>KPIs</span></div>
-            <div><strong>{dashboard.charts?.length || 0}</strong><span>charts</span></div>
-            <div><strong>{dashboard.filters?.length || 0}</strong><span>filters</span></div>
-          </div>
-          <div className="dashboard-charts">
-            {dashboard.charts?.slice(0, 4).map((chart) => (
-              <button key={chart.id} disabled={loading} onClick={() => onAsk(chart.question)}>
-                <span>{chart.title}</span>
-                <em>{chart.type}</em>
-              </button>
-            ))}
-          </div>
-          <button className="dashboard-export-btn" onClick={onExportDashboard}>
-            <Code width={14} height={14} /> Export dashboard JSON
-          </button>
-        </div>
-      )}
-
-      {numericCols.length > 0 && (
-        <div className="insight-card">
-          <div className="ic-head">
-            <ChartUp width={15} height={15} /> Quick Statistics
-            <select className="stat-select" value={statCol} onChange={(e) => setStatCol(e.target.value)}>
-              {numericCols.map((c) => <option key={c} value={c}>{c}</option>)}
-            </select>
-          </div>
-          {stats && (
-            <div className="stat-grid">
-              <Stat label="Mean"   v={stats.mean} />
-              <Stat label="Median" v={stats.median} />
-              <Stat label="Std Dev" v={stats.std} />
-              <Stat label="Min"    v={stats.min} />
-              <Stat label="Max"    v={stats.max} />
-              <Stat label="Range"  v={stats.max != null && stats.min != null ? +(stats.max - stats.min).toFixed(2) : null} />
-            </div>
-          )}
-        </div>
-      )}
-
-      <div className="insight-card custom-card">
-        <div className="ic-head"><Code width={15} height={15} /> Custom Data</div>
-        <p className="predict-hint">Paste your own rows or values to analyze them on the fly.</p>
-        <button className="custom-btn" disabled={loading} onClick={onOpenPaste}>
-          <Code width={14} height={14} /> Paste / input data
-        </button>
-      </div>
-
-      <div className="insight-card story-card">
-        <div className="ic-head"><Sparkles width={15} height={15} /> Dataset Story</div>
-        <p className="predict-hint">Generate a fact-first narrative from computed profile, quality, segment, and relationship facts.</p>
-        <button className="custom-btn" disabled={loading} onClick={onStory}>
-          <Sparkles width={14} height={14} /> Generate dataset story
-        </button>
-      </div>
-
-      <div className="insight-card predict-card">
-        <div className="ic-head"><Brain width={15} height={15} /> Predictive Model</div>
-        <p className="predict-hint">Train a model to predict a column and see what drives it.</p>
-        <div className="predict-row">
-          <span className="predict-label">Predict</span>
-          <select className="predict-select" value={target} onChange={(e) => setTarget(e.target.value)}>
-            {upload.columns.map((c) => <option key={c} value={c}>{c}</option>)}
-          </select>
-        </div>
-        <button className="predict-btn" disabled={loading || !target} onClick={() => onPredict(target)}>
-          {loading ? <span className="spinner" /> : <>🔮 Train &amp; Predict</>}
-        </button>
-      </div>
-
-      {modelInfo?.trained && (
-        <>
-          <PredictInputCard sessionId={upload.session_id} modelInfo={modelInfo} />
-          <ScenarioSimulatorCard sessionId={upload.session_id} modelInfo={modelInfo} category={category} />
-        </>
-      )}
-
-      <TimeSeriesForecastCard sessionId={upload.session_id} upload={upload} />
-
-      <div className="insight-card benchmark-card">
-        <div className="ic-head">🏆 Benchmark</div>
-        <p className="predict-hint">Evaluate the system with a suite of analytics questions and measure accuracy, chart rate, SQL routing, and response time.</p>
-        <button className="custom-btn" disabled={loading} onClick={() => onOpenBenchmark()}>
-          ▶ Run evaluation benchmark
-        </button>
-      </div>
-
-      <ExportCard upload={upload} messages={messages} category={category} />
-
-      <div className="insight-card">
-        <div className="ic-head"><cat.icon width={15} height={15} /> {cat.label} Analyses</div>
-        <div className="suggest-list">
-          {cat.suggested.map((s) => (
-            <button key={s.label} className="suggest-btn" disabled={loading} onClick={() => onAsk(s.q)}>
-              <span>{s.label}</span>
-              <span className="suggest-arrow">→</span>
+        {/* 4-Tab Navigation */}
+        <div className="tab-nav-4" role="tablist">
+          {TAB_CONFIG.map((t) => (
+            <button
+              key={t.id}
+              type="button"
+              role="tab"
+              id={`tab-${t.id}`}
+              aria-selected={activeTab === t.id}
+              aria-controls={`panel-${t.id}`}
+              className={`tab-btn ${activeTab === t.id ? 'active' : ''}`}
+              onClick={(e) => { e.preventDefault(); handleTabChange(t.id); }}
+            >
+              {t.label}
             </button>
           ))}
         </div>
       </div>
+
+      {/* ── TAB 1: OVERVIEW ────────────────────────────────────────────── */}
+      <InsightsTabPanel active={activeTab === 'overview'} tabId="overview">
+        {/* Primary Summary Card */}
+        <div className="insight-card decision-card">
+          <div className="ic-head"><Layers width={15} height={15} /> Primary Summary</div>
+          <div className="summary-score-grid">
+            <div className="score-badge-box">
+              <span className="score-num">{datasetScores.readinessScore}</span>
+              <span className="score-lbl">Readiness ({datasetScores.readinessLabel})</span>
+            </div>
+            <div className="score-badge-box">
+              <span className="score-num">{datasetScores.healthScore}/100</span>
+              <span className="score-lbl">Data Health ({datasetScores.healthLabel})</span>
+            </div>
+          </div>
+
+          <div className="dimensions-summary-row">
+            <span><strong>{datasetScores.totalRows.toLocaleString()}</strong> rows</span>
+            <span><strong>{datasetScores.totalCols}</strong> columns</span>
+            <span><strong>{datasetScores.totalIssueCount}</strong> issues</span>
+          </div>
+
+          <p className="dataset-one-liner">
+            {brief?.summary || `This dataset contains ${datasetScores.totalRows} rows and ${datasetScores.totalCols} columns, suitable for exploratory analysis and modeling after reviewing potential outliers.`}
+          </p>
+
+          {/* Best Use Cases */}
+          {brief?.recommended_use_cases?.length > 0 && (
+            <div className="brief-section">
+              <div className="brief-kicker">Best Use Cases</div>
+              {brief.recommended_use_cases.slice(0, 3).map((item) => (
+                <div key={item.name} className="brief-use">
+                  <span>{item.name}</span>
+                  <em className="use-case-fit">{item.fit}</em>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+
+        {/* Top Recommended Actions (Max 3 Deduplicated) */}
+        {deduplicatedActions.length > 0 && (
+          <div className="insight-card action-card">
+            <div className="ic-head"><Sparkles width={15} height={15} /> Top Recommended Actions</div>
+            <div className="action-list">
+              {deduplicatedActions.map((act) => (
+                <div key={act.id} className={`decision-action ${act.priority}`}>
+                  <div className="action-top">
+                    <strong>{act.title}</strong>
+                    <span className={`priority-tag ${act.priority}`}>{act.priority}</span>
+                  </div>
+                  <p>{act.explanation}</p>
+                  <button
+                    type="button"
+                    className="action-investigate"
+                    disabled={loading}
+                    onClick={() => onInvestigate(act.question)}
+                  >
+                    {act.actionLabel} →
+                  </button>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+      </InsightsTabPanel>
+
+      {/* ── TAB 2: DATA QUALITY ────────────────────────────────────────── */}
+      <InsightsTabPanel active={activeTab === 'quality'} tabId="quality">
+        {/* Quality Summary Row */}
+        <div className="insight-card quality-stats-card">
+          <div className="ic-head"><Activity width={15} height={15} /> Quality Summary</div>
+          <div className="quality-metrics-grid">
+            <div className="qm-item"><span>Missing</span><strong>{datasetScores.missingPct}%</strong></div>
+            <div className="qm-item"><span>Duplicates</span><strong>{datasetScores.dupRows}</strong></div>
+            <div className="qm-item"><span>Numeric</span><strong>{datasetScores.numericColsCount} cols</strong></div>
+            <div className="qm-item"><span>Outlier Cols</span><strong>{datasetScores.outlierColsCount}</strong></div>
+            <div className="qm-item"><span>Total Outliers</span><strong>{datasetScores.totalOutliers}</strong></div>
+          </div>
+        </div>
+
+        {/* Grouped Outliers Table */}
+        <div className="insight-card">
+          <div className="ic-head">
+            <AlertDot width={15} height={15} className="status-icon" />
+            <span>Potential Outliers ({datasetScores.totalOutliers} total)</span>
+          </div>
+          {datasetScores.outlierIssues.length === 0 ? (
+            <p className="predict-hint">No severe potential outliers detected across numeric columns.</p>
+          ) : (
+            <div className="outliers-group-box">
+              <table className="outliers-table">
+                <thead>
+                  <tr>
+                    <th>Column</th>
+                    <th>Count</th>
+                    <th>Severity</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {datasetScores.outlierIssues.map((item, idx) => {
+                    const colName = item.column || item.title?.replace(/outliers? in/i, '').trim() || `Col ${idx + 1}`
+                    const count = item.count || 1
+                    const severity = item.severity || (count > 20 ? 'high' : 'low')
+                    return (
+                      <tr key={idx}>
+                        <td><strong>{colName}</strong></td>
+                        <td>{count}</td>
+                        <td><span className={`severity-chip ${severity}`}>{severity}</span></td>
+                      </tr>
+                    )
+                  })}
+                </tbody>
+              </table>
+              <button
+                type="button"
+                className="btn-secondary-action compact"
+                style={{ marginTop: '10px', width: '100%' }}
+                disabled={loading}
+                onClick={() => onInvestigate('Inspect columns with potential outliers and statistical distributions')}
+              >
+                Inspect outliers
+              </button>
+            </div>
+          )}
+        </div>
+
+        {/* Cleaning Plan */}
+        {cleaningPlan?.actions?.length > 0 && (
+          <div className="insight-card cleaning-card">
+            <div className="ic-head"><Check width={15} height={15} /> Cleaning Plan</div>
+            <p className="predict-hint">{cleaningPlan.summary}</p>
+            <div className="cleaning-actions">
+              {cleaningPlan.actions.slice(0, 4).map((action) => (
+                <div key={action.id} className={`cleaning-action ${action.default ? 'default' : ''}`}>
+                  <strong>{action.title}</strong>
+                  <span>{action.impact}</span>
+                </div>
+              ))}
+            </div>
+            <button type="button" className="clean-export-btn" disabled={cleaningBusy} onClick={onCleanExport}>
+              {cleaningBusy ? <span className="spinner" /> : <Check width={14} height={14} />}
+              Download cleaned CSV
+            </button>
+          </div>
+        )}
+
+        {/* Collapsible Data Contract */}
+        {contract && (
+          <div className="insight-card contract-card">
+            <div
+              className="accordion-summary-clean"
+              onClick={() => setContractOpen((v) => !v)}
+              role="button"
+              tabIndex={0}
+              aria-expanded={contractOpen}
+              onKeyDown={(e) => (e.key === 'Enter' || e.key === ' ') && setContractOpen((v) => !v)}
+            >
+              <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                <Columns width={15} height={15} style={{ color: 'var(--primary)' }} />
+                <span>Data Contract</span>
+              </div>
+              <span style={{ fontSize: '11px', color: 'var(--text-muted)' }}>{contractOpen ? 'Hide ▲' : 'Show ▲'}</span>
+            </div>
+            <div style={{ fontSize: '12px', color: 'var(--text-soft)', marginTop: '4px' }}>
+              {contract.column_count || datasetScores.totalCols} columns · {contract.required_columns?.length || 0} required · All numeric
+            </div>
+
+            {contractOpen && (
+              <div className="accordion-content" style={{ marginTop: '10px' }}>
+                <div className="contract-cols">
+                  {contract.columns?.slice(0, 10).map((col) => (
+                    <div key={col.name} className="contract-col">
+                      <span>{col.name}</span>
+                      <em>{col.type}</em>
+                    </div>
+                  ))}
+                </div>
+                <button type="button" className="contract-export-btn" style={{ marginTop: '10px' }} onClick={onExportContract}>
+                  <Code width={14} height={14} /> Export contract JSON
+                </button>
+              </div>
+            )}
+          </div>
+        )}
+      </InsightsTabPanel>
+
+      {/* ── TAB 3: ANALYZE & MODEL ──────────────────────────────────────── */}
+      <InsightsTabPanel active={activeTab === 'analyze'} tabId="analyze">
+        {console.debug('[insights-tab] rendering AnalyzeModelTab', { columns, numericCols, dateCol, modelInfo })}
+        {/* Section: Explore */}
+        <div className="section-group-label">Explore</div>
+
+        {/* Priority Questions */}
+        <div className="insight-card">
+          <div className="ic-head"><Sparkles width={15} height={15} /> Suggested Questions</div>
+          <div className="suggest-list">
+            {(showAllQuestions ? priorityQuestions : priorityQuestions.slice(0, 3)).map((q, idx) => {
+              const questionText = typeof q === 'string' ? q : q.q || q.label
+              return (
+                <button key={idx} type="button" className="suggest-btn" disabled={loading} onClick={() => onAsk(questionText)}>
+                  <span>{questionText}</span>
+                  <span className="suggest-arrow">→</span>
+                </button>
+              )
+            })}
+          </div>
+          {priorityQuestions.length > 3 && (
+            <button
+              type="button"
+              className="btn-text-link"
+              style={{ marginTop: '6px', fontSize: '12px' }}
+              onClick={() => setShowAllQuestions(v => !v)}
+            >
+              {showAllQuestions ? 'Show less ▲' : 'Show more ▼'}
+            </button>
+          )}
+        </div>
+
+        {/* Quick Statistics with Column Selector */}
+        {numericCols.length > 0 && (
+          <div className="insight-card">
+            <div
+              className="accordion-summary-clean"
+              onClick={() => setStatsOpen((v) => !v)}
+              role="button"
+              tabIndex={0}
+              aria-expanded={statsOpen}
+              onKeyDown={(e) => (e.key === 'Enter' || e.key === ' ') && setStatsOpen((v) => !v)}
+            >
+              <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                <ChartUp width={15} height={15} style={{ color: 'var(--primary)' }} />
+                <span>Quick Statistics</span>
+              </div>
+              <span style={{ fontSize: '11px', color: 'var(--text-muted)' }}>{statsOpen ? 'Hide ▲' : 'Show ▲'}</span>
+            </div>
+
+            {statsOpen && (
+              <div className="accordion-content" style={{ marginTop: '10px' }}>
+                <div className="stat-select-row">
+                  <span style={{ fontSize: '12px', fontWeight: 600, color: 'var(--text-soft)' }}>Select Column:</span>
+                  <select className="stat-select" value={statCol} onChange={(e) => setStatCol(e.target.value)}>
+                    {numericCols.map((c) => <option key={c} value={c}>{c}</option>)}
+                  </select>
+                </div>
+                {stats && (
+                  <div className="stat-grid" style={{ marginTop: '10px' }}>
+                    <Stat label="Mean" v={stats.mean} />
+                    <Stat label="Median" v={stats.median} />
+                    <Stat label="Std Dev" v={stats.std} />
+                    <Stat label="Min" v={stats.min} />
+                    <Stat label="Max" v={stats.max} />
+                    <Stat label="Range" v={stats.max != null && stats.min != null ? +(stats.max - stats.min).toFixed(2) : null} />
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Dataset Story */}
+        <div className="insight-card story-card">
+          <div className="ic-head"><Sparkles width={15} height={15} /> Dataset Story</div>
+          <p className="predict-hint">Generate a fact-first narrative from computed dataset profile facts.</p>
+          <button type="button" className="custom-btn" disabled={loading} onClick={onStory}>
+            <Sparkles width={14} height={14} /> Generate dataset story
+          </button>
+        </div>
+
+        {/* Section: Model */}
+        <div className="section-group-label" style={{ marginTop: '14px' }}>Model</div>
+
+        {/* Predictive Model Form */}
+        <div className="insight-card predict-card">
+          <div className="ic-head"><Brain width={15} height={15} /> Predictive Model</div>
+          <p className="predict-hint">Train a model to predict a selected column and see feature importance.</p>
+
+          {columns.length < 2 ? (
+            <p className="predict-hint" style={{ color: 'var(--text-muted)', marginTop: '8px' }}>
+              Predictive modeling requires at least two usable columns.
+            </p>
+          ) : !predictConfigured ? (
+            <button
+              type="button"
+              className="btn-secondary-action full"
+              style={{ marginTop: '8px' }}
+              onClick={() => setPredictConfigured(true)}
+            >
+              <Sliders width={14} height={14} /> Configure model
+            </button>
+          ) : (
+            <div className="predict-form-expanded" style={{ marginTop: '10px' }}>
+              <div className="predict-row">
+                <span className="predict-label">Predict target</span>
+                <select className="predict-select" value={target} onChange={(e) => setTarget(e.target.value)}>
+                  {columns.map((c) => <option key={c} value={c}>{c}</option>)}
+                </select>
+              </div>
+              <div style={{ display: 'flex', gap: '8px', marginTop: '10px' }}>
+                <button type="button" className="predict-btn" style={{ flex: 1 }} disabled={loading || !target} onClick={() => onPredict(target)}>
+                  {loading ? <span className="spinner" /> : <>🔮 Train &amp; Predict</>}
+                </button>
+                <button type="button" className="btn-secondary-action" onClick={() => setPredictConfigured(false)}>Cancel</button>
+              </div>
+            </div>
+          )}
+        </div>
+
+        {modelInfo?.trained && (
+          <>
+            <PredictInputCard sessionId={upload.session_id} modelInfo={modelInfo} upload={upload} />
+            <ScenarioSimulatorCard sessionId={upload.session_id} modelInfo={modelInfo} category={category} upload={upload} />
+          </>
+        )}
+
+        {/* Time-Series Forecast */}
+        {dateCol ? (
+          <TimeSeriesForecastCard sessionId={upload.session_id} upload={upload} dateCol={dateCol} />
+        ) : (
+          <div className="insight-card forecast-card disabled">
+            <div className="ic-head"><TrendingUp width={15} height={15} /> Time-Series Forecast</div>
+            <p className="predict-hint" style={{ color: 'var(--text-muted)' }}>
+              Forecasting is unavailable because no date or time column was detected.
+            </p>
+          </div>
+        )}
+
+        {/* Section: Custom */}
+        <div className="section-group-label" style={{ marginTop: '14px' }}>Custom</div>
+        <div className="insight-card custom-card">
+          <div className="ic-head"><Code width={15} height={15} /> Custom Data</div>
+          <p className="predict-hint">Paste your own rows or values to analyze them on the fly.</p>
+          <button type="button" className="custom-btn" disabled={loading} onClick={onOpenPaste}>
+            <Code width={14} height={14} /> Paste / input data
+          </button>
+        </div>
+      </InsightsTabPanel>
+
+      {/* ── TAB 4: EXPORT & BUILD ───────────────────────────────────────── */}
+      <InsightsTabPanel active={activeTab === 'export'} tabId="export">
+        {console.debug('[insights-tab] rendering ExportBuildTab', { contract, dashboard })}
+        {/* User-facing Reports (PDF, PPTX) */}
+        <ExportCard upload={upload} messages={messages} category={category} />
+
+        {/* Dashboard Blueprint */}
+        {dashboard && (
+          <div className="insight-card dashboard-card">
+            <div className="ic-head"><ChartUp width={15} height={15} /> Dashboard Blueprint</div>
+            <div className="dashboard-stats">
+              <div><strong>{dashboard.kpis?.length ?? 4}</strong><span>KPIs</span></div>
+              <div><strong>{dashboard.charts?.length ?? 2}</strong><span>charts</span></div>
+              <div><strong>{dashboard.filters?.length ?? 0}</strong><span>filters</span></div>
+            </div>
+            <button type="button" className="dashboard-export-btn" onClick={onExportDashboard}>
+              <Code width={14} height={14} /> Download dashboard configuration
+            </button>
+          </div>
+        )}
+
+        {/* Developer Exports */}
+        <div className="insight-card">
+          <div className="ic-head"><Code width={15} height={15} /> Developer Exports</div>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', marginTop: '8px' }}>
+            {contract && (
+              <button type="button" className="btn-secondary-action full" onClick={onExportContract}>
+                <Code width={14} height={14} /> Export data contract JSON
+              </button>
+            )}
+            {dashboard && (
+              <button type="button" className="btn-secondary-action full" onClick={onExportDashboard}>
+                <Code width={14} height={14} /> Export dashboard JSON
+              </button>
+            )}
+          </div>
+        </div>
+
+        {/* Advanced Section Collapsible (Evaluation Benchmark) */}
+        <div className="insight-card benchmark-card">
+          <div
+            className="accordion-summary-clean"
+            onClick={() => setAdvancedOpen((v) => !v)}
+            role="button"
+            tabIndex={0}
+            aria-expanded={advancedOpen}
+            onKeyDown={(e) => (e.key === 'Enter' || e.key === ' ') && setAdvancedOpen((v) => !v)}
+          >
+            <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+              <Sparkles width={15} height={15} style={{ color: 'var(--primary)' }} />
+              <span>Advanced Evaluation</span>
+            </div>
+            <span style={{ fontSize: '11px', color: 'var(--text-muted)' }}>{advancedOpen ? 'Hide ▲' : 'Show ▲'}</span>
+          </div>
+
+          {advancedOpen && (
+            <div className="accordion-content" style={{ marginTop: '10px' }}>
+              <p className="predict-hint">Evaluate the system with 49 analytics questions measuring accuracy and latency.</p>
+              <button type="button" className="custom-btn" disabled={loading} onClick={onOpenBenchmark}>
+                ▶ Run evaluation benchmark
+              </button>
+            </div>
+          )}
+        </div>
+      </InsightsTabPanel>
     </aside>
   )
 }
+
+export const InsightsPanel = DatasetInsightsPanel
+
+
+
+
+
 
 function Stat({ label, v }) {
   return (
@@ -1228,7 +2386,8 @@ function PlotlyChart({ json }) {
 // ─── Chat ──────────────────────────────────────────────────────────────────────
 
 function AgentStep({ step }) {
-  const meta = STEP_META[step.step] || { icon: '•', color: '#94A3B8' }
+  const meta = STEP_META[step.step] || { icon: Activity, color: '#94A3B8' }
+  const StepIcon = typeof meta.icon === 'function' ? meta.icon : Activity
   const trace = step.meta || {}
   const elapsed = trace.elapsed_ms != null
     ? trace.elapsed_ms < 1000
@@ -1238,7 +2397,7 @@ function AgentStep({ step }) {
   const requestShort = trace.request_id ? trace.request_id.slice(0, 8) : null
   return (
     <div className="step-row" style={{ '--step-color': meta.color }}>
-      <span className="step-icon">{meta.icon}</span>
+      <span className="step-icon"><StepIcon width={14} height={14} /></span>
       <span className="step-content">
         <span className="step-label">{step.message}</span>
         {(trace.route || elapsed || requestShort) && (
@@ -1260,52 +2419,24 @@ const VERDICT_META = {
 }
 
 function CritiqueBadge({ critique }) {
-  const v = VERDICT_META[critique.verdict] || VERDICT_META.pass
-  const conf = critique.confidence != null ? `${Math.round(critique.confidence * 100)}%` : null
+  if (!critique || critique.verdict === 'pass') return null
+  const suggestion = critique.suggestion || critique.issues?.[0]
+  if (!suggestion) return null
+
   return (
-    <div className="critique-badge" style={{ '--vcolor': v.color, '--vbg': v.bg, '--vborder': v.border }}>
-      <div className="cb-verdict">{v.label}{conf && <span className="cb-conf">{conf} confidence</span>}</div>
-      {critique.issues?.length > 0 && (
-        <ul className="cb-list cb-issues">
-          {critique.issues.map((i, idx) => <li key={idx}>{i}</li>)}
-        </ul>
-      )}
-      {critique.strengths?.length > 0 && (
-        <ul className="cb-list cb-strengths">
-          {critique.strengths.map((s, idx) => <li key={idx}>{s}</li>)}
-        </ul>
-      )}
-      {critique.suggestion && <p className="cb-suggestion">💡 {critique.suggestion}</p>}
+    <div className="critique-simple-note">
+      <Sparkles width={13} height={13} style={{ color: 'var(--primary)' }} />
+      <span><strong>Note:</strong> {suggestion.replace(/^💡\s*/, '')}</span>
     </div>
   )
 }
 
 function ValidationPanel({ validation }) {
-  if (!validation) return null
+  if (!validation || (!validation.missing_pct && !validation.source_columns?.length)) return null
   return (
-    <div className="validation-panel">
-      <div className="vp-head">
-        <Check width={13} height={13} />
-        <span>{validation.confidence_label || 'High'} trust</span>
-        {validation.confidence != null && (
-          <em>{Math.round(validation.confidence * 100)}%</em>
-        )}
-      </div>
-      <div className="vp-method">{validation.method}</div>
-      <div className="vp-meta">
-        <span>{Number(validation.row_support || 0).toLocaleString()} rows checked</span>
-        {validation.source_columns?.length > 0 && (
-          <span>{validation.source_columns.join(', ')}</span>
-        )}
-        {validation.missing_pct != null && validation.missing_pct > 0 && (
-          <span>{validation.missing_pct}% missing in source fields</span>
-        )}
-      </div>
-      {validation.reasons?.length > 0 && (
-        <ul className="vp-reasons">
-          {validation.reasons.slice(0, 3).map((reason, i) => <li key={i}>{reason}</li>)}
-        </ul>
-      )}
+    <div className="validation-simple-note">
+      <Check width={13} height={13} style={{ color: 'var(--primary)' }} />
+      <span>Verified across {Number(validation.row_support || 0).toLocaleString()} rows ({validation.source_columns?.join(', ') || 'source data'})</span>
     </div>
   )
 }
@@ -1324,14 +2455,9 @@ function AnswerTrustBadge({ route, validation, critique }) {
   const confidence = validation?.confidence ?? critique?.confidence
   const confidenceText = confidence != null ? `${Math.round(confidence * 100)}%` : validation?.confidence_label
   const level = validation?.confidence_label || (confidence >= 0.9 ? 'High' : confidence >= 0.7 ? 'Medium' : 'Review')
-  const variant = route === 'deterministic' || route?.includes('deterministic')
-    ? 'deterministic'
-    : route === 'cache'
-      ? 'cache'
-      : 'agent'
 
   return (
-    <span className={`answer-trust-badge ${variant}`} title={validation?.method || critique?.suggestion || routeLabel}>
+    <span className="answer-trust-badge" title={validation?.method || critique?.suggestion || routeLabel}>
       <span>{routeLabel}</span>
       {(level || confidenceText) && <em>{level}{confidenceText ? ` · ${confidenceText}` : ''}</em>}
     </span>
@@ -1342,39 +2468,36 @@ function PlanBadge({ plan }) {
   const [open, setOpen] = useState(false)
   if (!plan?.strategy) return null
   return (
-    <div className="plan-badge">
-      <button className="plan-toggle" onClick={() => setOpen(v => !v)}>
-        🗺️ Strategy: {plan.strategy}
-        <span className="plan-arrow">{open ? '▲' : '▼'}</span>
-      </button>
+    <div className="accordion-row">
+      <div
+        className="accordion-summary-clean"
+        onClick={() => setOpen(v => !v)}
+        role="button"
+        tabIndex={0}
+        aria-expanded={open}
+        onKeyDown={(e) => (e.key === 'Enter' || e.key === ' ') && setOpen(v => !v)}
+      >
+        <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+          <Layers width={13} height={13} style={{ color: 'var(--primary)' }} />
+          <span>Strategy: {plan.strategy}</span>
+        </div>
+        <span style={{ fontSize: '11px', color: 'var(--text-muted)' }}>{open ? 'Hide ▲' : 'Details ▼'}</span>
+      </div>
       {open && (
-        <div className="plan-detail">
+        <div className="accordion-content">
           {plan.persona && (
-            <div className="persona-strip">
-              <div>
-                <strong>{plan.persona.name}</strong>
-                <span>{plan.persona.focus}</span>
-              </div>
-              {plan.persona.priority_kpis?.length > 0 && (
-                <div className="persona-kpis">
-                  {plan.persona.priority_kpis.slice(0, 5).map((kpi) => <em key={kpi}>{kpi}</em>)}
-                </div>
-              )}
+            <div className="plan-persona-row" style={{ marginBottom: '8px' }}>
+              <strong>{plan.persona.name}</strong>: <span style={{ color: 'var(--text-soft)' }}>{plan.persona.focus}</span>
             </div>
           )}
           {plan.analysis_steps?.length > 0 && (
-            <ol className="plan-steps">
+            <ol className="plan-steps" style={{ margin: '0 0 8px 16px', padding: 0 }}>
               {plan.analysis_steps.map((s, i) => <li key={i}>{s}</li>)}
             </ol>
           )}
           {plan.relevant_columns?.length > 0 && (
-            <div className="plan-cols">
+            <div className="plan-cols" style={{ display: 'flex', flexWrap: 'wrap', gap: '5px', alignItems: 'center', fontSize: '11px', color: 'var(--text-muted)' }}>
               Columns: {plan.relevant_columns.map(c => <span key={c} className="plan-col">{c}</span>)}
-            </div>
-          )}
-          {plan.rag_sources?.length > 0 && (
-            <div className="plan-rag">
-              📄 Context from: {plan.rag_sources.map(f => <span key={f} className="rag-source">{f}</span>)}
             </div>
           )}
         </div>
@@ -1384,10 +2507,10 @@ function PlanBadge({ plan }) {
 }
 
 const EXPLAIN_TABS = [
-  { key: 'importance', label: '📊 Feature Importance', field: 'chart' },
-  { key: 'shap',       label: '🔬 SHAP Beeswarm',     field: 'shap_chart' },
-  { key: 'perm',       label: '🎲 Permutation',        field: 'perm_chart' },
-  { key: 'pdp',        label: '📈 Partial Dependence', field: 'pdp_chart' },
+  { key: 'importance', label: 'Feature Importance', field: 'chart' },
+  { key: 'shap',       label: 'SHAP Beeswarm',     field: 'shap_chart' },
+  { key: 'perm',       label: 'Permutation',        field: 'perm_chart' },
+  { key: 'pdp',        label: 'Partial Dependence', field: 'pdp_chart' },
 ]
 
 function ExplainPanel({ msg }) {
@@ -1397,7 +2520,7 @@ function ExplainPanel({ msg }) {
   const current = available[active]
   return (
     <div className="explain-panel">
-      <div className="explain-label">🧠 Explainability</div>
+      <div className="explain-label"><Brain width={14} height={14} /> Explainability</div>
       <div className="explain-tabs">
         {available.map((t, i) => (
           <button key={t.key} className={`explain-tab ${i === active ? 'active' : ''}`}
@@ -1410,60 +2533,792 @@ function ExplainPanel({ msg }) {
   )
 }
 
-function ChatMessage({ msg, onAsk }) {
+function RowTableSection({ rowData }) {
+  if (!rowData || !rowData.fields) return null
+  return (
+    <div className="row-lookup-card">
+      <div className="row-lookup-header">
+        <Layers width={14} height={14} style={{ color: 'var(--primary)' }} />
+        <span>Row {rowData.display_row} Details</span>
+        <span className="row-lookup-count">{rowData.fields.length} columns</span>
+      </div>
+      <div className="row-lookup-table-wrap">
+        <table className="row-lookup-table">
+          <thead>
+            <tr>
+              <th>Column</th>
+              <th>Value</th>
+            </tr>
+          </thead>
+          <tbody>
+            {rowData.fields.map((f) => (
+              <tr key={f.field}>
+                <td><strong>{f.field}</strong></td>
+                <td>{f.value}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  )
+}
+
+function LiveExecutionLog({ steps, isDone, latestMeta, lensRes, isStreaming, onStop }) {
+  const [open, setOpen] = useState(!isDone)
+  const logRef = useRef(null)
+
+  useEffect(() => {
+    if (isDone) setOpen(false)
+  }, [isDone])
+
+  const displaySteps = useMemo(() => {
+    return steps.filter(s => !['plan', 'critique', 'code'].includes(s.step))
+  }, [steps])
+
+  const totalMs = latestMeta?.elapsed_ms || (steps[steps.length - 1]?.meta?.elapsed_ms)
+  const durationText = totalMs != null ? (totalMs < 1000 ? `${totalMs}ms` : `${(totalMs / 1000).toFixed(1)}s`) : null
+
+  if (isDone && (!displaySteps || displaySteps.length === 0)) {
+    return null
+  }
+
+  if (isDone && !open) {
+    return (
+      <div className="accordion-row">
+        <div
+          className="accordion-summary-clean"
+          onClick={() => setOpen(true)}
+          role="button"
+          tabIndex={0}
+          aria-expanded={false}
+          aria-controls="execution-log-details"
+          onKeyDown={(e) => (e.key === 'Enter' || e.key === ' ') && setOpen(true)}
+        >
+          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+            <Check width={13} height={13} style={{ color: 'var(--primary)' }} />
+            <span>Execution details</span>
+            {durationText && <span style={{ color: 'var(--text-muted)', fontSize: '11px' }}>({durationText})</span>}
+          </div>
+          <span style={{ fontSize: '11px', color: 'var(--text-muted)' }}>{displaySteps.length} steps ▼</span>
+        </div>
+      </div>
+    )
+  }
+
+  return (
+    <div className="accordion-row" id="execution-log-details">
+      {isDone && (
+        <div
+          className="accordion-summary-clean"
+          onClick={() => setOpen(false)}
+          role="button"
+          tabIndex={0}
+          aria-expanded={true}
+          onKeyDown={(e) => (e.key === 'Enter' || e.key === ' ') && setOpen(false)}
+        >
+          <span>Execution details</span>
+          <span style={{ fontSize: '11px', color: 'var(--text-muted)' }}>Hide details ▲</span>
+        </div>
+      )}
+      <div className="accordion-content">
+        <div className="live-log-container" ref={logRef} role="region" aria-live="polite" aria-label="Live execution checklist">
+          {displaySteps.map((s, idx) => {
+            const isLast = idx === displaySteps.length - 1
+            const isRunning = !isDone && isLast
+            const isWarning = s.step === 'lens_switch' || s.step === 'warning'
+            const isError = s.step === 'error'
+
+            let icon = '✓'
+            let statusClass = 'complete'
+            if (isRunning) {
+              icon = '⚡'
+              statusClass = 'running'
+            } else if (isWarning) {
+              icon = '⚠️'
+              statusClass = 'warning'
+            } else if (isError) {
+              icon = '✕'
+              statusClass = 'error'
+            }
+
+            return (
+              <div key={idx} className={`log-step-row ${statusClass}`}>
+                <span className="log-step-icon">{isRunning ? <span className="running-pulse-dot" /> : icon}</span>
+                <span className="log-step-text">{s.message || s.label || s.step}</span>
+              </div>
+            )
+          })}
+          {!isDone && (
+            <div className="log-step-row running">
+              <span className="log-step-icon"><span className="running-pulse-dot" /></span>
+              <span className="log-step-text">Processing analysis pipeline…</span>
+            </div>
+          )}
+        </div>
+        {isStreaming && onStop && (
+          <button className="btn-stop-analysis" onClick={onStop}>
+            ■ Stop analysis
+          </button>
+        )}
+      </div>
+    </div>
+  )
+}
+
+function getPrimitiveText(value) {
+  if (typeof value === 'string') {
+    const trimmed = value.trim()
+    return trimmed.length > 0 ? trimmed : undefined
+  }
+  if (typeof value === 'number' || typeof value === 'boolean') {
+    return String(value)
+  }
+  return undefined
+}
+
+function normalizeStepStatus(val) {
+  const s = String(val || '').toLowerCase()
+  if (s === 'complete' || s === 'completed' || s === 'success' || s === 'done') return 'complete'
+  if (s === 'warning' || s === 'lens_switch') return 'warning'
+  if (s === 'error' || s === 'failed') return 'failed'
+  if (s === 'running' || s === 'executing' || s === 'pending') return 'running'
+  return 'complete'
+}
+
+function normalizeExecutionStep(step, index) {
+  return {
+    id: String(step?.id || step?.step_id || step?.stepId || `step-${index + 1}`),
+    label: String(step?.label || step?.name || step?.title || step?.message || step?.step || 'Analysis step'),
+    detail: step?.detail || step?.description || step?.summary || step?.message,
+    status: normalizeStepStatus(step?.status || step?.step),
+    durationMs: step?.duration_ms || step?.durationMs || step?.meta?.elapsed_ms,
+  }
+}
+
+function normalizeStatus(val) {
+  const s = String(val || '').toLowerCase()
+  if (s === 'complete' || s === 'completed' || s === 'success' || s === 'succeeded' || s === 'done') return 'complete'
+  if (s === 'partial' || s === 'streaming') return 'partial'
+  if (s === 'error' || s === 'failed' || s === 'failure') return 'failed'
+  return 'running'
+}
+
+const PROGRESS_EVENT_TYPES = new Set([
+  'analysis_started',
+  'route_selected',
+  'step_started',
+  'step_completed',
+  'execution_step',
+  'progress',
+  'log',
+  'agent_started',
+  'agent_completed',
+  'strategy',
+  'understanding',
+  'lens_check',
+  'thinking',
+  'planning',
+  'analyzing',
+  'visualizing',
+  'critiquing',
+  'reporting',
+  'code',
+  'plan',
+  'analyst',
+  'critique',
+])
+
+const PARTIAL_RESULT_EVENT_TYPES = new Set([
+  'partial_result',
+  'section_updated',
+  'answer_partial',
+])
+
+const SUCCESS_EVENT_TYPES = new Set([
+  'analysis_completed',
+  'completed',
+  'done',
+])
+
+const FAILURE_EVENT_TYPES = new Set([
+  'analysis_failed',
+  'failed',
+  'error',
+])
+
+function classifyStreamEvent(event) {
+  const type = String(event?.type ?? event?.event ?? event?.step ?? '').toLowerCase()
+
+  if (SUCCESS_EVENT_TYPES.has(type)) {
+    return 'terminal-success'
+  }
+  if (FAILURE_EVENT_TYPES.has(type)) {
+    return 'terminal-failure'
+  }
+  if (PARTIAL_RESULT_EVENT_TYPES.has(type)) {
+    return 'partial-result'
+  }
+  if (PROGRESS_EVENT_TYPES.has(type)) {
+    return 'progress'
+  }
+
+  if (event?.status === 'complete' || event?.status === 'completed') {
+    return 'terminal-success'
+  }
+  if (event?.status === 'failed' || event?.status === 'error') {
+    return 'terminal-failure'
+  }
+
+  return 'progress'
+}
+
+function normalizeStreamStatus(event) {
+  const eventClass = classifyStreamEvent(event)
+  if (eventClass === 'terminal-success') return 'complete'
+  if (eventClass === 'terminal-failure') return 'failed'
+  if (eventClass === 'partial-result') return 'partial'
+  return 'running'
+}
+
+function normalizeQueryResponse(raw, fallbackRequestId) {
+  const rawIsObject = raw !== null && typeof raw === 'object'
+  const isStreamEvent = Boolean(raw?.type || raw?.step)
+  const defaultStatus = isStreamEvent ? normalizeStreamStatus(raw) : 'complete'
+
+  const nestedResult =
+    rawIsObject && raw.result !== null && typeof raw.result === 'object'
+      ? raw.result
+      : rawIsObject && raw.data !== null && typeof raw.data === 'object'
+        ? raw.data
+        : rawIsObject && raw.analysis !== null && typeof raw.analysis === 'object'
+          ? raw.analysis
+          : rawIsObject
+            ? raw
+            : {}
+
+  const answerObject =
+    nestedResult.answer ??
+    nestedResult.final_answer ??
+    nestedResult.finalAnswer ??
+    nestedResult.response ??
+    nestedResult.output
+
+  const primitiveResultText =
+    getPrimitiveText(raw?.result) ??
+    getPrimitiveText(nestedResult?.result)
+
+  let answerText = primitiveResultText
+
+  let answerType =
+    nestedResult.answer_type ??
+    nestedResult.answerType
+
+  let answerData
+
+  if (typeof answerObject === 'string') {
+    answerText = answerObject.trim() || answerText
+  } else if (answerObject && typeof answerObject === 'object') {
+    answerText =
+      getPrimitiveText(answerObject.text) ??
+      getPrimitiveText(answerObject.summary) ??
+      getPrimitiveText(answerObject.content) ??
+      getPrimitiveText(answerObject.message) ??
+      answerText
+
+    answerType = answerObject.type ?? answerType
+
+    answerData =
+      answerObject.data ??
+      answerObject.payload ??
+      answerObject.rows ??
+      answerObject.values
+  }
+
+  answerText =
+    answerText ??
+    getPrimitiveText(raw?.report) ??
+    getPrimitiveText(raw?.answer) ??
+    getPrimitiveText(raw?.response) ??
+    getPrimitiveText(raw?.output)
+
+  if (!answerData) {
+    answerData = raw?.row_data ?? raw?.payload?.row_data ?? nestedResult?.row_data
+  }
+
+  const rawSteps =
+    nestedResult.execution_steps ??
+    nestedResult.executionSteps ??
+    nestedResult.steps ??
+    nestedResult.trace ??
+    nestedResult.agent_steps ??
+    nestedResult.agentSteps ??
+    nestedResult.logs ??
+    raw?.execution_steps ??
+    raw?.executionSteps ??
+    raw?.steps ??
+    raw?.trace ??
+    raw?.agent_steps ??
+    raw?.logs ??
+    []
+
+  return {
+    requestId: String(
+      nestedResult.request_id ??
+      nestedResult.requestId ??
+      raw?.request_id ??
+      raw?.requestId ??
+      fallbackRequestId
+    ),
+    status: normalizeStatus(nestedResult.status ?? raw?.status ?? defaultStatus),
+    answerText,
+    answerType: answerType || (answerData?.fields ? 'row_lookup' : 'text'),
+    answerData,
+    executionSteps: Array.isArray(rawSteps)
+      ? rawSteps.map(normalizeExecutionStep)
+      : [],
+    warnings: Array.isArray(nestedResult.warnings ?? raw?.warnings) ? (nestedResult.warnings ?? raw?.warnings) : [],
+    generatedCode:
+      nestedResult.generated_code ??
+      nestedResult.generatedCode ??
+      raw?.generated_code ??
+      raw?.generatedCode ??
+      raw?.code,
+    effectiveLens:
+      nestedResult.effective_lens ??
+      nestedResult.effectiveLens ??
+      raw?.effective_lens ??
+      raw?.effectiveLens,
+    raw,
+  }
+}
+
+// ─── Number & Value Formatters for Non-Technical Readability ───────────────────
+
+function formatValue(val) {
+  if (val === null || val === undefined || val === '') return 'Not available'
+  if (typeof val === 'boolean') return val ? 'Yes' : 'No'
+  if (typeof val === 'number') {
+    if (Number.isInteger(val)) return val.toLocaleString()
+    return val.toLocaleString(undefined, { minimumFractionDigits: 1, maximumFractionDigits: 2 })
+  }
+  if (typeof val === 'string') {
+    const trimmed = val.trim()
+    if (/^-?\d+\.\d{3,}$/.test(trimmed)) {
+      const num = parseFloat(trimmed)
+      if (num >= 0 && num <= 1 && !trimmed.includes('%')) {
+        return `${(num * 100).toFixed(1)}%`
+      }
+      return num.toLocaleString(undefined, { minimumFractionDigits: 1, maximumFractionDigits: 2 })
+    }
+    return trimmed
+  }
+  return String(val)
+}
+
+function parsePlainLanguageSections(rawText) {
+  if (!rawText || typeof rawText !== 'string') return null
+
+  const lines = rawText.split('\n')
+  const result = {
+    mainAnswer: '',
+    explanation: '',
+    findings: [],
+    nextAction: '',
+    caveats: [],
+  }
+
+  let currentSection = 'main'
+  let currentList = []
+
+  const flushList = () => {
+    if (currentList.length > 0) {
+      if (currentSection === 'findings') result.findings.push(...currentList)
+      else if (currentSection === 'caveats') result.caveats.push(...currentList)
+      currentList = []
+    }
+  }
+
+  for (const line of lines) {
+    const trimmed = line.trim()
+    if (!trimmed) continue
+
+    const lower = trimmed.toLowerCase()
+
+    if (lower.includes('recommended approach:') || lower.startsWith('**headline:**') || lower.startsWith('### main answer')) {
+      flushList()
+      currentSection = 'main'
+      const clean = trimmed.replace(/^(###\s*main answer|\*\*headline:\*\*|\*\*recommended approach:\*\*)\s*/i, '')
+      if (clean) result.mainAnswer = (result.mainAnswer ? result.mainAnswer + ' ' : '') + clean
+    } else if (lower.includes('why this fits:') || lower.includes('key findings:') || lower.includes('what this means:')) {
+      flushList()
+      currentSection = 'findings'
+    } else if (lower.includes('before training:') || lower.includes('important caveats:') || lower.includes('caveat & context')) {
+      flushList()
+      currentSection = 'caveats'
+    } else if (lower.includes('recommended next step:') || lower.includes('what you should do next:')) {
+      flushList()
+      currentSection = 'nextAction'
+      const clean = trimmed.replace(/^(###\s*what you should do next|\*\*recommended next step:\*\*)\s*/i, '')
+      if (clean) result.nextAction = clean
+    } else if (trimmed.startsWith('•') || trimmed.startsWith('-') || trimmed.startsWith('*') || /^\d+\./.test(trimmed)) {
+      const bulletContent = trimmed.replace(/^([\bullet\-\*]|\d+\.)\s*/, '')
+      if (currentSection === 'findings') result.findings.push(bulletContent)
+      else if (currentSection === 'caveats') result.caveats.push(bulletContent)
+      else if (currentSection === 'nextAction' && !result.nextAction) result.nextAction = bulletContent
+      else currentList.push(bulletContent)
+    } else {
+      if (currentSection === 'main') {
+        result.mainAnswer = (result.mainAnswer ? result.mainAnswer + ' ' : '') + trimmed
+      } else if (currentSection === 'nextAction') {
+        result.nextAction = (result.nextAction ? result.nextAction + ' ' : '') + trimmed
+      } else if (currentSection === 'findings') {
+        result.findings.push(trimmed)
+      } else {
+        result.explanation = (result.explanation ? result.explanation + '\n' : '') + trimmed
+      }
+    }
+  }
+  flushList()
+
+  return result
+}
+
+function ReportFormatter({ content, text }) {
+  const input = content ?? text
+  if (input === null || input === undefined) return null
+
+  const rawText = typeof input === 'string' ? input : JSON.stringify(input, null, 2)
+  if (!rawText.trim()) return null
+
+  const parsed = parsePlainLanguageSections(rawText)
+  const cleanText = (str) => String(str || '').replace(/\*\*/g, '').trim()
+
+  return (
+    <div className="report-formatted-container">
+      {/* 1. Main Answer */}
+      <div className="report-headline-block">
+        <h3 className="report-headline-text">
+          {cleanText(parsed.mainAnswer || rawText.split('\n')[0])}
+        </h3>
+      </div>
+
+      {/* 2. What This Means / Explanation */}
+      {parsed.explanation && (
+        <div className="report-explanation-block">
+          <p className="report-explanation-text">{cleanText(parsed.explanation)}</p>
+        </div>
+      )}
+
+      {/* 3. Key Findings */}
+      {parsed.findings.length > 0 && (
+        <div className="report-section-block">
+          <div className="report-section-title">Key Findings</div>
+          <ul className="report-findings-list">
+            {parsed.findings.slice(0, 5).map((finding, idx) => (
+              <li key={idx} className="finding-item">
+                <span className="finding-bullet">•</span>
+                <span className="finding-text">{cleanText(finding)}</span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      {/* 4. Caveats */}
+      {parsed.caveats.length > 0 && (
+        <div className="report-section-block caveats">
+          <div className="report-section-title">Important Caveats</div>
+          <ul className="report-caveats-list">
+            {parsed.caveats.map((c, idx) => (
+              <li key={idx}>{cleanText(c)}</li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      {/* 5. Recommended Next Step */}
+      {parsed.nextAction && (
+        <div className="report-next-action-box">
+          <div className="next-action-head">🎯 Recommended Next Step</div>
+          <p className="next-action-body">{cleanText(parsed.nextAction)}</p>
+        </div>
+      )}
+    </div>
+  )
+}
+
+function AnalysisProgressState({ status, onStop, msgId }) {
+  let title = "Analysis in progress"
+  let description = "We are preparing your answer. Results will appear here as soon as they are available."
+
+  if (status === 'planning') {
+    title = "Understanding your question"
+    description = "Understanding your question and selecting the best analysis approach..."
+  } else if (status === 'validating') {
+    title = "Checking accuracy"
+    description = "Checking the answer against dataset statistical bounds for accuracy..."
+  }
+
+  return (
+    <div className="analysis-progress-card" style={{ padding: '16px', background: '#F8FAFC', borderRadius: '10px', border: '1px solid #E2E8F0', margin: '8px 0' }}>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '6px' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+          <span className="running-pulse-dot" style={{ width: '8px', height: '8px', background: 'var(--primary, #4F46E5)', borderRadius: '50%' }} />
+          <strong style={{ color: '#0F172A', fontSize: '14px', fontWeight: 600 }}>{title}</strong>
+        </div>
+        {onStop && (
+          <button
+            onClick={() => onStop(msgId)}
+            style={{ fontSize: '11px', padding: '3px 8px', borderRadius: '4px', border: '1px solid #CBD5E1', background: '#FFFFFF', cursor: 'pointer', color: '#475569' }}
+          >
+            Stop
+          </button>
+        )}
+      </div>
+      <p style={{ margin: 0, fontSize: '13px', color: '#475569', lineHeight: 1.5 }}>{description}</p>
+    </div>
+  )
+}
+
+function InlineProgressMessage({ message }) {
+  return (
+    <div className="inline-progress-msg" style={{ display: 'flex', alignItems: 'center', gap: '8px', padding: '8px 12px', background: '#F1F5F9', borderRadius: '6px', fontSize: '12px', color: '#334155', marginTop: '10px' }}>
+      <span className="running-pulse-dot" style={{ width: '6px', height: '6px', background: 'var(--primary, #4F46E5)', borderRadius: '50%' }} />
+      <span>{message}</span>
+    </div>
+  )
+}
+
+function EmptyFinalAnswerError() {
+  return (
+    <div className="analysis-error-state warning" style={{ padding: '14px', background: '#FFFBEB', borderRadius: '8px', border: '1px solid #FDE68A', color: '#92400E' }}>
+      <strong style={{ fontSize: '14px', display: 'block', marginBottom: '4px' }}>No answer was returned</strong>
+      <p style={{ margin: 0, fontSize: '12px' }}>The analysis completed, but its result could not be displayed.</p>
+    </div>
+  )
+}
+
+function StructuredAnswerSection({ answer }) {
+  if (!answer || typeof answer !== 'object') return null
+  const { title, summary, explanation, findings = [], caveats = [], next_action } = answer
+
+  return (
+    <div className="report-formatted-container" style={{ padding: '4px 0' }}>
+      {title && <div className="report-section-title" style={{ fontSize: '13px', color: 'var(--primary, #4F46E5)', fontWeight: 600, marginBottom: '6px' }}>{title}</div>}
+      {summary && (
+        <div className="report-headline-block" style={{ marginBottom: '8px' }}>
+          <h3 className="report-headline-text" style={{ color: '#0F172A', fontWeight: 500, fontSize: '16px', lineHeight: 1.6, margin: 0 }}>
+            {summary}
+          </h3>
+        </div>
+      )}
+      {explanation && (
+        <div className="report-explanation-block" style={{ marginTop: '8px', marginBottom: '8px' }}>
+          <p className="report-explanation-text" style={{ color: '#334155', fontSize: '14px', lineHeight: 1.6, margin: 0 }}>{explanation}</p>
+        </div>
+      )}
+      {Array.isArray(findings) && findings.length > 0 && (
+        <div className="report-section-block" style={{ marginTop: '10px' }}>
+          <div className="report-section-title" style={{ fontSize: '13px', fontWeight: 600, color: '#1E293B', marginBottom: '4px' }}>Key Findings</div>
+          <ul className="report-findings-list" style={{ paddingLeft: '16px', margin: 0 }}>
+            {findings.map((f, idx) => (
+              <li key={idx} className="finding-item" style={{ marginBottom: '4px', fontSize: '14px', color: '#334155' }}>
+                {typeof f === 'object' && f !== null ? <span><strong>{f.label}:</strong> {f.detail}</span> : String(f)}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+      {Array.isArray(caveats) && caveats.length > 0 && (
+        <div className="report-section-block caveats" style={{ marginTop: '10px' }}>
+          <div className="report-section-title" style={{ fontSize: '13px', fontWeight: 600, color: '#B45309', marginBottom: '4px' }}>Important Caveats</div>
+          <ul className="report-caveats-list" style={{ paddingLeft: '16px', margin: 0 }}>
+            {caveats.map((c, idx) => (
+              <li key={idx} style={{ marginBottom: '4px', fontSize: '13px', color: '#92400E' }}>{String(c)}</li>
+            ))}
+          </ul>
+        </div>
+      )}
+      {next_action && (
+        <div className="report-next-action-box" style={{ marginTop: '12px', padding: '10px 14px', background: '#F0FDF4', border: '1px solid #BBF7D0', borderRadius: '8px' }}>
+          <div className="next-action-head" style={{ fontWeight: 600, fontSize: '13px', color: '#15803D', marginBottom: '2px' }}>🎯 Recommended Next Step</div>
+          <p className="next-action-body" style={{ margin: 0, fontSize: '13px', color: '#166534' }}>{next_action}</p>
+        </div>
+      )}
+    </div>
+  )
+}
+
+function AnalysisAnswer({ msg, isError }) {
+  if (isError) {
+    return (
+      <div className="analysis-error-state" style={{ padding: '12px', background: '#FEF2F2', borderRadius: '8px', border: '1px solid #FCA5A5' }}>
+        <p style={{ color: 'var(--accent-red, #EF4444)', fontWeight: 600, margin: 0 }}>{msg.error || 'The analysis could not be completed.'}</p>
+        {import.meta.env.DEV && (msg.rawResponse || msg.debugPayload) && (
+          <details className="debug-payload-details" style={{ marginTop: '8px', fontSize: '11px' }}>
+            <summary style={{ cursor: 'pointer', color: 'var(--text-muted)' }}>Raw API response debug payload</summary>
+            <pre style={{ background: '#F8FAFC', padding: '8px', borderRadius: '6px', overflow: 'auto', maxHeight: '200px', marginTop: '4px' }}>
+              {JSON.stringify(msg.rawResponse || msg.debugPayload, null, 2)}
+            </pre>
+          </details>
+        )}
+      </div>
+    )
+  }
+
+  const ansObj = msg.answer && typeof msg.answer === 'object' ? msg.answer : null
+  if (ansObj && (ansObj.summary || ansObj.title || ansObj.explanation)) {
+    return <StructuredAnswerSection answer={ansObj} />
+  }
+
+  const rowData = msg.answerData || msg.row_data
+  if (rowData && (rowData.fields || rowData.values)) {
+    return <RowTableSection rowData={rowData} />
+  }
+
+  if (typeof msg.answerText === 'string' && msg.answerText.trim()) {
+    return <ReportFormatter content={msg.answerText} />
+  }
+
+  if (typeof msg.report === 'string' && msg.report.trim()) {
+    return <ReportFormatter content={msg.report} />
+  }
+
+  if (typeof msg.result === 'string' && msg.result.trim()) {
+    return <ReportFormatter content={msg.result} />
+  }
+
+  if (msg.answerData !== undefined && msg.answerData !== null) {
+    return (
+      <div className="generic-structured-result" style={{ background: '#F8FAFC', padding: '12px', borderRadius: '8px' }}>
+        <pre style={{ margin: 0, fontSize: '12px', fontFamily: 'monospace', color: '#0F172A' }}>
+          {typeof msg.answerData === 'object' ? JSON.stringify(msg.answerData, null, 2) : String(msg.answerData)}
+        </pre>
+      </div>
+    )
+  }
+
+  return null
+}
+
+function ChatMessage({ msg, onAsk, onStop }) {
   const [showCode, setShowCode] = useState(false)
-  const isDone = msg.steps.some((s) => s.step === 'done')
-  const isError = msg.steps.some((s) => s.step === 'error')
+  const status = msg.status || 'running'
+  const isDone = status === 'complete' || status === 'failed' || status === 'cancelled'
+  const isError = status === 'failed' || msg.steps.some((s) => s.step === 'error' || s.type === 'analysis_failed')
+  const isStreaming = msg.streaming && !isDone && !isError
+
   const cat = catByKey(msg.category)
   const hasExplain = msg.shap_chart || msg.perm_chart || msg.pdp_chart
   const latestMeta = [...msg.steps].reverse().find((s) => s.meta)?.meta
   const route = latestMeta?.route || msg.plan?.query_type
 
-  // Filter display steps — hide internal plan/critique/code steps from the track
-  const displaySteps = msg.steps.filter(s => !['plan', 'critique', 'code'].includes(s.step))
+  const lensRes = msg.lens_resolution || latestMeta?.lens_resolution || msg.steps.find(s => s.lens_resolution)?.lens_resolution
+  const effectiveCategory = lensRes?.effective_lens || msg.category
+  const effectiveCatObj = catByKey(effectiveCategory)
+  const wasAutoSwitched = lensRes?.was_auto_switched
+
+  const hasRenderableAnswer = Boolean(msg.answerText?.trim()) ||
+    msg.answerData !== undefined ||
+    Boolean(msg.result?.trim()) ||
+    Boolean(msg.report?.trim()) ||
+    Boolean(msg.row_data)
 
   return (
     <div className="chat-msg">
       <div className="bubble-user"><p>{msg.question}</p></div>
 
-      <div className={`bubble-agent ${isError ? 'is-error' : isDone ? 'is-done' : 'is-loading'}`}>
+      <div
+        className={`bubble-agent ${isError ? 'is-error' : isDone ? 'is-done' : 'is-loading'}`}
+        aria-live="polite"
+        aria-busy={isStreaming}
+      >
         <div className="agent-head">
-          <Sparkles width={14} height={14} /> Multi-Agent Analyst
-          <span className="agent-lens"><cat.icon width={11} height={11} /> {cat.label}</span>
-          {msg.plan?.persona?.name && (
-            <span className="persona-head-badge">{msg.plan.persona.name}</span>
+          <div className="agent-title-group">
+            <Sparkles width={14} height={14} />
+            <span>Multi-Agent Analyst</span>
+          </div>
+          <span className="agent-lens" title={wasAutoSwitched ? `Originally selected: ${cat.label}` : undefined}>
+            <effectiveCatObj.icon width={11} height={11} /> {effectiveCatObj.label}
+            {wasAutoSwitched && <em className="auto-selected-tag"> · Auto-selected</em>}
+          </span>
+
+          {!isDone && (
+            <span className="status-badge-progressive neutral">
+              <span className="running-pulse-dot" />
+              {status === 'planning' ? 'Planning' : status === 'validating' ? 'Checking accuracy' : status === 'partial' ? 'Initial answer' : 'Analyzing'}
+            </span>
           )}
+
           {isDone && !isError && (
             <AnswerTrustBadge route={route} validation={msg.validation} critique={msg.critique} />
           )}
-          {latestMeta?.request_id && (
+
+          {latestMeta?.request_id ? (
             <span className="trace-badge" title={`Request ${latestMeta.request_id}`}>
-              {latestMeta.endpoint || 'stream'} #{latestMeta.request_id.slice(0, 8)}
+              #{latestMeta.request_id.slice(0, 8)}
+            </span>
+          ) : (
+            <span className="security-badge" title="AST-validated · sandboxed execution">
+              <Lock width={12} height={12} />
             </span>
           )}
-          <span className="security-badge" title="AST-validated · sandboxed execution · 30s timeout">🔒</span>
         </div>
 
-        <div className="steps-track">
-          {displaySteps.map((s, i) => <AgentStep key={i} step={s} />)}
-        </div>
+        <div className="card-divider" />
 
-        {msg.plan && <PlanBadge plan={msg.plan} />}
+        {/* ── STATE-BASED ANSWER RENDERER ── */}
+        {(status === 'queued' || status === 'planning' || status === 'running') && !hasRenderableAnswer && (
+          <AnalysisProgressState status={status} onStop={onStop} msgId={msg.id} />
+        )}
 
-        {msg.code && (
-          <div className="code-section">
-            <button className="code-toggle" onClick={() => setShowCode((v) => !v)}>
-              <Code width={14} height={14} />
-              {msg.code_lang === 'sql'
-                ? <span className="code-lang-badge sql">SQL</span>
-                : <span className="code-lang-badge py">Python</span>}
-              {showCode ? 'Hide' : 'Show'} generated code
-            </button>
-            {showCode && <div className="code-block"><pre>{msg.code}</pre></div>}
+        {(status === 'queued' || status === 'planning' || status === 'running') && hasRenderableAnswer && (
+          <>
+            <AnalysisAnswer msg={msg} />
+            <InlineProgressMessage message="Additional analysis is still running." />
+          </>
+        )}
+
+        {status === 'partial' && (
+          <>
+            <AnalysisAnswer msg={msg} />
+            <InlineProgressMessage message="Initial answer available. Additional checks are still running." />
+          </>
+        )}
+
+        {status === 'validating' && (
+          <>
+            <AnalysisAnswer msg={msg} />
+            <InlineProgressMessage message="Checking the answer for accuracy." />
+          </>
+        )}
+
+        {status === 'failed' && <AnalysisAnswer msg={msg} isError={true} />}
+
+        {status === 'complete' && hasRenderableAnswer && <AnalysisAnswer msg={msg} />}
+
+        {status === 'complete' && !hasRenderableAnswer && <EmptyFinalAnswerError />}
+
+        {/* ── LIVE ACTIVITY LOG / CHECKLIST WITH STOP BUTTON WHEN PROCESSING ── */}
+        <LiveExecutionLog
+          steps={msg.steps}
+          isDone={isDone}
+          latestMeta={latestMeta}
+          lensRes={lensRes}
+          isStreaming={isStreaming}
+          onStop={() => onStop && onStop(msg.id)}
+        />
+
+        {/* Strategy Row */}
+        {msg.plan?.strategy && (
+          <div className="strategy-row">
+            <Layers width={13} height={13} style={{ color: 'var(--primary)', flexShrink: 0 }} />
+            <span><strong>Strategy:</strong> {msg.plan.strategy}</span>
           </div>
         )}
 
-        {/* ML predict: explainability panel; otherwise Plotly or PNG chart */}
+        {/* Visualization */}
         {hasExplain ? (
           <ExplainPanel msg={msg} />
         ) : msg.chart_json ? (
@@ -1472,21 +3327,47 @@ function ChatMessage({ msg, onAsk }) {
           msg.chart && <img className="chart-img" src={`data:image/png;base64,${msg.chart}`} alt="Generated chart" />
         )}
 
-        {msg.report && !isError && (
-          <div className="report-section">
-            <div className="report-label"><Sparkles width={12} height={12} /> Executive Summary</div>
-            <div className="report-body">{msg.report}</div>
+        {/* Code Accordion */}
+        {msg.code && (
+          <div className="code-accordion accordion-row">
+            <div
+              className="accordion-summary-clean"
+              onClick={() => setShowCode((v) => !v)}
+              role="button"
+              tabIndex={0}
+              aria-expanded={showCode}
+              onKeyDown={(e) => (e.key === 'Enter' || e.key === ' ') && setShowCode((v) => !v)}
+            >
+              <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                <Code width={14} height={14} style={{ color: 'var(--primary)' }} />
+                <span>Generated Code ({msg.code_lang === 'sql' ? 'SQL' : 'Python'})</span>
+              </div>
+              <span style={{ fontSize: '11px', color: 'var(--text-muted)' }}>{showCode ? 'Hide ▲' : 'Show ▲'}</span>
+            </div>
+            {showCode && (
+              <div className="code-block-clean">
+                <pre>{msg.code}</pre>
+              </div>
+            )}
           </div>
         )}
 
-        {!msg.report && msg.result && !isError && (
-          <div className="result-box"><pre className="result-text">{msg.result}</pre></div>
-        )}
-
+        {/* Critique Note & Validation Accordion */}
         {msg.critique && isDone && <CritiqueBadge critique={msg.critique} />}
 
         {msg.validation && isDone && !isError && <ValidationPanel validation={msg.validation} />}
 
+        {/* Subtle Lens Note at Bottom */}
+        {wasAutoSwitched && isDone && (
+          <div className="lens-note-compact">
+            <Sparkles width={13} height={13} style={{ color: 'var(--primary)', flexShrink: 0 }} />
+            <span>
+              <strong>Lens note:</strong> This dataset appears to contain {effectiveCatObj.label.toLowerCase()} data. The analysis was completed using the {effectiveCatObj.label} lens instead of the selected {cat.label} lens. For future questions about this dataset, choose the {effectiveCatObj.label} or General lens.
+            </span>
+          </div>
+        )}
+
+        {/* Follow-up Question Chips */}
         {msg.followups?.length > 0 && isDone && !isError && (
           <div className="followup-row">
             {msg.followups.map((text) => (
@@ -1501,7 +3382,7 @@ function ChatMessage({ msg, onAsk }) {
   )
 }
 
-function ChatArea({ upload, category, messages, onAsk, onStory, onInvestigate, onCleanExport, onExportContract, onExportDashboard, cleaningBusy, loading, question, setQuestion, inputRef }) {
+function ChatArea({ upload, category, messages, onAsk, onStory, onInvestigate, onCleanExport, onExportContract, onExportDashboard, cleaningBusy, loading, question, setQuestion, inputRef, onStop }) {
   const cat = catByKey(category)
   const bottomRef = useRef()
   useEffect(() => { bottomRef.current?.scrollIntoView({ behavior: 'smooth' }) }, [messages])
@@ -1637,7 +3518,7 @@ function ChatArea({ upload, category, messages, onAsk, onStory, onInvestigate, o
         )
       ) : (
         <div className="message-list">
-          {messages.map((m) => <ChatMessage key={m.id} msg={m} onAsk={onAsk} />)}
+          {messages.map((m) => <ChatMessage key={m.id} msg={m} onAsk={onAsk} onStop={onStop} />)}
           <div ref={bottomRef} />
         </div>
       )}
@@ -1671,17 +3552,119 @@ function ChatArea({ upload, category, messages, onAsk, onStory, onInvestigate, o
 
 export default function App() {
   const [upload, setUpload] = useState(null)
+  const [datasets, setDatasets] = useState([])
   const [uploading, setUploading] = useState(false)
   const [category, setCategory] = useState('general')
   const [messages, setMessages] = useState([])
   const [question, setQuestion] = useState('')
   const [loading, setLoading] = useState(false)
+  const [leftPanelCollapsed, setLeftPanelCollapsed] = useState(false)
+  const [rightPanelCollapsed, setRightPanelCollapsed] = useState(false)
+  const requestTimeoutsRef = useRef(new Map())
+  const isAnalyzing = useMemo(() => {
+    return loading || (messages || []).some((m) => m.status === 'queued' || m.status === 'running' || (m.status === 'partial' && m.streaming))
+  }, [loading, messages])
   const [showPaste, setShowPaste] = useState(false)
+  const [showUrlImport, setShowUrlImport] = useState(false)
+  const [showJoin, setShowJoin] = useState(false)
+  const [showCompare, setShowCompare] = useState(false)
   const [showBenchmark, setShowBenchmark] = useState(false)
+  const [showDataViewer, setShowDataViewer] = useState(false)
   const [modelInfo, setModelInfo] = useState(null)
   const [docs, setDocs] = useState([])
   const [cleaningBusy, setCleaningBusy] = useState(false)
   const inputRef = useRef()
+
+  const [sidebarWidth, setSidebarWidth] = useState(320)
+  const [insightsWidth, setInsightsWidth] = useState(400)
+  const isDraggingSidebar = useRef(false)
+  const isDraggingInsights = useRef(false)
+
+  const handleSidebarMouseDown = useCallback((e) => {
+    e.preventDefault()
+    isDraggingSidebar.current = true
+    const startX = e.clientX
+    const startWidth = sidebarWidth
+
+    const handleMouseMove = (moveEvent) => {
+      if (!isDraggingSidebar.current) return
+      const delta = moveEvent.clientX - startX
+      const newWidth = Math.max(280, Math.min(600, startWidth + delta))
+      setSidebarWidth(newWidth)
+    }
+
+    const handleMouseUp = () => {
+      isDraggingSidebar.current = false
+      window.removeEventListener('mousemove', handleMouseMove)
+      window.removeEventListener('mouseup', handleMouseUp)
+      document.body.classList.remove('is-resizing')
+    }
+
+    window.addEventListener('mousemove', handleMouseMove)
+    window.addEventListener('mouseup', handleMouseUp)
+    document.body.classList.add('is-resizing')
+  }, [sidebarWidth])
+
+  const handleInsightsMouseDown = useCallback((e) => {
+    e.preventDefault()
+    isDraggingInsights.current = true
+    const startX = e.clientX
+    const startWidth = insightsWidth
+
+    const handleMouseMove = (moveEvent) => {
+      if (!isDraggingInsights.current) return
+      const delta = startX - moveEvent.clientX
+      // Size in Picture 2 (380px+) is the minimum safe width; panel is expandable only and NOT shrinkable below this bound!
+      const newWidth = Math.max(380, Math.min(750, startWidth + delta))
+      setInsightsWidth(newWidth)
+    }
+
+    const handleMouseUp = () => {
+      isDraggingInsights.current = false
+      window.removeEventListener('mousemove', handleMouseMove)
+      window.removeEventListener('mouseup', handleMouseUp)
+      document.body.classList.remove('is-resizing')
+    }
+
+    window.addEventListener('mousemove', handleMouseMove)
+    window.addEventListener('mouseup', handleMouseUp)
+    document.body.classList.add('is-resizing')
+  }, [insightsWidth])
+
+  const handleUpload = useCallback((data) => {
+    const item = { ...data, uploadedAt: data.uploadedAt || new Date() }
+    setUpload(item)
+    setDatasets((prev) => {
+      const idx = prev.findIndex(d => d.session_id === item.session_id)
+      if (idx >= 0) {
+        const next = [...prev]; next[idx] = item; return next
+      }
+      return [...prev, item]
+    })
+  }, [])
+
+  const handleUrlImportSubmit = useCallback(async (urlStr) => {
+    if (!urlStr.trim()) return
+    setUploading(true)
+    try {
+      const res = await fetch(`${API}/import_url`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url: urlStr.trim(), filename: 'imported_dataset.csv' }),
+      })
+      const data = await res.json()
+      if (!res.ok) throw new Error(data.detail || 'Import failed')
+      setShowUrlImport(false)
+      setMessages([])
+      setModelInfo(null)
+      setDocs([])
+      handleUpload(data)
+    } catch (e) {
+      alert(e.message)
+    } finally {
+      setUploading(false)
+    }
+  }, [handleUpload])
 
   const handlePasteSubmit = useCallback(async (text, hasHeader) => {
     if (!text.trim()) return
@@ -1689,7 +3672,7 @@ export default function App() {
     try {
       const res = await fetch(`${API}/upload_text`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', 'X-Session-Token': upload?.token || '' },
         body: JSON.stringify({ text, has_header: hasHeader, filename: 'pasted_data.csv' }),
       })
       const data = await res.json()
@@ -1698,7 +3681,7 @@ export default function App() {
       setMessages([])
       setModelInfo(null)
       setDocs([])
-      setUpload({ ...data, uploadedAt: new Date() })
+      handleUpload(data)
     } catch (e) {
       alert(e.message)
     } finally {
@@ -1706,69 +3689,321 @@ export default function App() {
     }
   }, [])
 
+  // Per-request abort controller map: requestId → {controller, timeoutId}
+  // This prevents a new request from cancelling an older in-flight request.
+  const requestManagerRef = useRef(new Map())
+
+  const handleStop = useCallback((msgId) => {
+    const entry = requestManagerRef.current.get(msgId)
+    if (entry) {
+      clearTimeout(entry.timeoutId)
+      entry.controller.abort('user_cancelled')
+      requestManagerRef.current.delete(msgId)
+    }
+    fetch(`${API}/cancel/${msgId}`, { method: 'POST' }).catch(() => {})
+    setMessages((prev) => prev.map((m) => m.id === msgId ? {
+      ...m,
+      streaming: false,
+      status: 'cancelled',
+      steps: [...m.steps, { step: 'stopped', message: 'Stopped by user — partial results preserved' }]
+    } : m))
+    setLoading(false)
+  }, [])
+
+  const handleAnalysisStreamEvent = useCallback((rawEvent, clientRequestId) => {
+    const eventClass = classifyStreamEvent(rawEvent)
+    const normalized = normalizeQueryResponse(rawEvent, clientRequestId)
+    const currentReqId = String(clientRequestId).toLowerCase()
+
+    console.debug('[query-stream] event classification', {
+      eventType: rawEvent?.type || rawEvent?.step,
+      eventClass,
+      clientRequestId,
+      rawEvent,
+    })
+
+    setMessages((prev) => prev.map((m) => {
+      if (String(m.id).toLowerCase() !== currentReqId) return m
+
+      const combinedSteps = [...(m.steps || []), rawEvent]
+      const newExecutionSteps = normalized.executionSteps.length > 0
+        ? normalized.executionSteps
+        : (m.executionSteps || combinedSteps.map(normalizeExecutionStep))
+
+      if (eventClass === 'progress') {
+        return {
+          ...m,
+          status: 'running',
+          streaming: true,
+          steps: combinedSteps,
+          executionSteps: newExecutionSteps,
+          plan: rawEvent.plan ?? m.plan,
+          code: rawEvent.code ?? m.code,
+        }
+      }
+
+      if (eventClass === 'partial-result') {
+        return {
+          ...m,
+          status: 'partial',
+          streaming: true,
+          steps: combinedSteps,
+          executionSteps: newExecutionSteps,
+          answerText: normalized.answerText ?? m.answerText,
+          answerType: normalized.answerType ?? m.answerType,
+          answerData: normalized.answerData ?? m.answerData,
+          result: normalized.answerText ?? m.result,
+          report: normalized.answerText ?? m.report,
+          row_data: normalized.answerData ?? m.row_data,
+          code: normalized.generatedCode ?? rawEvent.code ?? m.code,
+          code_lang: rawEvent.code_lang ?? m.code_lang,
+          chart: rawEvent.chart ?? m.chart,
+          chart_json: rawEvent.chart_json ?? m.chart_json,
+        }
+      }
+
+      if (eventClass === 'terminal-failure') {
+        return {
+          ...m,
+          status: 'failed',
+          streaming: false,
+          error: rawEvent.error || rawEvent.message || 'Analysis failed',
+          debugPayload: import.meta.env.DEV ? rawEvent : undefined,
+          steps: combinedSteps,
+          executionSteps: newExecutionSteps,
+        }
+      }
+
+      if (eventClass === 'terminal-success') {
+        const hasAnswer = Boolean(normalized.answerText?.trim()) || normalized.answerData !== undefined || Boolean(rawEvent.result) || Boolean(rawEvent.report) || Boolean(rawEvent.row_data)
+
+        if (!hasAnswer) {
+          console.error('[query-stream] terminal-success has no renderable answer', { normalized, rawEvent })
+          return {
+            ...m,
+            status: 'failed',
+            streaming: false,
+            error: 'The server completed the analysis but returned no displayable answer.',
+            debugPayload: import.meta.env.DEV ? rawEvent : undefined,
+            steps: combinedSteps,
+            executionSteps: newExecutionSteps,
+          }
+        }
+
+        return {
+          ...m,
+          status: 'complete',
+          streaming: false,
+          steps: combinedSteps,
+          executionSteps: newExecutionSteps,
+          answerText: normalized.answerText ?? m.answerText,
+          answerType: normalized.answerType ?? m.answerType,
+          answerData: normalized.answerData ?? m.answerData,
+          code: normalized.generatedCode ?? rawEvent.code ?? m.code,
+          code_lang: rawEvent.code_lang ?? m.code_lang,
+          result: normalized.answerText ?? rawEvent.result ?? m.result,
+          chart: rawEvent.chart ?? m.chart,
+          chart_json: rawEvent.chart_json ?? m.chart_json,
+          report: normalized.answerText ?? rawEvent.report ?? m.report,
+          critique: rawEvent.critique ?? m.critique,
+          validation: rawEvent.validation ?? m.validation,
+          plan: rawEvent.plan ?? m.plan,
+          followups: rawEvent.followups ?? m.followups,
+          row_data: normalized.answerData ?? rawEvent.row_data ?? m.row_data,
+          error: null,
+          debugPayload: import.meta.env.DEV ? rawEvent : undefined,
+        }
+      }
+
+      return m
+    }))
+  }, [])
+
   // Shared SSE consumer used by streaming analysis endpoints.
   const streamInto = useCallback(async (url, body, label) => {
     if (!upload || loading) return
     setLoading(true)
-    const msgId = Date.now()
-    setMessages((prev) => [...prev, { id: msgId, question: label, category, steps: [], code: null, code_lang: null, result: null, chart: null, chart_json: null, report: null, critique: null, validation: null, plan: null, followups: [], shap_chart: null, perm_chart: null, pdp_chart: null }])
+    const clientRequestId = typeof crypto !== 'undefined' && crypto.randomUUID
+      ? crypto.randomUUID()
+      : `req-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`
+
+    const controller = new AbortController()
+    const timeoutId = window.setTimeout(() => {
+      console.warn('[query] request timed out after 120s', { clientRequestId })
+      controller.abort('timeout')
+    }, 120000)
+
+    // Register this request in the per-request manager map
+    requestManagerRef.current.set(clientRequestId, { controller, timeoutId })
+
+    console.debug('[query] submitting request', {
+      clientRequestId,
+      question: label,
+      category,
+      url,
+    })
+
+    setMessages((prev) => [...prev, {
+      id: clientRequestId,
+      request_id: clientRequestId,
+      question: label,
+      category,
+      status: 'running',
+      streaming: true,
+      steps: [],
+      code: null,
+      code_lang: null,
+      result: null,
+      chart: null,
+      chart_json: null,
+      report: null,
+      critique: null,
+      validation: null,
+      plan: null,
+      followups: [],
+      shap_chart: null,
+      perm_chart: null,
+      pdp_chart: null,
+      row_data: null,
+      error: null,
+    }])
 
     try {
+      const requestPayload = { ...body, request_id: clientRequestId }
       const res = await fetch(url, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
+        headers: { 'Content-Type': 'application/json', 'X-Session-Token': upload?.token || '' },
+        body: JSON.stringify(requestPayload),
+        signal: controller.signal,
       })
+
+      const contentType = res.headers.get('content-type') || ''
+      console.debug('[query] response received', {
+        clientRequestId,
+        status: res.status,
+        contentType,
+      })
+
       if (!res.ok) {
-        const err = await res.json()
-        throw new Error(err.detail || 'Request failed')
+        const errText = await res.text()
+        let detail = `Query failed with status ${res.status}`
+        try {
+          const parsed = JSON.parse(errText)
+          detail = parsed.detail || detail
+        } catch (_) {}
+        throw new Error(detail)
+      }
+
+      if (contentType.includes('application/json')) {
+        const raw = await res.json()
+        handleAnalysisStreamEvent(raw, clientRequestId)
+        return
+      }
+
+      if (!res.body) {
+        throw new Error('Streaming response has no body.')
       }
 
       const reader = res.body.getReader()
       const decoder = new TextDecoder()
       let buffer = ''
+      let terminalReceived = false
 
-      const handleEvent = (block) => {
-        const line = block.split('\n').find((l) => l.startsWith('data: '))
-        if (!line) return
+      const parseSseBlock = (block) => {
+        const lines = block.split(/\r?\n/)
+        const dataLine = lines.find((l) => l.startsWith('data: '))
+        if (!dataLine) return null
         try {
-          const event = JSON.parse(line.slice(6))
-          setMessages((prev) => prev.map((m) => m.id !== msgId ? m : {
-            ...m,
-            steps: [...m.steps, event],
-            code: event.code ?? m.code,
-            code_lang: event.code_lang ?? m.code_lang,
-            result: event.result ?? m.result,
-            chart: event.chart ?? m.chart,
-            chart_json: event.chart_json ?? m.chart_json,
-            report: event.report ?? m.report,
-            critique: event.critique ?? m.critique,
-            validation: event.validation ?? m.validation,
-            plan: event.plan ?? m.plan,
-            followups: event.followups ?? m.followups,
-            shap_chart: event.shap_chart ?? m.shap_chart,
-            perm_chart: event.perm_chart ?? m.perm_chart,
-            pdp_chart:  event.pdp_chart  ?? m.pdp_chart,
-          }))
-        } catch (_) {}
+          return JSON.parse(dataLine.slice(6))
+        } catch (_) {
+          return null
+        }
       }
 
-      while (true) {
-        const { done, value } = await reader.read()
-        if (done) break
-        // Buffer chunks; only parse complete SSE events (separated by a blank line).
-        // Large payloads (e.g. a 90KB chart) span multiple chunks.
-        buffer += decoder.decode(value, { stream: true })
-        const blocks = buffer.split('\n\n')
-        buffer = blocks.pop() ?? ''
-        for (const block of blocks) handleEvent(block)
+      try {
+        while (true) {
+          const { value, done } = await reader.read()
+          buffer += decoder.decode(value, { stream: !done })
+
+          const blocks = buffer.split(/\r?\n\r?\n/)
+          buffer = blocks.pop() ?? ''
+
+          for (const block of blocks) {
+            const event = parseSseBlock(block)
+            if (!event) continue
+
+            const eventReqId = String(event.request_id ?? event.requestId ?? '').toLowerCase()
+            if (eventReqId && eventReqId !== String(clientRequestId).toLowerCase()) {
+              continue
+            }
+
+            handleAnalysisStreamEvent(event, clientRequestId)
+            const classification = classifyStreamEvent(event)
+            if (classification === 'terminal-success' || classification === 'terminal-failure') {
+              terminalReceived = true
+            }
+          }
+
+          if (done) break
+        }
+
+        if (buffer.trim()) {
+          const finalEvent = parseSseBlock(buffer)
+          if (finalEvent) {
+            handleAnalysisStreamEvent(finalEvent, clientRequestId)
+            const classification = classifyStreamEvent(finalEvent)
+            if (classification === 'terminal-success' || classification === 'terminal-failure') {
+              terminalReceived = true
+            }
+          }
+        }
+
+        if (!terminalReceived) {
+          setMessages((prev) => prev.map((m) => {
+            if (String(m.id).toLowerCase() !== String(clientRequestId).toLowerCase()) return m
+            if (m.status === 'complete' || m.status === 'failed') return m
+            const hasAnswer = Boolean(m.answerText) || m.answerData !== undefined || Boolean(m.result) || Boolean(m.report)
+            return {
+              ...m,
+              status: hasAnswer ? 'complete' : 'failed',
+              streaming: false,
+              error: hasAnswer ? null : 'The stream ended without a terminal completion event.',
+            }
+          }))
+        }
+      } finally {
+        reader.releaseLock()
       }
-      if (buffer.trim()) handleEvent(buffer)
     } catch (e) {
-      setMessages((prev) => prev.map((m) => m.id === msgId
-        ? { ...m, steps: [...m.steps, { step: 'error', message: e.message }] } : m))
+      if (e.name === 'AbortError') {
+        console.warn('[query] request aborted or timed out', { clientRequestId })
+        setMessages((prev) => prev.map((m) => {
+          if (String(m.id).toLowerCase() !== String(clientRequestId).toLowerCase()) return m
+          const hasPartial = m.steps.length > 0 || m.result != null || m.row_data != null
+          return {
+            ...m,
+            status: hasPartial ? 'partial' : 'failed',
+            streaming: false,
+            error: 'The server did not send a completion response. Any available partial results have been preserved.',
+          }
+        }))
+      } else {
+        console.error('[query] request error', { clientRequestId, error: e.message })
+        setMessages((prev) => prev.map((m) => {
+          if (String(m.id).toLowerCase() !== String(clientRequestId).toLowerCase()) return m
+          return {
+            ...m,
+            status: 'failed',
+            streaming: false,
+            error: e.message || 'The analysis could not be completed.',
+          }
+        }))
+      }
     } finally {
+      window.clearTimeout(timeoutId)
+      requestManagerRef.current.delete(clientRequestId)
       setLoading(false)
+      console.debug('[query] completing request cleanup', { clientRequestId })
       setTimeout(() => inputRef.current?.focus(), 50)
     }
   }, [upload, loading, category])
@@ -1794,9 +4029,8 @@ export default function App() {
   const predict = useCallback(async (target) => {
     if (!target) return
     await streamInto(`${API}/predict`, { session_id: upload.session_id, target, category }, `🔮 Predict "${target}"`)
-    // Load the trained-model metadata so the user can predict new cases.
     try {
-      const res = await fetch(`${API}/model_info/${upload.session_id}`)
+      const res = await fetch(`${API}/model_info/${upload.session_id}`, { headers: { 'X-Session-Token': upload?.token || '' } })
       if (res.ok) {
         const info = await res.json()
         if (info.trained) setModelInfo(info)
@@ -1810,7 +4044,7 @@ export default function App() {
     try {
       const res = await fetch(`${API}/clean/${upload.session_id}`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', 'X-Session-Token': upload?.token || '' },
         body: JSON.stringify({}),
       })
       const payload = await res.json()
@@ -1835,7 +4069,14 @@ export default function App() {
 
   return (
     <div className="app">
-      <TopNav upload={upload} category={category} />
+      <TopNav
+        upload={upload}
+        category={category}
+        leftPanelCollapsed={leftPanelCollapsed}
+        setLeftPanelCollapsed={setLeftPanelCollapsed}
+        rightPanelCollapsed={rightPanelCollapsed}
+        setRightPanelCollapsed={setRightPanelCollapsed}
+      />
       {!upload ? (
         <UploadScreen
           onUpload={setUpload}
@@ -1844,17 +4085,37 @@ export default function App() {
           category={category}
           setCategory={setCategory}
           onOpenPaste={() => setShowPaste(true)}
+          onOpenUrlImport={() => setShowUrlImport(true)}
         />
       ) : (
-        <div className="workspace">
-          <Sidebar
-            upload={upload}
-            category={category}
-            setCategory={setCategory}
-            onReset={() => { setUpload(null); setMessages([]); setModelInfo(null); setDocs([]) }}
-            docs={docs}
-            onDocsUpdated={setDocs}
-          />
+        <div className={`workspace ${leftPanelCollapsed ? 'collapsed-left' : ''} ${rightPanelCollapsed ? 'collapsed-right' : ''}`}>
+          {!leftPanelCollapsed && (
+            <>
+              <Sidebar
+                style={{ width: `${sidebarWidth}px` }}
+                upload={upload}
+                category={category}
+                setCategory={setCategory}
+                onReset={() => { setUpload(null); setMessages([]); setModelInfo(null); setDocs([]) }}
+                docs={docs}
+                onDocsUpdated={setDocs}
+                datasets={datasets}
+                onSelectDataset={(d) => setUpload(d)}
+                onOpenAddDataset={() => setUpload(null)}
+                onOpenJoin={() => setShowJoin(true)}
+                onOpenCompare={() => setShowCompare(true)}
+                onOpenDataViewer={() => setShowDataViewer(true)}
+              />
+              <div
+                className="panel-resizer panel-resizer-left"
+                onMouseDown={handleSidebarMouseDown}
+                onDoubleClick={() => setSidebarWidth(320)}
+                title="Drag to resize left panel (Double-click to reset)"
+              >
+                <div className="resizer-handle-line" />
+              </div>
+            </>
+          )}
           <ChatArea
             upload={upload}
             category={category}
@@ -1871,24 +4132,56 @@ export default function App() {
             setQuestion={setQuestion}
             inputRef={inputRef}
           />
-          <InsightsPanel
-            upload={upload}
-            category={category}
-            onAsk={ask}
-            onStory={story}
-            onInvestigate={investigate}
-            onPredict={predict}
-            onOpenPaste={() => setShowPaste(true)}
-            onOpenBenchmark={() => setShowBenchmark(true)}
-            onCleanExport={exportCleanedCsv}
-            onExportContract={exportDataContract}
-            onExportDashboard={exportDashboardSpec}
-            cleaningBusy={cleaningBusy}
-            modelInfo={modelInfo}
-            loading={loading}
-            messages={messages}
-          />
+          {!rightPanelCollapsed && (
+            <>
+              <div
+                className="panel-resizer panel-resizer-right"
+                onMouseDown={handleInsightsMouseDown}
+                onDoubleClick={() => setInsightsWidth(400)}
+                title="Drag to expand right panel (Double-click to reset)"
+              >
+                <div className="resizer-handle-line" />
+              </div>
+              <InsightsErrorBoundary>
+                <DatasetInsightsPanel
+                  style={{ width: `${insightsWidth}px`, minWidth: '380px', maxWidth: '750px' }}
+                  upload={upload}
+                  category={category}
+                  onAsk={ask}
+                  onStory={story}
+                  onInvestigate={investigate}
+                  onPredict={predict}
+                  onOpenPaste={() => setShowPaste(true)}
+                  onOpenBenchmark={() => setShowBenchmark(true)}
+                  onCleanExport={exportCleanedCsv}
+                  onExportContract={exportDataContract}
+                  onExportDashboard={exportDashboardSpec}
+                />
+              </InsightsErrorBoundary>
+            </>
+          )}
         </div>
+      )}
+
+            {showUrlImport && (
+        <UrlImportModal uploading={uploading} onClose={() => setShowUrlImport(false)} onSubmit={handleUrlImportSubmit} />
+      )}
+
+      {showJoin && datasets.length >= 2 && (
+        <JoinModal
+          datasets={datasets}
+          activeSessionId={upload?.session_id}
+          onClose={() => setShowJoin(false)}
+          onJoined={handleUpload}
+        />
+      )}
+
+      {showCompare && datasets.length >= 2 && (
+        <CompareModal
+          datasets={datasets}
+          activeSessionId={upload?.session_id}
+          onClose={() => setShowCompare(false)}
+        />
       )}
 
       {showPaste && (
@@ -1897,6 +4190,10 @@ export default function App() {
 
       {showBenchmark && upload && (
         <BenchmarkModal sessionId={upload.session_id} onClose={() => setShowBenchmark(false)} />
+      )}
+
+      {showDataViewer && upload && (
+        <ExcelDataViewerModal upload={upload} onClose={() => setShowDataViewer(false)} />
       )}
     </div>
   )

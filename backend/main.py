@@ -1,4 +1,5 @@
 import ast
+import sys
 import io
 import os
 import re
@@ -11,8 +12,21 @@ import queue
 import socket
 import ipaddress
 import urllib.parse
+import logging
+import httpx
+import contextlib
 import multiprocessing as mp
 from collections.abc import Awaitable, Callable
+from typing import Any, Literal
+from backend.streaming.cancellation import cancel_request, is_cancelled, clear_cancellation
+from backend.llm.client import llm_client
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+)
+logger = logging.getLogger(__name__)
+BACKEND_BUILD_ID = "runtime-query-debug-v3"
 
 import pandas as pd
 import numpy as np
@@ -23,7 +37,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 import seaborn as sns
 
-# ── Premium chart theme — seaborn base + custom rcParams, matched to the indigo UI ──
+# ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ Premium chart theme ÃÂ¢ÃÂÃÂ seaborn base + custom rcParams, matched to the indigo UI ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
 INDIGO_PALETTE = ["#4F46E5", "#10B981", "#F59E0B", "#8B5CF6", "#EF4444",
                   "#06B6D4", "#EC4899", "#0EA5E9", "#64748B", "#14B8A6"]
 try:
@@ -71,7 +85,7 @@ plt.rcParams.update({
 })
 matplotlib.rcParams["axes.prop_cycle"] = matplotlib.cycler(color=INDIGO_PALETTE)
 
-from fastapi import FastAPI, UploadFile, File, HTTPException, Request, BackgroundTasks
+from fastapi import FastAPI, UploadFile, File, HTTPException, Request, BackgroundTasks, Header, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
@@ -83,7 +97,7 @@ import storage
 
 load_dotenv(override=True)
 
-app = FastAPI(title="CSV Analyst AI — Agentic Data Scientist")
+app = FastAPI(title="CSV Analyst AI ÃÂ¢ÃÂÃÂ Agentic Data Scientist")
 
 # ALLOWED_ORIGINS: comma-separated list, e.g. "https://your-app.vercel.app"
 # Falls back to "*" in local dev (when env var is not set).
@@ -98,8 +112,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-GEMINI_MODEL = "gemini-2.5-flash-lite-preview-06-17"
-client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
+GEMMA_MODEL = os.environ.get("GEMMA_MODEL", "gemma-4-31b-it")
+GEMINI_MODEL = GEMMA_MODEL
+client = genai.Client(api_key=os.environ.get("GEMMA_API_KEY") or os.environ.get("GEMINI_API_KEY"))
 
 dataframes: dict[str, pd.DataFrame] = {}
 models: dict[str, dict] = {}  # session_id -> trained model info (for inference on new input)
@@ -108,6 +123,7 @@ query_cache: dict[str, dict] = {}
 session_meta: dict[str, dict] = {}
 rate_limit_buckets: dict[str, list[float]] = {}
 jobs: dict[str, dict] = {}
+session_profile_cache: dict[str, dict] = {}  # session_id -> cached quality/profile facts
 
 MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_BYTES", 25 * 1024 * 1024))
 MAX_DATAFRAME_ROWS = int(os.environ.get("MAX_DATAFRAME_ROWS", 100_000))
@@ -158,10 +174,10 @@ async def rate_limit_middleware(
     bucket.append(now)
     return await call_next(request)
 
-# ── RAG document store ────────────────────────────────────────────────────────
+# ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ RAG document store ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
 
-EMBED_MODEL = "models/text-embedding-004"
-EMBED_DIM   = 768
+EMBED_DIM = 768
+_local_vectorizer = None
 
 
 def _chunk_text(text: str, size: int = 600, overlap: int = 80) -> list[str]:
@@ -174,15 +190,18 @@ def _chunk_text(text: str, size: int = 600, overlap: int = 80) -> list[str]:
 
 
 def _embed_batch(texts: list[str]) -> list[list[float]]:
-    """Embed a list of texts using Gemini text-embedding-004."""
-    results = []
-    for text in texts:
-        try:
-            resp = client.models.embed_content(model=EMBED_MODEL, contents=text)
-            results.append(list(resp.embeddings[0].values))
-        except Exception:
-            results.append([0.0] * EMBED_DIM)
-    return results
+    """Embed a list of texts using local sklearn HashingVectorizer (zero external LLM API calls)."""
+    global _local_vectorizer
+    if not texts:
+        return []
+    if _local_vectorizer is None:
+        from sklearn.feature_extraction.text import HashingVectorizer
+        _local_vectorizer = HashingVectorizer(n_features=EMBED_DIM, norm="l2", alternate_sign=False)
+    try:
+        vecs = _local_vectorizer.transform(texts).toarray()
+        return [v.tolist() for v in vecs]
+    except Exception:
+        return [[0.0] * EMBED_DIM for _ in texts]
 
 
 def _parse_doc(content: bytes, filename: str) -> str:
@@ -249,6 +268,281 @@ class QueryRequest(BaseModel):
     session_id: str
     question: str
     category: str = "general"
+    request_id: str | None = None
+
+
+class ExecutionStepResponse(BaseModel):
+    id: str
+    label: str
+    status: Literal["pending", "running", "complete", "warning", "failed", "skipped"] = "complete"
+    detail: str | None = None
+    duration_ms: int | None = None
+
+
+class AnswerResponse(BaseModel):
+    type: str
+    text: str | None = None
+    data: Any | None = None
+
+
+APP_BUILD_ID = "runtime-query-debug-v3"
+BACKEND_BUILD_ID = APP_BUILD_ID
+
+
+class QueryResponse(BaseModel):
+    request_id: str
+    status: Literal["running", "partial", "complete", "failed"] = "complete"
+    answer: AnswerResponse | None = None
+    execution_steps: list[ExecutionStepResponse] = Field(default_factory=list)
+    warnings: list[dict[str, Any]] = Field(default_factory=list)
+    effective_lens: str = "general"
+    generated_code: str | None = None
+    error: str | None = None
+    debug_build_id: str = APP_BUILD_ID
+
+
+class AnalysisEvidence(BaseModel):
+    intent: str
+    dataset_name: str | None = None
+    facts: dict[str, Any] = Field(default_factory=dict)
+    tables: list[dict[str, Any]] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+    assumptions: list[str] = Field(default_factory=list)
+    unavailable_information: list[str] = Field(default_factory=list)
+    generated_code: str | None = None
+
+
+class GeneratedAnswer(BaseModel):
+    title: str | None = None
+    summary: str
+    explanation: str | None = None
+    findings: list[dict[str, Any]] = Field(default_factory=list)
+    caveats: list[str] = Field(default_factory=list)
+    next_action: str | None = None
+
+
+# ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ Schema-aware analytics plan schemas ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
+
+class PlanDimension(BaseModel):
+    column: str
+    role: Literal["group_by", "x_axis", "category"] = "group_by"
+
+
+class PlanMeasure(BaseModel):
+    column: str | None = None
+    operation: Literal["count", "count_distinct", "sum", "mean", "median", "min", "max", "percentage"]
+    label: str
+
+
+class PlanFilter(BaseModel):
+    column: str
+    operator: str   # "==", "!=", ">", "<", ">=", "<=", "contains", "in"
+    value: Any
+
+
+class PlanChart(BaseModel):
+    type: Literal["bar", "line", "pie", "scatter", "histogram", "box"]
+    x: str | None = None
+    y: str | None = None
+    category: str | None = None
+    value: str | None = None
+
+
+class AnalysisPlan(BaseModel):
+    intent: Literal["lookup", "aggregation", "comparison", "visualization", "data_quality", "modeling", "forecasting"] = "aggregation"
+    dimensions: list[PlanDimension] = Field(default_factory=list)
+    measures: list[PlanMeasure] = Field(default_factory=list)
+    filters: list[PlanFilter] = Field(default_factory=list)
+    chart: PlanChart | None = None
+    title: str | None = None
+    confidence: float = 0.8
+    ambiguity: list[str] = Field(default_factory=list)
+    reasoning_summary: str = ""
+
+
+class ResolvedAnalysisPlan(AnalysisPlan):
+    """Immutable after semantic validation. All downstream stages must use this exact object."""
+    validated: bool = True
+    validation_warnings: list[str] = Field(default_factory=list)
+    resolved_dimension_col: str | None = None
+    resolved_measure_col: str | None = None
+    resolved_operation: str | None = None
+    resolved_chart_type: str | None = None
+
+
+
+SYNTHESIS_SYSTEM_PROMPT = """You are an expert dataset analysis assistant. Answer the user's question using ONLY the verified dataset evidence provided.
+
+Requirements:
+- Give the direct answer first in plain language suitable for a non-technical user.
+- Do not invent the dataset's intended purpose or unverified facts.
+- Distinguish observations from assumptions.
+- Do not claim that a model, method, or use case is best unless it was explicitly tested in the evidence.
+- Format important numbers clearly and include relevant data-quality limitations.
+- Never guess or change computed numeric values.
+- Return your answer as a JSON object adhering strictly to this schema:
+{
+  "title": "<short descriptive title or null>",
+  "summary": "<main direct answer in plain language>",
+  "explanation": "<detailed explanation or context>",
+  "findings": [{"label": "<key observation>", "detail": "<value or detail>"}],
+  "caveats": ["<caveat or limitation if any>"],
+  "next_action": "<suggested follow-up question or action>"
+}
+"""
+
+
+def synthesize_llm_answer(
+    question: str,
+    evidence: AnalysisEvidence,
+    effective_lens: str = "general",
+    request_id: str | None = None,
+) -> GeneratedAnswer:
+    """Generate structured natural-language response strictly grounded in verified facts."""
+    payload = {
+        "user_question": question,
+        "effective_lens": effective_lens,
+        "evidence": {
+            "intent": evidence.intent,
+            "dataset_name": evidence.dataset_name,
+            "facts": evidence.facts,
+            "warnings": evidence.warnings,
+        },
+    }
+
+    user_text = json.dumps(payload, default=str)
+
+    def _call_model(payload_str: str) -> str:
+        from backend.llm.client import llm_client
+        return llm_client.generate_content(
+            system_instruction=SYNTHESIS_SYSTEM_PROMPT,
+            contents=payload_str,
+            temperature=0.1,
+            timeout_seconds=10.0,
+            request_id=request_id,
+            stage="synthesis",
+        )
+
+    raw_text = ""
+    try:
+        raw_text = _call_model(user_text)
+    except Exception as e:
+        if "cancelled" in str(e).lower():
+            raise e
+        logger.warning("LLM synthesis attempt 1 failed: %s. Retrying with trimmed payload.", e)
+        try:
+            trimmed_payload = {
+                "user_question": question,
+                "effective_lens": effective_lens,
+                "evidence": {
+                    "intent": evidence.intent,
+                    "dataset_name": evidence.dataset_name,
+                    "facts": {k: v for k, v in list(evidence.facts.items())[:10]},
+                    "warnings": evidence.warnings,
+                },
+            }
+            raw_text = _call_model(json.dumps(trimmed_payload, default=str))
+        except Exception as e2:
+            if "cancelled" in str(e2).lower():
+                raise e2
+            logger.error("LLM synthesis attempt 2 failed: %s", e2)
+            from backend.core.errors import LLMSynthesisError
+            raise LLMSynthesisError("The calculations completed, but the explanation could not be generated.")
+
+    try:
+        clean = raw_text
+        if clean.startswith("```"):
+            clean = clean.split("\n", 1)[1]
+        if "```" in clean:
+            clean = clean.rsplit("```", 1)[0]
+        clean = clean.strip()
+        parsed = json.loads(clean)
+        return GeneratedAnswer(
+            title=parsed.get("title"),
+            summary=parsed.get("summary") or "Analysis completed.",
+            explanation=parsed.get("explanation"),
+            findings=parsed.get("findings") if isinstance(parsed.get("findings"), list) else [],
+            caveats=parsed.get("caveats") if isinstance(parsed.get("caveats"), list) else [],
+            next_action=parsed.get("next_action"),
+        )
+    except Exception as parse_err:
+        logger.warning("Failed to parse JSON response from LLM synthesis (%s). Using fallback wrapper.", parse_err)
+        return GeneratedAnswer(
+            title="Analysis Result",
+            summary=raw_text if raw_text else "Analysis complete based on verified evidence.",
+            explanation=None,
+            findings=[],
+            caveats=evidence.warnings,
+            next_action="Explore further dataset columns or ask a follow-up question.",
+        )
+
+
+def build_query_response(
+    *,
+    request_id: str,
+    status: str = "complete",
+    answer_type: str = "text",
+    answer_text: str | None = None,
+    answer_data: Any | None = None,
+    generated_answer: GeneratedAnswer | dict | None = None,
+    execution_steps: list[dict] | None = None,
+    warnings: list[dict] | None = None,
+    effective_lens: str = "general",
+    generated_code: str | None = None,
+    error: str | None = None,
+) -> dict:
+    steps_payload = []
+    if execution_steps:
+        for idx, s in enumerate(execution_steps):
+            steps_payload.append({
+                "id": str(s.get("id") or s.get("step_id") or s.get("stepId") or f"step-{idx + 1}"),
+                "label": str(s.get("label") or s.get("name") or s.get("title") or s.get("message") or s.get("step") or "Analysis step"),
+                "status": str(s.get("status") or "complete"),
+                "detail": s.get("detail") or s.get("description") or s.get("summary") or s.get("message"),
+                "duration_ms": s.get("duration_ms") or s.get("durationMs") or s.get("elapsed_ms"),
+            })
+
+    # NOTE: LLM Answer Synthesis step is only added when the caller explicitly includes
+    # a step with id="synthesis" or detail containing "LLM". Never added unconditionally.
+    # This was previously a false observability step that appeared even on synthesis failures.
+
+    answer_payload = {
+        "type": answer_type,
+        "text": answer_text,
+        "data": answer_data,
+    }
+
+    if generated_answer:
+        if isinstance(generated_answer, GeneratedAnswer):
+            ga_dict = generated_answer.model_dump()
+        elif isinstance(generated_answer, dict):
+            ga_dict = generated_answer
+        else:
+            ga_dict = {}
+
+        answer_payload.update({
+            "title": ga_dict.get("title"),
+            "summary": ga_dict.get("summary") or answer_text or "",
+            "explanation": ga_dict.get("explanation"),
+            "findings": ga_dict.get("findings") or [],
+            "caveats": ga_dict.get("caveats") or [],
+            "next_action": ga_dict.get("next_action"),
+            "text": ga_dict.get("summary") or answer_text or "",
+        })
+
+    return {
+        "type": "analysis_completed",
+        "step": "done",
+        "request_id": request_id,
+        "status": status,
+        "answer": answer_payload,
+        "execution_steps": steps_payload,
+        "warnings": warnings or [],
+        "effective_lens": effective_lens,
+        "generated_code": generated_code,
+        "error": error,
+        "debug_build_id": APP_BUILD_ID,
+    }
 
 
 class StoryRequest(BaseModel):
@@ -346,6 +640,7 @@ def _delete_session(session_id: str) -> None:
     doc_stores.pop(session_id, None)
     conversation_state.pop(session_id, None)
     session_meta.pop(session_id, None)
+    session_profile_cache.pop(session_id, None)
     for key in list(query_cache):
         value = query_cache.get(key, {})
         if key.startswith(f"{session_id}:") or value.get("session_id") == session_id:
@@ -394,7 +689,13 @@ def cleanup_expired_sessions() -> None:
     storage.cleanup_old_sessions(ttl_seconds=SESSION_TTL_SECONDS)
 
 
+def _cache_get(key: str) -> dict | None:
+    """Retrieve a cached query response event from in-memory session cache."""
+    return query_cache.get(key)
+
+
 def _cache_set(key: str, value: dict) -> None:
+    """Store a query response event in in-memory session cache, enforcing max capacity."""
     query_cache[key] = value
     while len(query_cache) > MAX_QUERY_CACHE_ENTRIES:
         oldest = next(iter(query_cache))
@@ -465,9 +766,9 @@ def public_job(job: dict) -> dict:
     }
 
 
-def make_sse_emitter(endpoint: str, session_id: str) -> Callable[[dict], str]:
+def make_sse_emitter(endpoint: str, session_id: str, request_id: str | None = None) -> Callable[[dict], str]:
     """Create an SSE encoder that adds request tracing metadata to every event."""
-    request_id = str(uuid.uuid4())
+    req_id = request_id or str(uuid.uuid4())
     started_at = _now()
     sequence = 0
 
@@ -475,9 +776,11 @@ def make_sse_emitter(endpoint: str, session_id: str) -> Callable[[dict], str]:
         nonlocal sequence
         sequence += 1
         event = {**payload}
+        if "request_id" not in event:
+            event["request_id"] = req_id
         meta = {**event.get("meta", {})}
         meta.update({
-            "request_id": request_id,
+            "request_id": req_id,
             "endpoint": endpoint,
             "session_id": session_id,
             "elapsed_ms": int((_now() - started_at) * 1000),
@@ -572,12 +875,12 @@ def _fig_to_b64(fig) -> str:
 
 
 def build_overview_charts(df: pd.DataFrame) -> list[dict]:
-    """Deterministically render an instant 'dashboard' the moment a CSV loads —
+    """Deterministically render an instant 'dashboard' the moment a CSV loads ÃÂ¢ÃÂÃÂ
     no LLM call, so it is fast and demo-safe. Each chart is isolated in try/except."""
     charts: list[dict] = []
     numeric = df.select_dtypes(include="number")
 
-    # 1 · Correlation heatmap
+    # 1 ÃÂÃÂ· Correlation heatmap
     if numeric.shape[1] >= 2:
         try:
             corr = numeric.corr()
@@ -591,7 +894,7 @@ def build_overview_charts(df: pd.DataFrame) -> list[dict]:
         except Exception:
             pass
 
-    # 2 · Distribution small-multiples (up to 6 numeric columns)
+    # 2 ÃÂÃÂ· Distribution small-multiples (up to 6 numeric columns)
     if numeric.shape[1] >= 1:
         try:
             cols = list(numeric.columns)[:6]
@@ -612,11 +915,11 @@ def build_overview_charts(df: pd.DataFrame) -> list[dict]:
         except Exception:
             pass
 
-    # 3 · Top values of the first meaningful low-cardinality categorical column
+    # 3 ÃÂÃÂ· Top values of the first meaningful low-cardinality categorical column
     for c in df.columns:
         name = str(c).lower()
         if any(k in name for k in ("date", "time", "_at", "id")):
-            continue  # skip dates / identifiers — not useful as categories
+            continue  # skip dates / identifiers ÃÂ¢ÃÂÃÂ not useful as categories
         if not pd.api.types.is_numeric_dtype(df[c]) and 2 <= df[c].nunique() <= 25:
             try:
                 vc = df[c].value_counts().head(10)
@@ -2459,6 +2762,26 @@ def deterministic_answer(question: str, df: pd.DataFrame,
         code = "result = f\"The dataset has {len(df):,} rows and {df.shape[1]:,} columns.\""
         return done(result, code=code, validation_method="Dataset shape read from DataFrame dimensions")
 
+    m_max = re.search(r'\b(highest|lowest|maximum|minimum|max|min)\b\s+([a-zA-Z0-9_ ]+)', q)
+    if m_max:
+        target_term = m_max.group(2).strip()
+        matched_col = None
+        for col in df.columns:
+            if col.lower() in target_term or target_term in col.lower():
+                if pd.api.types.is_numeric_dtype(df[col]):
+                    matched_col = col
+                    break
+        if matched_col:
+            is_max = m_max.group(1) in ("highest", "maximum", "max")
+            row_idx = df[matched_col].idxmax() if is_max else df[matched_col].idxmin()
+            row_val = df.loc[row_idx, matched_col]
+            id_col = next((c for c in df.columns if "id" in c.lower() or "name" in c.lower() or "employee" in c.lower()), df.columns[0])
+            id_val = df.loc[row_idx, id_col]
+            op_label = "highest" if is_max else "lowest"
+            result = f"The {id_col} with the {op_label} {matched_col} ({row_val}) is {id_val}."
+            code = f"idx = df['{matched_col}'].idx{'max' if is_max else 'min'}()\nresult = df.loc[idx]"
+            return done(result, code=code, validation_method=f"Direct pandas {op_label} lookup on column {matched_col}")
+
     if any(term in q for term in ("missing", "null", "blank")):
         missing = df.isna().sum()
         pct = (missing / max(len(df), 1) * 100).round(1)
@@ -2559,6 +2882,11 @@ def deterministic_answer(question: str, df: pd.DataFrame,
     return None
 
 
+def try_deterministic_answer(df: pd.DataFrame, question: str, category: str = "general") -> dict | None:
+    """Convenience wrapper for deterministic pandas calculation engine."""
+    return deterministic_answer(question, df, category=category)
+
+
 def train_predictive_model(df: pd.DataFrame, target: str) -> tuple[str, str, dict]:
     """Train a Random Forest; return (summary, importance_chart, info).
     info also contains shap_chart, perm_chart, pdp_chart for explainability."""
@@ -2595,7 +2923,7 @@ def train_predictive_model(df: pd.DataFrame, target: str) -> tuple[str, str, dic
         classes = [str(c) for c in ycat.cat.categories]
         y = ycat.cat.codes
         if n_classes < 2:
-            raise ValueError("Target has only one class — nothing to classify.")
+            raise ValueError("Target has only one class ÃÂ¢ÃÂÃÂ nothing to classify.")
         model = RandomForestClassifier(n_estimators=200, max_depth=10, random_state=42, n_jobs=-1)
     else:
         classes = None
@@ -2607,18 +2935,18 @@ def train_predictive_model(df: pd.DataFrame, target: str) -> tuple[str, str, dic
     model.fit(Xtr, ytr)
     pred = model.predict(Xte)
 
-    # ── 1. Feature importance (gini / MDI) ───────────────────────────────────
+    # ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ 1. Feature importance (gini / MDI) ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
     importances = pd.Series(model.feature_importances_, index=X.columns).sort_values(ascending=False)
     top = importances.head(12)
     fig, ax = plt.subplots(figsize=(8, max(4, 0.5 * len(top))))
     sns.barplot(x=top.values, y=top.index.astype(str), ax=ax)
     for cont in ax.containers:
         ax.bar_label(cont, fmt="%.3f", padding=3)
-    ax.set_title(f"What predicts '{target}'?  ·  Feature Importance (MDI)")
+    ax.set_title(f"What predicts '{target}'?  ÃÂÃÂ·  Feature Importance (MDI)")
     ax.set_xlabel("Importance"); ax.set_ylabel("Feature")
     chart = _fig_to_b64(fig)
 
-    # ── 2. SHAP beeswarm (global explanation) ────────────────────────────────
+    # ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ 2. SHAP beeswarm (global explanation) ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
     shap_chart = None
     try:
         import shap
@@ -2640,7 +2968,7 @@ def train_predictive_model(df: pd.DataFrame, target: str) -> tuple[str, str, dic
     except Exception:
         plt.close("all")
 
-    # ── 3. Permutation importance (test-set, unbiased) ───────────────────────
+    # ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ 3. Permutation importance (test-set, unbiased) ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
     perm_chart = None
     try:
         perm = permutation_importance(model, Xte, yte, n_repeats=5, random_state=42, n_jobs=-1)
@@ -2651,14 +2979,14 @@ def train_predictive_model(df: pd.DataFrame, target: str) -> tuple[str, str, dic
         fig, ax = plt.subplots(figsize=(8, max(4, 0.5 * len(perm_df))))
         ax.barh(perm_df["Feature"][::-1], perm_df["Importance"][::-1],
                 xerr=perm_df["Std"][::-1], color="#4F46E5", alpha=0.85, capsize=3)
-        ax.set_title(f"Permutation Importance · '{target}' (test set)")
+        ax.set_title(f"Permutation Importance ÃÂÃÂ· '{target}' (test set)")
         ax.set_xlabel("Mean decrease in score")
         plt.tight_layout()
         perm_chart = _fig_to_b64(fig)
     except Exception:
         plt.close("all")
 
-    # ── 4. Partial Dependence Plots (top 2 features) ─────────────────────────
+    # ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ 4. Partial Dependence Plots (top 2 features) ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
     pdp_chart = None
     try:
         top2 = list(importances.head(2).index)
@@ -2668,26 +2996,26 @@ def train_predictive_model(df: pd.DataFrame, target: str) -> tuple[str, str, dic
             axes = [axes]
         PartialDependenceDisplay.from_estimator(model, X, top2, ax=axes,
                                                 kind="average", subsample=500, random_state=42)
-        fig.suptitle(f"Partial Dependence — Top Features for '{target}'",
+        fig.suptitle(f"Partial Dependence ÃÂ¢ÃÂÃÂ Top Features for '{target}'",
                      fontsize=13, fontweight="bold")
         fig.tight_layout()
         pdp_chart = _fig_to_b64(fig)
     except Exception:
         plt.close("all")
 
-    # ── metrics & summary ────────────────────────────────────────────────────
+    # ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ metrics & summary ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
     if is_classification:
         metric = f"Accuracy: {accuracy_score(yte, pred):.1%}   |   F1 (weighted): {f1_score(yte, pred, average='weighted'):.2f}"
         task = f"Trained a Random Forest classifier to predict '{target}' ({n_classes} classes)."
     else:
-        metric = f"R²: {r2_score(yte, pred):.3f}   |   MAE: {mean_absolute_error(yte, pred):,.3f}"
+        metric = f"RÃÂÃÂ²: {r2_score(yte, pred):.3f}   |   MAE: {mean_absolute_error(yte, pred):,.3f}"
         task = f"Trained a Random Forest regressor to predict '{target}'."
 
     top3 = ", ".join(f"{n} ({v:.0%})" for n, v in top.head(3).items())
     summary = (f"{task}\n{metric}\n\n"
                f"Top features: {top3}.\n"
                f"Trained on {len(Xtr)} rows, validated on {len(Xte)}, {X.shape[1]} features.\n"
-               f"Explainability: SHAP beeswarm · Permutation importance · Partial dependence plots generated.")
+               f"Explainability: SHAP beeswarm ÃÂÃÂ· Permutation importance ÃÂÃÂ· Partial dependence plots generated.")
 
     features_meta = []
     for c in num_cols + cat_cols:
@@ -2736,7 +3064,467 @@ def build_predict_payload(session_id: str, df: pd.DataFrame, target: str) -> dic
     }
 
 
+# ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ Schema-aware analytics planner ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
+
+def build_semantic_schema(df: pd.DataFrame) -> dict:
+    """Build a rich semantic schema from a DataFrame ÃÂ¢ÃÂÃÂ deterministic, no LLM.
+
+    Each column gets:
+    - dtype string
+    - unique_count / unique_ratio (0.0ÃÂ¢ÃÂÃÂ1.0)
+    - null_pct
+    - sample_values (up to 3)
+    - semantic_role_candidates: identifier | categorical_dimension | numeric_measure | temporal | unknown
+
+    Identifier detection (unique_ratio >= 0.95, non-numeric) is the key signal that
+    tells the LLM planner to use count_distinct rather than sum/mean.
+    """
+    cols: list[dict] = []
+    numeric_cols = [str(c) for c in df.select_dtypes(include="number").columns]
+
+    for col in df.columns:
+        s = df[col]
+        non_null = s.dropna()
+        n_total = len(df)
+        unique_count = int(non_null.nunique())
+        unique_ratio = round(unique_count / max(n_total, 1), 3)
+        is_numeric = pd.api.types.is_numeric_dtype(s)
+        is_datetime = pd.api.types.is_datetime64_any_dtype(s)
+
+        roles: list[str] = []
+        if is_datetime:
+            roles.append("temporal")
+        elif unique_ratio >= 0.90 and not is_numeric:
+            roles.append("identifier")
+        elif unique_ratio < 0.25 and not is_numeric:
+            roles.append("categorical_dimension")
+        elif is_numeric and unique_ratio >= 0.40:
+            roles.append("numeric_measure")
+        elif is_numeric:
+            roles.append("numeric_measure")
+            roles.append("categorical_dimension")
+        if not roles:
+            roles.append("unknown")
+
+        try:
+            samples = non_null.head(3).tolist()
+            # Ensure JSON-serialisable
+            samples = [str(v) if not isinstance(v, (int, float, bool, type(None))) else v for v in samples]
+        except Exception:
+            samples = []
+
+        cols.append({
+            "name": str(col),
+            "dtype": str(s.dtype),
+            "unique_count": unique_count,
+            "unique_ratio": unique_ratio,
+            "null_pct": round(s.isna().mean() * 100, 1),
+            "sample_values": samples,
+            "semantic_role_candidates": roles,
+        })
+
+    return {
+        "row_count": len(df),
+        "column_count": len(df.columns),
+        "columns": cols,
+        "candidate_identifiers": [c["name"] for c in cols if "identifier" in c["semantic_role_candidates"]],
+        "candidate_dimensions": [c["name"] for c in cols if "categorical_dimension" in c["semantic_role_candidates"]],
+        "candidate_measures": [c["name"] for c in cols if "numeric_measure" in c["semantic_role_candidates"]],
+        "candidate_temporal": [c["name"] for c in cols if "temporal" in c["semantic_role_candidates"]],
+    }
+
+
+SCHEMA_AWARE_PLANNER_SYSTEM = """You are a schema-aware data analytics planner.
+
+Given a dataset semantic schema and a user question, produce an AnalysisPlan JSON object that describes WHAT to compute, not HOW.
+
+## Semantic inference rules (apply in order):
+
+1. "number/count of X" ÃÂ¢ÃÂÃÂ operation = "count_distinct" on an identifier column, NOT sum of a numeric measure.
+   - Use `candidate_identifiers` to find the entity to count.
+   - If no identifier exists, use operation = "count" (row count).
+
+2. "total/sum of X" ÃÂ¢ÃÂÃÂ operation = "sum" on a numeric_measure column named X (or closest match).
+
+3. "average/mean X" ÃÂ¢ÃÂÃÂ operation = "mean" on the named numeric_measure.
+
+4. "by Y" ÃÂ¢ÃÂÃÂ Y is a categorical_dimension used as the grouping dimension.
+
+5. Chart type:
+   - pie / donut ÃÂ¢ÃÂÃÂ requested or implied by "by department/category" with count
+   - bar ÃÂ¢ÃÂÃÂ comparison across categories
+   - line ÃÂ¢ÃÂÃÂ trend over time (requires temporal column)
+   - scatter ÃÂ¢ÃÂÃÂ relationship between two numeric measures
+   - histogram ÃÂ¢ÃÂÃÂ distribution of a single numeric measure
+   - box ÃÂ¢ÃÂÃÂ spread/outliers of a numeric measure by group
+
+6. Do NOT default to the first numeric column found.
+   Do NOT reuse a column from a previous question unless the current question names it explicitly.
+
+## Context isolation:
+- Derive the plan from `current_question` and `semantic_schema` ONLY.
+- Use `explicit_references` only if the user's message names a prior result by column name.
+- Do NOT inherit previous chart columns unless the user refers to them.
+
+## Output: ONLY valid JSON, no markdown fences, no extra text.
+
+{
+  "intent": "aggregation" | "visualization" | "comparison" | "lookup" | "data_quality" | "modeling" | "forecasting",
+  "dimensions": [{"column": "<col>", "role": "group_by"}],
+  "measures": [{"column": "<col or null>", "operation": "count_distinct|count|sum|mean|median|min|max|percentage", "label": "<human label>"}],
+  "filters": [],
+  "chart": {"type": "pie|bar|line|scatter|histogram|box", "x": "<col>", "y": "<label>", "category": "<col>", "value": "<label>"},
+  "title": "<descriptive title>",
+  "confidence": 0.0ÃÂ¢ÃÂÃÂ1.0,
+  "ambiguity": ["<question if genuinely unclear>"],
+  "reasoning_summary": "<one sentence explaining the interpretation>"
+}
+
+If the request is genuinely ambiguous AND confidence < 0.55, set ambiguity to a single clarifying question and confidence accordingly.
+"""
+
+
+def validate_analysis_plan(
+    raw_plan: dict,
+    df: pd.DataFrame,
+    semantic_schema: dict,
+) -> tuple["ResolvedAnalysisPlan", list[str]]:
+    """Validate an LLM-produced AnalysisPlan against the actual DataFrame schema.
+
+    Returns (ResolvedAnalysisPlan, warnings).
+    Fixes minor issues automatically; records warnings for the user.
+    """
+    warnings: list[str] = []
+    col_names = [str(c) for c in df.columns]
+    col_lower_map = {c.lower(): c for c in col_names}
+
+    def resolve_col(name: str | None) -> str | None:
+        """Case-insensitive + camelCase-space column lookup."""
+        if not name:
+            return None
+        if name in col_names:
+            return name
+        # Try lowercase
+        if name.lower() in col_lower_map:
+            return col_lower_map[name.lower()]
+        # Try removing spaces
+        no_space = name.replace(" ", "").lower()
+        for cn in col_names:
+            if cn.replace(" ", "").lower() == no_space or cn.replace("_", "").lower() == no_space:
+                return cn
+        return None
+
+    # Parse into AnalysisPlan ÃÂ¢ÃÂÃÂ fill defaults for invalid fields
+    try:
+        plan = AnalysisPlan.model_validate(raw_plan)
+    except Exception as parse_err:
+        warnings.append(f"Plan parse error: {parse_err}. Using best-effort defaults.")
+        plan = AnalysisPlan(
+            intent="aggregation",
+            dimensions=[],
+            measures=[],
+            reasoning_summary="Fallback plan due to parse error.",
+        )
+
+    # ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ Resolve dimension column ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
+    resolved_dim_col: str | None = None
+    if plan.dimensions:
+        raw_dim = plan.dimensions[0].column
+        resolved_dim_col = resolve_col(raw_dim)
+        if not resolved_dim_col:
+            warnings.append(f"Dimension column '{raw_dim}' not found in dataset. Skipping grouping.")
+        else:
+            plan.dimensions[0] = PlanDimension(column=resolved_dim_col, role=plan.dimensions[0].role)
+
+    # ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ Resolve measure column ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
+    resolved_measure_col: str | None = None
+    resolved_operation: str | None = None
+
+    if plan.measures:
+        m = plan.measures[0]
+        resolved_operation = m.operation
+
+        if m.operation in ("count", "count_distinct"):
+            # count ops: column is the entity being counted (optional for plain count)
+            if m.column:
+                resolved_measure_col = resolve_col(m.column)
+                if not resolved_measure_col:
+                    warnings.append(f"Measure column '{m.column}' not found. Falling back to row count.")
+                    resolved_operation = "count"
+                    resolved_measure_col = None
+                else:
+                    # Verify the column is not a pure numeric measure (wrong for count_distinct)
+                    col_schema = next((c for c in semantic_schema["columns"] if c["name"] == resolved_measure_col), None)
+                    if col_schema and "numeric_measure" in col_schema["semantic_role_candidates"] and "identifier" not in col_schema["semantic_role_candidates"]:
+                        warnings.append(
+                            f"Column '{resolved_measure_col}' looks like a numeric measure, not an identifier. "
+                            f"Did you mean to sum/average it? Proceeding with count_distinct as requested."
+                        )
+        else:
+            # sum/mean/etc: column must be numeric
+            if m.column:
+                resolved_measure_col = resolve_col(m.column)
+                if not resolved_measure_col:
+                    warnings.append(f"Measure column '{m.column}' not found. Using first numeric column as fallback.")
+                    numeric_cols = [c["name"] for c in semantic_schema["columns"] if "numeric_measure" in c["semantic_role_candidates"]]
+                    resolved_measure_col = numeric_cols[0] if numeric_cols else None
+                elif not pd.api.types.is_numeric_dtype(df[resolved_measure_col]):
+                    warnings.append(f"Column '{resolved_measure_col}' is not numeric. Cannot perform {m.operation}.")
+                    resolved_measure_col = None
+                # Block using an identifier column as a numeric measure
+                col_schema = next((c for c in semantic_schema["columns"] if c["name"] == resolved_measure_col), None)
+                if col_schema and "identifier" in col_schema["semantic_role_candidates"] and m.operation in ("sum", "mean", "median"):
+                    warnings.append(
+                        f"Column '{resolved_measure_col}' appears to be an identifier (unique_ratio={col_schema['unique_ratio']:.2f}). "
+                        f"Summing/averaging identifiers is rarely meaningful. Consider using count_distinct instead."
+                    )
+
+    # ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ Validate chart type compatibility ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
+    resolved_chart_type: str | None = plan.chart.type if plan.chart else None
+    if plan.chart:
+        if plan.chart.type == "pie" and resolved_operation in ("mean", "median", "min", "max"):
+            warnings.append("Pie charts work best with counts or sums, not averages. Auto-repairing to bar chart.")
+            resolved_chart_type = "bar"
+        if plan.chart.type == "line" and not semantic_schema.get("candidate_temporal"):
+            warnings.append("Line chart requested but no temporal column detected. Using bar chart instead.")
+            resolved_chart_type = "bar"
+        if plan.chart.type == "scatter" and (not plan.measures or len(plan.measures) < 2):
+            warnings.append("Scatter chart needs two measure columns. Falling back to bar chart.")
+            resolved_chart_type = "bar"
+
+    # ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ Confidence threshold ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
+    if plan.confidence < 0.50:
+        warnings.append(f"Low planning confidence ({plan.confidence:.0%}). Consider asking for clarification.")
+
+    # Update chart in plan with resolved type
+    if plan.chart and resolved_chart_type and resolved_chart_type != plan.chart.type:
+        plan.chart = PlanChart(
+            type=resolved_chart_type,  # type: ignore[arg-type]
+            x=plan.chart.x,
+            y=plan.chart.y,
+            category=plan.chart.category,
+            value=plan.chart.value,
+        )
+
+    resolved = ResolvedAnalysisPlan(
+        **plan.model_dump(),
+        validation_warnings=warnings,
+        resolved_dimension_col=resolved_dim_col,
+        resolved_measure_col=resolved_measure_col,
+        resolved_operation=resolved_operation,
+        resolved_chart_type=resolved_chart_type,
+    )
+    return resolved, warnings
+
+
+def execute_resolved_plan(df: pd.DataFrame, plan: "ResolvedAnalysisPlan") -> pd.DataFrame:
+    """Execute a validated AnalysisPlan deterministically against the DataFrame.
+
+    Returns a result DataFrame ready for chart generation and explanation.
+    No LLM involved ÃÂ¢ÃÂÃÂ numeric accuracy is guaranteed.
+    """
+    import re as _re
+
+    dim_col = plan.resolved_dimension_col
+    measure_col = plan.resolved_measure_col
+    operation = plan.resolved_operation
+    measure_label = plan.measures[0].label if plan.measures else "Value"
+
+    # ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ Apply filters ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
+    filtered_df = df.copy()
+    for f in plan.filters:
+        col = f.column
+        if col not in filtered_df.columns:
+            continue
+        try:
+            op = f.operator
+            val = f.value
+            if op == "==":
+                filtered_df = filtered_df[filtered_df[col] == val]
+            elif op == "!=":
+                filtered_df = filtered_df[filtered_df[col] != val]
+            elif op == ">":
+                filtered_df = filtered_df[pd.to_numeric(filtered_df[col], errors="coerce") > float(val)]
+            elif op == "<":
+                filtered_df = filtered_df[pd.to_numeric(filtered_df[col], errors="coerce") < float(val)]
+            elif op == ">=":
+                filtered_df = filtered_df[pd.to_numeric(filtered_df[col], errors="coerce") >= float(val)]
+            elif op == "<=":
+                filtered_df = filtered_df[pd.to_numeric(filtered_df[col], errors="coerce") <= float(val)]
+            elif op == "contains":
+                filtered_df = filtered_df[filtered_df[col].astype(str).str.contains(str(val), case=False, na=False)]
+            elif op == "in":
+                filtered_df = filtered_df[filtered_df[col].isin(val if isinstance(val, list) else [val])]
+        except Exception:
+            pass  # Skip invalid filters silently
+
+    # ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ Grouped aggregation ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
+    if dim_col and dim_col in filtered_df.columns:
+        if operation == "count_distinct" and measure_col and measure_col in filtered_df.columns:
+            result_df = (
+                filtered_df.groupby(dim_col, dropna=False)[measure_col]
+                .nunique()
+                .reset_index(name=measure_label)
+            )
+        elif operation == "count":
+            result_df = (
+                filtered_df.groupby(dim_col, dropna=False)
+                .size()
+                .reset_index(name=measure_label)
+            )
+        elif operation == "sum" and measure_col and measure_col in filtered_df.columns:
+            result_df = (
+                filtered_df.groupby(dim_col, dropna=False)[measure_col]
+                .sum()
+                .reset_index(name=measure_label)
+            )
+        elif operation == "mean" and measure_col and measure_col in filtered_df.columns:
+            result_df = (
+                filtered_df.groupby(dim_col, dropna=False)[measure_col]
+                .mean()
+                .round(2)
+                .reset_index(name=measure_label)
+            )
+        elif operation == "median" and measure_col and measure_col in filtered_df.columns:
+            result_df = (
+                filtered_df.groupby(dim_col, dropna=False)[measure_col]
+                .median()
+                .reset_index(name=measure_label)
+            )
+        elif operation == "min" and measure_col and measure_col in filtered_df.columns:
+            result_df = (
+                filtered_df.groupby(dim_col, dropna=False)[measure_col]
+                .min()
+                .reset_index(name=measure_label)
+            )
+        elif operation == "max" and measure_col and measure_col in filtered_df.columns:
+            result_df = (
+                filtered_df.groupby(dim_col, dropna=False)[measure_col]
+                .max()
+                .reset_index(name=measure_label)
+            )
+        elif operation == "percentage":
+            counts = filtered_df.groupby(dim_col, dropna=False).size()
+            total = counts.sum()
+            result_df = (counts / total * 100).round(1).reset_index(name=measure_label)
+        else:
+            # Fallback: row count by dimension
+            result_df = (
+                filtered_df.groupby(dim_col, dropna=False)
+                .size()
+                .reset_index(name=measure_label)
+            )
+
+        # Sort descending by measure value
+        result_df = result_df.sort_values(measure_label, ascending=False).reset_index(drop=True)
+        return result_df
+
+    # ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ No dimension: scalar aggregation ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
+    if measure_col and measure_col in filtered_df.columns:
+        series = filtered_df[measure_col].dropna()
+        if operation == "count_distinct":
+            val = series.nunique()
+        elif operation == "count":
+            val = len(filtered_df)
+        elif operation == "sum":
+            val = float(series.sum())
+        elif operation == "mean":
+            val = round(float(series.mean()), 4)
+        elif operation == "median":
+            val = float(series.median())
+        elif operation == "min":
+            val = float(series.min())
+        elif operation == "max":
+            val = float(series.max())
+        else:
+            val = float(series.sum())
+        return pd.DataFrame({measure_col: [val]})
+
+    # ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ Fallback: return summary ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
+    return pd.DataFrame({"rows": [len(filtered_df)], "columns": [len(filtered_df.columns)]})
+
+
+def build_chart_spec_from_plan(
+    result_df: pd.DataFrame,
+    plan: "ResolvedAnalysisPlan",
+) -> tuple[str | None, str | None]:
+    """Generate a Plotly chart JSON from the resolved plan and execution result.
+
+    Returns (chart_b64, chart_json). chart_b64 is None (we use JSON for interactive charts).
+    Uses ONLY plan.resolved_measure_col and plan.resolved_dimension_col ÃÂ¢ÃÂÃÂ never picks its own columns.
+    """
+    if not plan.chart or not plan.resolved_chart_type:
+        return None, None
+    if result_df.empty or len(result_df.columns) < 1:
+        return None, None
+
+    try:
+        import plotly.express as px
+        import plotly.graph_objects as go
+
+        dim_col = plan.resolved_dimension_col
+        measure_label = plan.measures[0].label if plan.measures else (result_df.columns[-1] if len(result_df.columns) > 1 else result_df.columns[0])
+        chart_type = plan.resolved_chart_type
+        title = plan.title or f"{measure_label} by {dim_col}" if dim_col else measure_label
+
+        THEME = dict(
+            template="plotly_white",
+            font=dict(family="Inter, Segoe UI, sans-serif", size=12),
+            title_font_size=15,
+            colorway=["#4F46E5", "#10B981", "#F59E0B", "#8B5CF6", "#EF4444", "#06B6D4", "#EC4899", "#0EA5E9"],
+            margin=dict(l=60, r=30, t=60, b=60),
+            hoverlabel=dict(bgcolor="white", font_size=12),
+        )
+
+        if chart_type == "pie" and dim_col and measure_label in result_df.columns and dim_col in result_df.columns:
+            fig = px.pie(result_df, names=dim_col, values=measure_label, title=title)
+        elif chart_type == "bar" and dim_col and measure_label in result_df.columns and dim_col in result_df.columns:
+            fig = px.bar(result_df, x=dim_col, y=measure_label, title=title)
+        elif chart_type == "line" and dim_col and measure_label in result_df.columns and dim_col in result_df.columns:
+            fig = px.line(result_df, x=dim_col, y=measure_label, title=title, markers=True)
+        elif chart_type == "scatter" and len(result_df.select_dtypes(include="number").columns) >= 2:
+            num_cols = result_df.select_dtypes(include="number").columns.tolist()
+            fig = px.scatter(result_df, x=num_cols[0], y=num_cols[1], title=title)
+        elif chart_type == "histogram" and measure_label in result_df.columns:
+            fig = px.histogram(result_df, x=measure_label, title=title)
+        elif chart_type == "box" and dim_col and measure_label in result_df.columns and dim_col in result_df.columns:
+            fig = px.box(result_df, x=dim_col, y=measure_label, title=title)
+        elif dim_col and measure_label in result_df.columns and dim_col in result_df.columns:
+            # fallback: bar
+            fig = px.bar(result_df, x=dim_col, y=measure_label, title=title)
+        else:
+            return None, None
+
+        fig.update_layout(**THEME)
+        return None, fig.to_json()
+    except Exception as chart_err:
+        logger.warning("build_chart_spec_from_plan failed: %s", chart_err)
+        return None, None
+
+
+def extract_explicit_references(
+    question: str,
+    prior_state: dict | None,
+) -> dict:
+    """Return only the prior columns/values the user explicitly mentions in the current question.
+
+    Prevents PerformanceScore (from an earlier chart) leaking into a new plan for 'employee count by department'.
+    """
+    if not prior_state:
+        return {}
+    q_lower = question.lower()
+    referenced: dict = {}
+    prior_cols: list[str] = []
+    if prior_state.get("plan") and isinstance(prior_state["plan"].get("relevant_columns"), list):
+        prior_cols = prior_state["plan"]["relevant_columns"]
+    for col in prior_cols:
+        if col.lower() in q_lower or col.replace("_", " ").lower() in q_lower:
+            referenced[col] = prior_state.get("result", "")
+    return referenced
+
+
 def get_df_schema(df: pd.DataFrame) -> str:
+
     schema = f"Shape: {df.shape[0]} rows x {df.shape[1]} columns\n\nColumns:\n"
     for col in df.columns:
         schema += f"  - {col} ({df[col].dtype}): sample values: {df[col].dropna().head(3).tolist()}\n"
@@ -2796,7 +3584,7 @@ def execute_sql(sql: str, df: pd.DataFrame) -> str:
         conn.close()
 
 
-# ── Multi-agent system prompts ────────────────────────────────────────────────
+# ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ Multi-agent system prompts ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
 
 PLANNER_SYSTEM = """You are a data analysis planner. Given a DataFrame schema and a user question, produce a structured analysis plan.
 
@@ -2811,7 +3599,7 @@ Output ONLY valid JSON (no markdown fences, no extra text) with exactly this str
   "query_type": "pandas"
 }
 
-query_type rules — choose "sql" when the question involves:
+query_type rules ÃÂ¢ÃÂÃÂ choose "sql" when the question involves:
 - Filtering rows by value (WHERE-style: top N, specific category, date range)
 - Grouping and aggregating (GROUP BY: sum/count/avg by category)
 - Ranking or sorting a subset (ORDER BY + LIMIT)
@@ -2819,17 +3607,17 @@ query_type rules — choose "sql" when the question involves:
 Otherwise use "pandas" (for correlations, distributions, ML, custom statistics)."""
 
 ANALYST_SYSTEM = """You are a data analyst. A pandas DataFrame `df` is already loaded.
-Write Python code to compute the NUMERICAL analysis only — statistics, aggregations, comparisons, correlations. No charts.
+Write Python code to compute the NUMERICAL analysis only ÃÂ¢ÃÂÃÂ statistics, aggregations, comparisons, correlations. No charts.
 
 Rules:
-- `df` is already defined — do not reload it
+- `df` is already defined ÃÂ¢ÃÂÃÂ do not reload it
 - Pre-imported: pandas (pd), numpy (np), io, base64
 - You MAY import: scipy, sklearn, statsmodels
 - Set `result` to a detailed string with all numerical findings (include specific numbers)
 - Set `chart_b64 = None` always
 - If result is a DataFrame, convert: result = df_result.to_string()
 - ROBUSTNESS: use df.select_dtypes(include='number') for numeric ops; never run math on text columns
-- Output ONLY valid Python code — no markdown fences, no explanation"""
+- Output ONLY valid Python code ÃÂ¢ÃÂÃÂ no markdown fences, no explanation"""
 
 SQL_ANALYST_SYSTEM = """You are a SQL data analyst. A SQLite database table named `data` contains the user's dataset.
 Write a single SQL SELECT query to answer the user's question.
@@ -2841,7 +3629,7 @@ Rules:
 - For text matching: use LIKE '%value%' (case insensitive in SQLite)
 - For aggregations: use GROUP BY, ORDER BY, LIMIT
 - Always add ORDER BY for ranking/top-N questions
-- Output ONLY the raw SQL query — no markdown fences, no semicolon, no explanation
+- Output ONLY the raw SQL query ÃÂ¢ÃÂÃÂ no markdown fences, no semicolon, no explanation
 
 Common patterns:
   Top N by metric:     SELECT category, SUM(metric) AS total FROM data GROUP BY category ORDER BY total DESC LIMIT 10
@@ -2853,7 +3641,7 @@ VISUALIZER_SYSTEM = """You are a data visualization expert. A pandas DataFrame `
 Write Python code to create ONE excellent INTERACTIVE Plotly chart that best illustrates the findings.
 
 Rules:
-- `df` is already defined — do not reload it
+- `df` is already defined ÃÂ¢ÃÂÃÂ do not reload it
 - Pre-imported: pandas (pd), numpy (np), plotly.express (px), plotly.graph_objects (go)
 - Create a Plotly figure named `fig` using px or go
 - Apply this theme exactly ONCE after creating fig:
@@ -2869,13 +3657,13 @@ Rules:
 - Save as: chart_json = fig.to_json()
 - Set chart_b64 = None, result = None
 - Common chart patterns:
-    • Bar: px.bar(df, x='col', y='col', title='...')
-    • Line: px.line(df, x='date_col', y='metric', title='...')
-    • Scatter: px.scatter(df, x='col1', y='col2', color='group', title='...')
-    • Histogram: px.histogram(df, x='col', title='...')
-    • Box: px.box(df, x='group', y='metric', title='...')
-    • Heatmap: use go.Heatmap with z=corr.values, x=corr.columns, y=corr.columns
-- Output ONLY valid Python code — no markdown fences, no explanation"""
+    ÃÂ¢ÃÂÃÂ¢ Bar: px.bar(df, x='col', y='col', title='...')
+    ÃÂ¢ÃÂÃÂ¢ Line: px.line(df, x='date_col', y='metric', title='...')
+    ÃÂ¢ÃÂÃÂ¢ Scatter: px.scatter(df, x='col1', y='col2', color='group', title='...')
+    ÃÂ¢ÃÂÃÂ¢ Histogram: px.histogram(df, x='col', title='...')
+    ÃÂ¢ÃÂÃÂ¢ Box: px.box(df, x='group', y='metric', title='...')
+    ÃÂ¢ÃÂÃÂ¢ Heatmap: use go.Heatmap with z=corr.values, x=corr.columns, y=corr.columns
+- Output ONLY valid Python code ÃÂ¢ÃÂÃÂ no markdown fences, no explanation"""
 
 CRITIC_SYSTEM = """You are a senior statistician reviewing a data analysis for accuracy and completeness.
 
@@ -2900,9 +3688,9 @@ Structure your response EXACTLY as:
 **Headline:** One sentence direct answer to the question.
 
 **Key Findings:**
-• Finding 1 with specific numbers
-• Finding 2 with specific numbers
-• Finding 3 with specific numbers
+ÃÂ¢ÃÂÃÂ¢ Finding 1 with specific numbers
+ÃÂ¢ÃÂÃÂ¢ Finding 2 with specific numbers
+ÃÂ¢ÃÂÃÂ¢ Finding 3 with specific numbers
 
 **Implication:** One sentence business recommendation or implication.
 
@@ -2912,7 +3700,7 @@ Structure your response EXACTLY as:
 SYSTEM_PROMPT = ANALYST_SYSTEM
 
 
-# Domain lenses — the selected category turns the agent into a domain expert,
+# Domain lenses ÃÂ¢ÃÂÃÂ the selected category turns the agent into a domain expert,
 # shaping which computations it prefers and how it narrates the result.
 CATEGORY_PERSONAS = {
     "general": (
@@ -2921,31 +3709,31 @@ CATEGORY_PERSONAS = {
     ),
     "financial": (
         "ANALYSIS LENS: Financial. You are a senior FINANCIAL analyst. Interpret the data "
-        "through a financial lens — revenue, costs, margins, growth rates (YoY/MoM), volatility "
+        "through a financial lens ÃÂ¢ÃÂÃÂ revenue, costs, margins, growth rates (YoY/MoM), volatility "
         "and risk, and key ratios. Prefer computations like growth %, cumulative totals, moving "
         "averages, and standard deviation as a risk proxy. Format money clearly and, in the "
         "written answer, call out financial implications, risks, and opportunities."
     ),
     "medical": (
         "ANALYSIS LENS: Medical. You are a clinical / healthcare data analyst. Interpret the data "
-        "through a medical lens — prevalence, risk factors, patient cohorts, and distributions of "
+        "through a medical lens ÃÂ¢ÃÂÃÂ prevalence, risk factors, patient cohorts, and distributions of "
         "clinical measurements. Prefer group-wise comparisons (outcome vs. non-outcome), "
         "correlation of features with the outcome, and distribution analysis. ALWAYS describe "
         "relationships as associations, NOT causation. Flag clinically meaningful or at-risk groups."
     ),
     "retail": (
         "ANALYSIS LENS: Retail. You are a retail & e-commerce analyst. Interpret the data through "
-        "a commerce lens — sales and revenue by product/category/region, order volume, basket "
+        "a commerce lens ÃÂ¢ÃÂÃÂ sales and revenue by product/category/region, order volume, basket "
         "size, ratings, and customer behavior. Prefer top-N rankings, revenue breakdowns, and trends."
     ),
     "marketing": (
         "ANALYSIS LENS: Marketing. You are a marketing & growth analyst. Interpret the data through "
-        "a marketing lens — acquisition, conversion, retention, segmentation, channels, and campaign "
+        "a marketing lens ÃÂ¢ÃÂÃÂ acquisition, conversion, retention, segmentation, channels, and campaign "
         "performance. Prefer funnel/segment breakdowns, rates, and cohort-style comparisons."
     ),
     "hr": (
         "ANALYSIS LENS: HR. You are an HR / people-analytics specialist. Interpret the data through "
-        "a workforce lens — headcount, attrition/turnover, tenure, demographics, performance, and "
+        "a workforce lens ÃÂ¢ÃÂÃÂ headcount, attrition/turnover, tenure, demographics, performance, and "
         "compensation equity. Prefer group comparisons and distribution analysis; be sensitive about fairness."
     ),
 }
@@ -2956,7 +3744,7 @@ def system_prompt_for(category: str) -> str:
     return f"{persona}\n\n{SYSTEM_PROMPT}"
 
 
-# ── Sandbox security configuration ───────────────────────────────────────────
+# ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ Sandbox security configuration ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
 
 MAX_EXEC_SECONDS  = 30    # hard wall-clock timeout per code execution
 MAX_RESULT_CHARS  = 5_000 # truncate oversized results to prevent memory abuse
@@ -2980,6 +3768,15 @@ _BLOCKED_ATTRS = frozenset({
 _BLOCKED_CALLS = frozenset({
     "eval", "exec", "compile", "open", "breakpoint",
     "__import__", "input", "memoryview",
+    "getattr", "setattr", "delattr",
+})
+
+# Pandas & filesystem I/O methods blocked to prevent sandbox escaping.
+_BLOCKED_PANDAS_IO = frozenset({
+    "read_csv", "read_excel", "read_parquet", "read_feather",
+    "read_html", "read_sql", "read_sql_query", "read_sql_table", "read_pickle",
+    "to_csv", "to_excel", "to_parquet", "to_feather", "to_html",
+    "to_sql", "to_pickle", "to_markdown", "to_hdf", "read_hdf",
 })
 
 
@@ -2994,6 +3791,10 @@ class _ASTSecurityVisitor(ast.NodeVisitor):
         if node.attr in _BLOCKED_ATTRS:
             raise SecurityError(
                 f"Access to attribute '{node.attr}' is blocked in the sandbox"
+            )
+        if node.attr in _BLOCKED_PANDAS_IO:
+            raise SecurityError(
+                f"File I/O method '{node.attr}' is blocked in the sandbox"
             )
         self.generic_visit(node)
 
@@ -3027,36 +3828,56 @@ def validate_code_ast(code: str) -> None:
     _ASTSecurityVisitor().visit(tree)
 
 
+# Maximum seconds the sandbox process may run before forcible termination.
+MAX_SANDBOX_SECONDS = int(os.environ.get("MAX_SANDBOX_SECONDS", 15))
+
+
+class ExecutionTimeoutError(TimeoutError, RuntimeError):
+    """Raised when sandboxed code execution exceeds the configured time limit."""
+
+
 def execute_code(code: str, df: pd.DataFrame) -> tuple[str, str | None, str | None]:
-    """Execute sandboxed code with three security layers:
+    """Execute sandboxed code with process-isolated execution only:
     1. AST pre-scan (blocks dangerous attributes / calls / imports)
     2. Restricted __builtins__ (whitelisted only)
-    3. Process-isolated execution timeout (MAX_EXEC_SECONDS)
+    3. Process-isolated execution with hard timeout (no in-process fallback).
     Returns (result, chart_b64, chart_json).
     """
-    # Layer 1 — AST security scan (raises SecurityError on violations)
+    # Layer 1 ÃÂ¢ÃÂÃÂ AST security scan (raises SecurityError on violations)
     validate_code_ast(code)
 
-    ctx = mp.get_context("spawn")
-    output_queue = ctx.Queue(maxsize=1)
-    process = ctx.Process(target=execute_code_worker, args=(code, df, output_queue))
-    process.start()
-
+    timeout_sec = getattr(sys.modules[__name__], "MAX_EXEC_SECONDS", MAX_SANDBOX_SECONDS)
+    payload = None
+    timed_out = False
     try:
-        payload = output_queue.get(timeout=MAX_EXEC_SECONDS)
-    except queue.Empty as exc:
-        process.terminate()
-        process.join(1)
-        if process.is_alive() and hasattr(process, "kill"):
-            process.kill()
+        ctx = mp.get_context("spawn")
+        output_queue = ctx.Queue(maxsize=1)
+        process = ctx.Process(target=execute_code_worker, args=(code, df, output_queue))
+        process.start()
+
+        try:
+            payload = output_queue.get(timeout=timeout_sec)
+        except queue.Empty:
+            timed_out = True
+            process.terminate()
             process.join(1)
-        raise TimeoutError(
-            f"Code execution exceeded the {MAX_EXEC_SECONDS}s time limit and was terminated."
-        ) from exc
-    finally:
-        process.join(2)
-        output_queue.close()
-        output_queue.join_thread()
+            if process.is_alive() and hasattr(process, "kill"):
+                process.kill()
+                process.join(1)
+            payload = None
+        finally:
+            try:
+                output_queue.close()
+            except Exception:
+                pass
+    except Exception as exc:
+        raise RuntimeError(f"Sandbox process startup failed: {exc}")
+
+    if timed_out:
+        raise ExecutionTimeoutError(f"Code execution timed out after {timeout_sec}s (terminated).")
+
+    if payload is None:
+        raise RuntimeError("Sandbox process produced no output.")
 
     if payload[0] == "error":
         _, exc_type, exc_message, traceback_text = payload
@@ -3069,11 +3890,11 @@ def execute_code(code: str, df: pd.DataFrame) -> tuple[str, str | None, str | No
     if result is None:
         result = "Done. See chart above." if (chart_b64 or chart_json) else "No result returned."
 
-    # Result size guard — truncate enormous outputs
+    # Result size guard ÃÂ¢ÃÂÃÂ truncate enormous outputs
     result_str = str(result)
     if len(result_str) > MAX_RESULT_CHARS:
         result_str = (result_str[:MAX_RESULT_CHARS]
-                      + f"\n… [truncated — {len(result_str):,} chars total]")
+                      + f"\nÃÂ¢ÃÂÃÂ¦ [truncated ÃÂ¢ÃÂÃÂ {len(result_str):,} chars total]")
 
     return result_str, chart_b64, chart_json
 
@@ -3103,6 +3924,19 @@ def register_dataframe(df: pd.DataFrame, filename: str) -> dict:
     data_contract = build_data_contract(df)
     dashboard_spec = build_dashboard_spec(df)
     decision_actions = decision_brief.get("decision_actions", [])
+    # Cache the quality profile by session for fast reuse in query pipeline
+    session_profile_cache[session_id] = {
+        "quality_report": quality_report,
+        "column_roles": column_roles,
+        "proactive_insights": proactive_insights,
+        "cleaning_plan": cleaning_plan,
+        "decision_actions": decision_actions,
+        "filename": filename,
+        "row_count": len(df),
+        "column_count": len(df.columns),
+        "columns": [str(c) for c in df.columns],
+        "numeric_columns": [str(c) for c in df.select_dtypes(include="number").columns],
+    }
     return {
         "session_id": session_id,
         "token": token,
@@ -3224,8 +4058,8 @@ async def upload_file(
 ALLOWED_DOMAINS = {"docs.google.com", "drive.google.com", "sheets.googleapis.com"}
 
 
-def validate_safe_url(url_str: str) -> str:
-    """Validate that the input URL is a secure public Google Sheets export URL and block SSRF vectors."""
+def validate_and_pin_url(url_str: str) -> tuple[str, str, str]:
+    """Validate input URL, check domain allowlist, resolve IP address, enforce private IP checks, and return (pinned_url, original_hostname, safe_target_url)."""
     url_str = url_str.strip()
     if not url_str:
         raise HTTPException(status_code=400, detail="URL cannot be empty.")
@@ -3253,6 +4087,7 @@ def validate_safe_url(url_str: str) -> str:
             detail="Security error: URL import is strictly restricted to public Google Sheets export links (docs.google.com).",
         )
 
+    resolved_ip: str | None = None
     try:
         ip_info = socket.getaddrinfo(hostname, None)
         for item in ip_info:
@@ -3260,15 +4095,47 @@ def validate_safe_url(url_str: str) -> str:
             ip_obj = ipaddress.ip_address(ip_str)
             if ip_obj.is_private or ip_obj.is_loopback or ip_obj.is_link_local or ip_obj.is_reserved:
                 raise HTTPException(status_code=400, detail="Security error: Resolved IP address is private or restricted.")
+            if resolved_ip is None:
+                resolved_ip = ip_str
     except socket.gaierror:
         raise HTTPException(status_code=400, detail="Could not resolve hostname.")
 
-    return url_str
+    if not resolved_ip:
+        raise HTTPException(status_code=400, detail="Could not resolve safe IP address.")
+
+    port_str = f":{parsed.port}" if parsed.port else ""
+    pinned_netloc = f"{resolved_ip}{port_str}"
+    pinned_url = urllib.parse.urlunparse((parsed.scheme, pinned_netloc, parsed.path, parsed.params, parsed.query, parsed.fragment))
+
+    return resolved_ip, hostname, url_str
+
+
+@contextlib.contextmanager
+def pin_hostname_to_ip(hostname: str, pinned_ip: str):
+    """Context manager overriding DNS resolution so hostname connects directly to pinned_ip with full TLS verification."""
+    orig_getaddrinfo = socket.getaddrinfo
+
+    def pinned_getaddrinfo(host, port, *args, **kwargs):
+        if host and host.lower() == hostname.lower():
+            return orig_getaddrinfo(pinned_ip, port, *args, **kwargs)
+        return orig_getaddrinfo(host, port, *args, **kwargs)
+
+    socket.getaddrinfo = pinned_getaddrinfo
+    try:
+        yield
+    finally:
+        socket.getaddrinfo = orig_getaddrinfo
+
+
+def validate_safe_url(url_str: str) -> str:
+    """Wrapper function preserving original signature for backward compatibility."""
+    _, _, safe_url = validate_and_pin_url(url_str)
+    return safe_url
 
 
 @app.post("/import_url")
 async def import_from_url(req: UrlImportRequest) -> dict:
-    raw_url = validate_safe_url(req.url)
+    _, _, raw_url = validate_and_pin_url(req.url)
 
     target_url = raw_url
     if "docs.google.com/spreadsheets/d/" in raw_url:
@@ -3277,24 +4144,22 @@ async def import_from_url(req: UrlImportRequest) -> dict:
             sheet_id = match.group(1)
             target_url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv"
 
-    validate_safe_url(target_url)
-
     current_url = target_url
     content: bytes | None = None
     max_redirects = 5
 
     try:
-        async with httpx.AsyncClient(follow_redirects=False, timeout=15.0) as client:
+        async with httpx.AsyncClient(follow_redirects=False, timeout=15.0, verify=True) as client:
             for _ in range(max_redirects + 1):
-                validate_safe_url(current_url)
-                resp = await client.get(current_url)
+                pinned_ip, host_header, current_url = validate_and_pin_url(current_url)
+                with pin_hostname_to_ip(host_header, pinned_ip):
+                    resp = await client.get(current_url)
 
                 if resp.status_code in (301, 302, 303, 307, 308):
                     redirect_location = resp.headers.get("location")
                     if not redirect_location:
                         raise HTTPException(status_code=400, detail="Redirect missing location header.")
                     current_url = urllib.parse.urljoin(current_url, redirect_location)
-                    validate_safe_url(current_url)
                     continue
 
                 if resp.status_code != 200:
@@ -3387,8 +4252,36 @@ def build_dataset_comparison(df1: pd.DataFrame, df2: pd.DataFrame) -> dict:
     }
 
 
+def verify_token_for_session(
+    session_id: str,
+    x_session_token: str | None = Header(None, alias="X-Session-Token"),
+    token: str | None = Query(None),
+) -> str:
+    """Validate that a valid token is provided for session_id via X-Session-Token header or token query parameter."""
+    provided_token = x_session_token or token
+    if not provided_token:
+        raise HTTPException(
+            status_code=401,
+            detail="Session authentication token missing. Provide X-Session-Token header or token query parameter.",
+        )
+    meta = session_meta.get(session_id)
+    if meta and meta.get("token") == provided_token:
+        return provided_token
+    if storage.verify_token(session_id, provided_token):
+        return provided_token
+    raise HTTPException(
+        status_code=401,
+        detail="Invalid session authentication token.",
+    )
+
+
 @app.post("/compare")
-def compare_datasets_endpoint(req: CompareRequest) -> dict:
+def compare_datasets_endpoint(
+    req: CompareRequest,
+    x_session_token: str | None = Header(None, alias="X-Session-Token"),
+    token: str | None = Query(None),
+) -> dict:
+    verify_token_for_session(req.session_id_1, x_session_token, token)
     cleanup_expired_sessions()
     df1 = get_session_df(req.session_id_1)
     df2 = get_session_df(req.session_id_2)
@@ -3401,7 +4294,12 @@ def compare_datasets_endpoint(req: CompareRequest) -> dict:
 
 
 @app.post("/infer_join")
-def infer_join_endpoint(req: InferJoinRequest) -> dict:
+def infer_join_endpoint(
+    req: InferJoinRequest,
+    x_session_token: str | None = Header(None, alias="X-Session-Token"),
+    token: str | None = Query(None),
+) -> dict:
+    verify_token_for_session(req.session_id_1, x_session_token, token)
     df1 = get_session_df(req.session_id_1)
     df2 = get_session_df(req.session_id_2)
     candidates = infer_join_keys(df1, df2)
@@ -3418,7 +4316,12 @@ compare_store: dict[str, dict] = {}
 
 
 @app.post("/join")
-def join_datasets(req: JoinRequest) -> dict:
+def join_datasets(
+    req: JoinRequest,
+    x_session_token: str | None = Header(None, alias="X-Session-Token"),
+    token: str | None = Query(None),
+) -> dict:
+    verify_token_for_session(req.session_id_1, x_session_token, token)
     df1 = get_session_df(req.session_id_1)
     df2 = get_session_df(req.session_id_2)
 
@@ -3577,7 +4480,12 @@ def build_time_series_forecast(
 
 
 @app.post("/forecast")
-def forecast_endpoint(req: ForecastRequest) -> dict:
+def forecast_endpoint(
+    req: ForecastRequest,
+    x_session_token: str | None = Header(None, alias="X-Session-Token"),
+    token: str | None = Query(None),
+) -> dict:
+    verify_token_for_session(req.session_id, x_session_token, token)
     cleanup_expired_sessions()
     df = get_session_df(req.session_id)
     _touch_session(req.session_id)
@@ -3619,8 +4527,14 @@ async def upload_text(req: TextUploadRequest) -> dict:
 
 
 @app.post("/upload_doc")
-async def upload_doc(session_id: str, file: UploadFile = File(...)) -> dict:
+async def upload_doc(
+    session_id: str,
+    file: UploadFile = File(...),
+    x_session_token: str | None = Header(None, alias="X-Session-Token"),
+    token: str | None = Query(None),
+) -> dict:
     """Upload a PDF, Excel, or text file to enrich analysis with RAG context."""
+    verify_token_for_session(session_id, x_session_token, token)
     cleanup_expired_sessions()
     if session_id not in dataframes:
         raise HTTPException(status_code=404, detail="Upload a CSV first, then attach documents.")
@@ -3643,7 +4557,12 @@ async def upload_doc(session_id: str, file: UploadFile = File(...)) -> dict:
 
 
 @app.get("/docs/{session_id}")
-def get_docs(session_id: str) -> dict:
+def get_docs(
+    session_id: str,
+    x_session_token: str | None = Header(None, alias="X-Session-Token"),
+    token: str | None = Query(None),
+) -> dict:
+    verify_token_for_session(session_id, x_session_token, token)
     cleanup_expired_sessions()
     if session_id in dataframes:
         _touch_session(session_id)
@@ -3654,25 +4573,47 @@ def get_docs(session_id: str) -> dict:
 
 
 @app.get("/quality/{session_id}")
-def quality(session_id: str) -> dict:
+def quality(
+    session_id: str,
+    x_session_token: str | None = Header(None, alias="X-Session-Token"),
+    token: str | None = Query(None),
+) -> dict:
+    verify_token_for_session(session_id, x_session_token, token)
     df = get_session_df(session_id)
     return build_quality_report(df)
 
 
 @app.get("/brief/{session_id}")
-def decision_brief(session_id: str, category: str = "general") -> dict:
+def decision_brief(
+    session_id: str,
+    category: str = "general",
+    x_session_token: str | None = Header(None, alias="X-Session-Token"),
+    token: str | None = Query(None),
+) -> dict:
+    verify_token_for_session(session_id, x_session_token, token)
     df = get_session_df(session_id)
     return build_decision_brief(df, category)
 
 
 @app.get("/cleaning_plan/{session_id}")
-def cleaning_plan(session_id: str) -> dict:
+def cleaning_plan(
+    session_id: str,
+    x_session_token: str | None = Header(None, alias="X-Session-Token"),
+    token: str | None = Query(None),
+) -> dict:
+    verify_token_for_session(session_id, x_session_token, token)
     df = get_session_df(session_id)
     return build_cleaning_plan(df)
 
 
 @app.post("/clean/{session_id}")
-def clean_dataset(session_id: str, req: CleanRequest) -> dict:
+def clean_dataset(
+    session_id: str,
+    req: CleanRequest,
+    x_session_token: str | None = Header(None, alias="X-Session-Token"),
+    token: str | None = Query(None),
+) -> dict:
+    verify_token_for_session(session_id, x_session_token, token)
     df = get_session_df(session_id)
     plan = build_cleaning_plan(df)
     selected_actions = req.actions if req.actions is not None else plan["default_actions"]
@@ -3698,31 +4639,56 @@ def clean_dataset(session_id: str, req: CleanRequest) -> dict:
 
 
 @app.get("/contract/{session_id}")
-def data_contract(session_id: str) -> dict:
+def data_contract(
+    session_id: str,
+    x_session_token: str | None = Header(None, alias="X-Session-Token"),
+    token: str | None = Query(None),
+) -> dict:
+    verify_token_for_session(session_id, x_session_token, token)
     df = get_session_df(session_id)
     return build_data_contract(df)
 
 
 @app.post("/validate_rows/{session_id}")
-def validate_rows(session_id: str, req: ValidateRowsRequest) -> dict:
+def validate_rows(
+    session_id: str,
+    req: ValidateRowsRequest,
+    x_session_token: str | None = Header(None, alias="X-Session-Token"),
+    token: str | None = Query(None),
+) -> dict:
+    verify_token_for_session(session_id, x_session_token, token)
     df = get_session_df(session_id)
     contract = build_data_contract(df)
     return validate_rows_against_contract(req.rows, contract)
 
 
 @app.get("/dashboard/{session_id}")
-def dashboard_spec(session_id: str, category: str = "general") -> dict:
+def dashboard_spec(
+    session_id: str,
+    category: str = "general",
+    x_session_token: str | None = Header(None, alias="X-Session-Token"),
+    token: str | None = Query(None),
+) -> dict:
+    verify_token_for_session(session_id, x_session_token, token)
     df = get_session_df(session_id)
     return build_dashboard_spec(df, category)
 
 
 @app.post("/investigate")
-async def investigate(req: InvestigationRequest) -> StreamingResponse:
+async def investigate(
+    req: InvestigationRequest,
+    x_session_token: str | None = Header(None, alias="X-Session-Token"),
+    token: str | None = Query(None),
+) -> StreamingResponse:
     """Run an autonomous, deterministic investigation and stream the analyst workflow."""
-    df = get_session_df(req.session_id)
+    verify_token_for_session(req.session_id, x_session_token, token)
+    if req.session_id not in dataframes:
+        raise HTTPException(status_code=404, detail="Session not found. Upload a CSV first.")
+    df = dataframes[req.session_id]
+    req_id = getattr(req, "request_id", None) or str(uuid.uuid4())
 
     async def stream():
-        emit = make_sse_emitter("investigate", req.session_id)
+        emit = make_sse_emitter("investigate", req.session_id, request_id=req_id)
         yield emit({
             "step": "analyzing",
             "message": "Scoping the investigation goal against the uploaded dataset...",
@@ -3730,52 +4696,396 @@ async def investigate(req: InvestigationRequest) -> StreamingResponse:
         })
         yield emit({"step": "planning", "message": "Building an investigation tree across trends, segments, anomalies, and quality..."})
         yield emit({"step": "executing", "message": "Computing deterministic evidence from the dataframe..."})
-        investigation = build_investigation_report(df, req.goal, req.category)
-        plan = investigation["plan"]
-        yield emit({"step": "plan", "message": f"Plan: {plan['strategy']}", "plan": plan})
-        yield emit({"step": "reporting", "message": "Writing the autonomous investigation brief from computed evidence..."})
-        done_event = {
-            "step": "done",
-            "message": "Autonomous investigation complete",
-            "result": investigation["report"],
-            "report": investigation["report"],
-            "chart": None,
-            "chart_json": investigation["chart_json"],
-            "critique": {
-                "verdict": "pass",
-                "confidence": investigation["validation"]["confidence"],
-                "issues": [],
-                "strengths": ["Investigation is grounded in deterministic dataframe checks."],
-                "suggestion": "Use the recommended actions to drill into the strongest driver next.",
-            },
-            "plan": plan,
-            "followups": suggest_followups(req.goal, df, plan, conversation_state.get(req.session_id)),
-            "validation": investigation["validation"],
-            "decision_actions": investigation["decision_actions"],
-            "investigation": {
-                "goal": investigation["goal"],
-                "persona": investigation["persona"],
-                "persona_columns": investigation["persona_columns"],
-                "primary_metric": investigation["primary_metric"],
-                "primary_dimension": investigation["primary_dimension"],
-                "trend": investigation["trend"],
-                "segment_driver": investigation["segment_driver"],
-                "outliers": investigation["outliers"],
-                "correlation": investigation["correlation"],
-                "quality": investigation["quality"],
-                "recommended_actions": investigation["recommended_actions"],
-                "investigation_tree": investigation["investigation_tree"],
-            },
-            "meta": investigation["meta"],
-        }
-        _update_conversation_state(req.session_id, req.goal, investigation["report"], plan)
-        yield emit(done_event)
+        try:
+            investigation = build_investigation_report(df, req.goal, getattr(req, "category", "general") or "general")
+            plan = investigation["plan"]
+            yield emit({"step": "plan", "message": f"Plan: {plan['strategy']}", "plan": plan})
+            yield emit({"step": "reporting", "message": "Writing the autonomous investigation brief from computed evidence..."})
+            done_event = {
+                "step": "done",
+                "message": "Autonomous investigation complete",
+                "result": investigation["report"],
+                "report": investigation["report"],
+                "chart": None,
+                "chart_json": investigation["chart_json"],
+                "critique": {
+                    "verdict": "pass",
+                    "confidence": investigation["validation"]["confidence"],
+                    "issues": [],
+                    "strengths": ["Investigation is grounded in deterministic dataframe checks."],
+                    "suggestion": "Use the recommended actions to drill into the strongest driver next.",
+                },
+                "plan": plan,
+                "followups": suggest_followups(req.goal, df, plan, conversation_state.get(req.session_id)),
+                "validation": investigation["validation"],
+                "decision_actions": investigation["decision_actions"],
+                "investigation": {
+                    "goal": investigation["goal"],
+                    "persona": investigation["persona"],
+                    "persona_columns": investigation["persona_columns"],
+                    "primary_metric": investigation["primary_metric"],
+                    "primary_dimension": investigation["primary_dimension"],
+                    "trend": investigation["trend"],
+                    "segment_driver": investigation["segment_driver"],
+                    "outliers": investigation["outliers"],
+                    "correlation": investigation["correlation"],
+                    "quality": investigation["quality"],
+                    "recommended_actions": investigation["recommended_actions"],
+                    "investigation_tree": investigation["investigation_tree"],
+                },
+                "meta": investigation["meta"],
+            }
+            _update_conversation_state(req.session_id, req.goal, investigation["report"], plan)
+            yield emit(done_event)
+        except Exception as exc:
+            logger.error("Investigation failed: %s", exc, exc_info=True)
+            yield emit({
+                "step": "done",
+                "message": f"Investigation failed: {exc}",
+                "result": f"Autonomous investigation encountered an error: {exc}",
+                "report": f"Autonomous investigation encountered an error: {exc}",
+                "error": str(exc),
+            })
 
     return StreamingResponse(stream(), media_type="text/event-stream")
 
 
+
+
+def detect_dataset_domain(df: pd.DataFrame, filename: str = "", question: str = "") -> tuple[str, float]:
+    """Detects the dataset domain based on schema columns, sample data, filename, and question keywords."""
+    text = (filename + " " + question + " " + " ".join(str(c) for c in df.columns)).lower()
+
+    med_terms = {"glucose", "bp", "bloodpressure", "skin", "insulin", "bmi", "age", "outcome", "patient", "diagnosis", "cholesterol", "heart", "clinical", "hospital", "symptom", "medical", "disease", "health"}
+    fin_terms = {"price", "fare", "revenue", "cost", "profit", "sales", "amount", "order", "income", "margin", "balance", "expense", "stock", "portfolio"}
+    ret_terms = {"product", "store", "quantity", "discount", "customer", "retail", "inventory", "shipping"}
+    mkt_terms = {"campaign", "conversion", "click", "impression", "lead", "channel", "ad", "ctr", "segment"}
+    hr_terms  = {"employee", "salary", "department", "attrition", "tenure", "headcount", "job", "hire", "eval", "performance"}
+
+    scores = {
+        "medical": sum(1 for k in med_terms if k in text),
+        "financial": sum(1 for k in fin_terms if k in text),
+        "retail": sum(1 for k in ret_terms if k in text),
+        "marketing": sum(1 for k in mkt_terms if k in text),
+        "hr": sum(1 for k in hr_terms if k in text),
+    }
+
+    best_domain, best_score = max(scores.items(), key=lambda item: item[1])
+    if best_score >= 1:
+        confidence = min(0.95, 0.60 + best_score * 0.10)
+        return best_domain, confidence
+    return "general", 0.70
+
+
+def resolve_analysis_lens(df: pd.DataFrame, selected_lens: str, filename: str = "", question: str = "") -> dict:
+    """Resolves effective lens, detecting if the selected lens matches or if an auto-switch is required."""
+    sel = (selected_lens or "general").lower()
+    detected, confidence = detect_dataset_domain(df, filename=filename, question=question)
+
+    is_unsuitable = False
+    cols_lower = [c.lower() for c in df.columns]
+
+    if sel == "financial":
+        fin_terms = {"price", "fare", "revenue", "cost", "profit", "sales", "amount", "order", "income", "margin", "balance", "expense"}
+        if not any(any(k in c for k in fin_terms) for c in cols_lower):
+            is_unsuitable = True
+    elif sel == "medical":
+        med_terms = {"glucose", "bp", "bloodpressure", "skin", "insulin", "bmi", "age", "outcome", "patient", "diagnosis", "cholesterol", "heart", "clinical", "hospital", "symptom", "disease", "health"}
+        if not any(any(k in c for k in med_terms) for c in cols_lower):
+            is_unsuitable = True
+
+    if is_unsuitable:
+        effective = detected if detected != sel else "general"
+        was_switched = True
+        reason = f"The selected {sel.capitalize()} lens does not match this dataset profile ({detected.capitalize()}). Continuing with {effective.capitalize()} lens."
+    else:
+        effective = sel
+        was_switched = False
+        reason = f"Selected {sel.capitalize()} lens is suitable for this dataset."
+
+    return {
+        "selected_lens": sel,
+        "detected_lens": detected,
+        "effective_lens": effective,
+        "confidence": confidence,
+        "was_auto_switched": was_switched,
+        "reason": reason,
+    }
+
+
+from enum import Enum
+
+
+class QueryComplexity(str, Enum):
+    DIRECT = "direct"
+    STANDARD = "standard"
+    DEEP = "deep"
+
+
+QUERY_BUDGETS: dict[str, dict] = {
+    "direct": {
+        "max_llm_calls": 1,
+        "deadline_seconds": 12,
+        "allow_chart": False,
+        "allow_critic": False,
+    },
+    "standard": {
+        "max_llm_calls": 2,
+        "deadline_seconds": 30,
+        "allow_chart": False,
+        "allow_critic": True,
+    },
+    "deep": {
+        "max_llm_calls": 4,
+        "deadline_seconds": 90,
+        "allow_chart": True,
+        "allow_critic": True,
+    },
+}
+
+
+def get_query_complexity_route(q_type: str) -> QueryComplexity:
+    if q_type in ("unclear_query", "direct_row_lookup", "dataset_purpose", "simple_aggregation", "model_recommendation", "deterministic", "deterministic_shape", "simple_lookup"):
+        return QueryComplexity.DIRECT
+    if q_type in ("visualization", "comparison", "data_quality", "data_quality_guidance", "group_by"):
+        return QueryComplexity.STANDARD
+    if q_type in ("predictive_modeling", "forecasting", "complex_analysis"):
+        return QueryComplexity.DEEP
+    return QueryComplexity.STANDARD
+
+
+def classify_query_complexity(question: str, df: pd.DataFrame) -> tuple[str, dict]:
+    """Classifies query complexity into direct_row_lookup, unclear_query, dataset_purpose, simple_aggregation, visualization, predictive_modeling, comparison, or complex_analysis."""
+    import re
+    q_lower = question.lower().strip()
+
+    # Unclear query check (e.g., "gg", "hi", "asdf", single words without context)
+    if len(q_lower) < 3 or (len(q_lower) <= 4 and not any(c in q_lower for c in "0123456789")):
+        return "unclear_query", {}
+
+    # Dataset row/column shape check
+    if any(k in q_lower for k in ["how many rows", "row count", "number of rows", "total rows", "how many columns", "column count", "dataset shape"]):
+        return "simple_aggregation", {"column": df.columns[0] if len(df.columns) > 0 else "rows"}
+
+    # ML Model recommendation intent check
+    if any(k in q_lower for k in [
+        "what machine-learning algorithm", "what machine learning algorithm",
+        "which machine learning algorithm", "which model would be good",
+        "what model would be good", "good algorithm for this", "suitable algorithm",
+        "model recommendation", "which model to use", "what model to use"
+    ]):
+        return "model_recommendation", {}
+
+    # Dataset purpose intent check
+    if any(k in q_lower for k in [
+        "purpose of this dataset", "purpose of dataset", "what is this dataset about",
+        "dataset purpose", "dataset overview", "what does this data contain",
+        "what is the purpose of this data", "how is this dataset", "how is dataset",
+        "describe this dataset", "describe dataset", "explain this dataset", "about this dataset"
+    ]):
+        return "dataset_purpose", {}
+
+    # Direct row lookup: e.g. "what does row 70 tell us?", "what does 70th row tell us", "show row 12", "row 5", "row 70"
+    m_row = re.search(r'(\d+)(?:st|nd|rd|th)?\s*row\b|\brow\s*#?\s*(\d+)\b', q_lower)
+    if m_row:
+        num_str = m_row.group(1) or m_row.group(2)
+        if num_str:
+            row_num = int(num_str)
+            actual_idx = row_num - 1 if (1 <= row_num <= len(df)) else row_num
+            if 0 <= actual_idx < len(df):
+                return "direct_row_lookup", {"row_index": actual_idx, "display_row": row_num}
+
+    # Grouped comparison check
+    if any(k in q_lower for k in ["compare ", "across ", "versus ", " vs ", "difference between "]):
+        return "comparison", {}
+
+    # Simple aggregation check: e.g. "what is the average blood pressure?" or "highest PerformanceScore"
+    agg_terms = {"average", "mean", "median", "max", "maximum", "min", "minimum", "sum", "total", "count", "highest", "lowest", "top", "bottom", "find", "best", "worst"}
+    if any(term in q_lower for term in agg_terms) and not any(k in q_lower for k in ["chart", "plot", "model", "predict", "forecast", "compare", "across", "trend", "correlation"]):
+        def _col_variants(col_name: str) -> list[str]:
+            """Return lowercase matching variants of a column name.
+            Handles: exact, underscoreÃÂ¢ÃÂÃÂspace, camelCaseÃÂ¢ÃÂÃÂspace, PascalCaseÃÂ¢ÃÂÃÂspace."""
+            raw = str(col_name).lower()
+            underscore = raw.replace("_", " ")
+            camel_spaced = re.sub(r'([a-z])([A-Z])', r'\1 \2', str(col_name)).lower()
+            return list(dict.fromkeys([raw, underscore, camel_spaced]))
+
+        matched_col = None
+        for col_orig in df.columns:
+            for variant in _col_variants(col_orig):
+                if variant in q_lower:
+                    matched_col = col_orig
+                    break
+            if matched_col:
+                break
+        if matched_col:
+            return "simple_aggregation", {"column": matched_col}
+
+    # Data-quality guidance: improve / clean / fix / prepare dataset quality questions
+    quality_guidance_terms = [
+        "improve this dataset", "improve the dataset", "how to make this a good dataset",
+        "how to improve", "clean this dataset", "clean the dataset", "fix this dataset",
+        "prepare this dataset", "data quality", "data issues", "quality issues",
+        "what's wrong with this data", "what is wrong with this data",
+        "how should i clean", "how do i clean", "data preparation", "preprocessing",
+        "missing values", "handle missing", "deal with missing",
+        "outlier", "duplicate", "data cleaning", "how to prepare",
+        "make dataset better", "dataset problems", "dataset issues",
+    ]
+    if any(k in q_lower for k in quality_guidance_terms):
+        return "data_quality_guidance", {}
+
+    if any(k in q_lower for k in ["chart", "plot", "heatmap", "histogram", "distribution", "graph"]):
+        return "visualization", {}
+    if any(k in q_lower for k in ["model", "predict", "predictive", "train"]):
+        return "predictive_modeling", {}
+
+    return "complex_analysis", {}
+
+
+def extract_row_lookup_result(df: pd.DataFrame, row_index: int, display_row: int) -> dict:
+    """Extracts field-value pairs and statistical comparisons for a specific row in the dataframe."""
+    row_series = df.iloc[row_index]
+    fields = []
+    numeric_cols = df.select_dtypes(include=[np.number]).columns
+    highlights = []
+
+    for col, val in row_series.items():
+        val_str = str(val) if pd.notna(val) else "Null"
+        fields.append({"field": str(col), "value": val_str})
+
+        if col in numeric_cols and pd.notna(val):
+            col_mean = df[col].mean()
+            col_std = df[col].std()
+            if col_std > 0 and abs(val - col_mean) > 1.2 * col_std:
+                direction = "higher" if val > col_mean else "lower"
+                highlights.append(f"**{col}** ({val_str}) is significantly {direction} than dataset average ({col_mean:.1f}).")
+
+    row_text = f"**Row {display_row} Data Summary**\n\n"
+    if highlights:
+        row_text += "**Key Observations:**\nÃÂ¢ÃÂÃÂ¢ " + "\nÃÂ¢ÃÂÃÂ¢ ".join(highlights)
+    else:
+        row_text += "**Key Observations:**\nÃÂ¢ÃÂÃÂ¢ Column values fall within standard dataset statistical bounds."
+
+    return {
+        "display_row": display_row,
+        "row_index": row_index,
+        "fields": fields,
+        "summary": row_text,
+        "highlights": highlights,
+    }
+
+
+def run_model_recommendation_answer(df: pd.DataFrame, question: str, profile: dict | None = None) -> dict:
+    """Generate structured ML algorithm recommendation based on dataset characteristics."""
+    target_col = None
+    if profile and profile.get("target_candidates"):
+        target_col = profile["target_candidates"][0]
+    else:
+        for col in df.columns:
+            if str(col).lower() in ("outcome", "target", "label", "status", "class", "diabetes"):
+                target_col = col
+                break
+        if not target_col and len(df.columns) > 0:
+            target_col = df.columns[-1]
+
+    num_rows = len(df)
+    num_cols = len(df.columns)
+    is_classification = True
+    class_imbalance = ""
+
+    if target_col and target_col in df.columns:
+        unique_vals = df[target_col].nunique()
+        if unique_vals > 10 and pd.api.types.is_numeric_dtype(df[target_col]):
+            is_classification = False
+        elif unique_vals == 2:
+            counts = df[target_col].value_counts(normalize=True)
+            min_pct = round(counts.min() * 100, 1)
+            if min_pct < 40:
+                class_imbalance = f" The target class is moderately imbalanced (minority class is {min_pct}%)."
+
+    if is_classification:
+        direct_answer = (
+            "**Recommended approach:** Start with **Logistic Regression** as an interpretable baseline, "
+            "then compare it against a **Gradient-Boosted Tree Classifier** (e.g., XGBoost / LightGBM) or Random Forest. "
+            "Do not select a final model until both candidates are evaluated using stratified cross-validation."
+        )
+        why_bullets = [
+            f"The prediction target (`{target_col}`) is binary/categorical across {num_rows:,} sample records.{class_imbalance}",
+            f"The dataset contains {num_cols} feature columns with numeric and domain indicators suitable for decision trees.",
+            "Logistic Regression establishes a clear baseline for feature weights, while Tree Ensembles capture non-linear feature interactions."
+        ]
+        before_training = [
+            "Convert physiologically invalid zero values in measurements to missing values (`NaN`).",
+            "Perform missing-value imputation and feature scaling inside cross-validation folds to prevent data leakage.",
+            "Evaluate models using ROC-AUC, PR-AUC, and F1-score rather than accuracy alone."
+        ]
+    else:
+        direct_answer = (
+            "**Recommended approach:** Start with **Ridge Regression** as a regularized linear baseline, "
+            "then compare it against a **Random Forest Regressor** or **LightGBM Regressor**."
+        )
+        why_bullets = [
+            f"The target column (`{target_col}`) is continuous across {num_rows:,} records.",
+            "Ridge Regression prevents coefficient overfitting, while Gradient Boosted Trees capture non-linear relationships.",
+            "Tree regressors naturally handle varying feature scales without mandatory normalization."
+        ]
+        before_training = [
+            "Check feature skewness and consider log-transforming heavily skewed predictor columns.",
+            "Impute missing feature values within validation pipelines.",
+            "Evaluate using RMSE, MAE, and RÃÂÃÂ² scores on out-of-fold predictions."
+        ]
+
+    report_text = f"{direct_answer}\n\n" \
+                  f"**Why this fits:**\n" + "\n".join(f"ÃÂ¢ÃÂÃÂ¢ {b}" for b in why_bullets) + "\n\n" \
+                  f"**Before training:**\n" + "\n".join(f"ÃÂ¢ÃÂÃÂ¢ {b}" for b in before_training) + "\n\n" \
+                  f"**Recommended next step:** Run a 5-fold cross-validation benchmark comparing the baseline model with the tree ensemble."
+
+    return {
+        "type": "model_recommendation",
+        "title": "Machine Learning Algorithm Recommendation",
+        "text": report_text,
+        "data": {
+            "target": str(target_col),
+            "task": "classification" if is_classification else "regression",
+            "recommended_baseline": "Logistic Regression" if is_classification else "Ridge Regression",
+            "recommended_ensemble": "Gradient Boosted Trees / Random Forest",
+            "why": why_bullets,
+            "before_training": before_training,
+            "next_step": "Run 5-fold cross-validation benchmark",
+        }
+    }
+
+
+query_cache: dict[str, dict] = {}
+
+
+def _cache_set(key: str, event: dict) -> None:
+    max_entries = getattr(sys.modules[__name__], "MAX_QUERY_CACHE_ENTRIES", 50)
+    query_cache[key] = event
+    while len(query_cache) > max_entries:
+        first_key = next(iter(query_cache))
+        del query_cache[first_key]
+
+
+def _cache_get(key: str) -> dict | None:
+    return query_cache.get(key)
+
+
+@app.post("/cancel/{request_id}")
+def cancel_request_handler(request_id: str) -> dict:
+    success = cancel_request(request_id)
+    return {"request_id": request_id, "status": "cancelled" if success else "not_found"}
+
+
 @app.post("/query")
-async def query_csv(req: QueryRequest) -> StreamingResponse:
+async def query_csv(
+    req: QueryRequest,
+    request: Request,
+    x_session_token: str | None = Header(None, alias="X-Session-Token"),
+    token: str | None = Query(None),
+) -> StreamingResponse:
+    verify_token_for_session(req.session_id, x_session_token, token)
     cleanup_expired_sessions()
     if req.session_id not in dataframes:
         raise HTTPException(status_code=404, detail="Session not found. Upload a CSV first.")
@@ -3783,290 +5093,857 @@ async def query_csv(req: QueryRequest) -> StreamingResponse:
 
     df = dataframes[req.session_id]
     schema = get_df_schema(df)
-    category_persona = CATEGORY_PERSONAS.get(req.category, CATEGORY_PERSONAS["general"])
     cache_key = _cache_key(req.session_id, req.category, req.question, df)
+    req_id = req.request_id or str(uuid.uuid4())
+
+    logger.info("Query started request_id=%s session_id=%s question=%s", req_id, req.session_id, req.question)
 
     async def stream():
-        emit = make_sse_emitter("query", req.session_id)
+        emit = make_sse_emitter("query", req.session_id, request_id=req_id)
+        start_monotonic = time.monotonic()
+        start_time = time.time()
+        stage_timings = {"routing_ms": 0, "planner_ms": 0, "execution_ms": 0, "synthesis_ms": 0}
 
-        def llm(system: str, user: str, temperature: float = 0) -> str:
-            resp = client.models.generate_content(
-                model=GEMINI_MODEL,
-                contents=user,
-                config=types.GenerateContentConfig(
+        try:
+            if cache_key in query_cache:
+                cached = dict(query_cache[cache_key])
+                cached.setdefault("meta", {})["route"] = "cache"
+                cached["message"] = "Analysis complete (cached)"
+                yield emit(cached)
+                return
+            if is_cancelled(req_id):
+                logger.info("Request cancelled request_id=%s", req_id)
+                yield emit({
+                    "type": "request_cancelled",
+                    "request_id": req_id,
+                    "status": "cancelled",
+                    "step": "done",
+                    "message": "Analysis request was cancelled."
+                })
+                clear_cancellation(req_id)
+                return
+
+            q_type, q_meta = classify_query_complexity(req.question, df)
+            filename_meta = session_meta.get(req.session_id, {}).get("filename", "")
+            lens_res = resolve_analysis_lens(df, req.category, filename=filename_meta, question=req.question)
+
+            complexity_route = get_query_complexity_route(q_type).value
+            budget_info = QUERY_BUDGETS.get(complexity_route, QUERY_BUDGETS["standard"])
+            deadline_seconds = float(budget_info["deadline_seconds"])
+            deadline_at = start_monotonic + deadline_seconds
+
+            def remaining_seconds() -> float:
+                return max(0.0, deadline_at - time.monotonic())
+
+            def check_deadline():
+                if is_cancelled(req_id):
+                    raise RuntimeError("Request cancelled by user")
+                if remaining_seconds() <= 0:
+                    from backend.core.errors import ExecutionBudgetExceededError
+                    raise ExecutionBudgetExceededError(f"Request deadline of {deadline_seconds:.0f}s exceeded")
+
+            def llm(system: str, user: str, temperature: float = 0, stage: str = "synthesis") -> str:
+                check_deadline()
+                return llm_client.generate_content(
                     system_instruction=system,
+                    contents=user,
                     temperature=temperature,
-                ),
-            )
-            text = (resp.text or "").strip()
-            if text.startswith("```"):
-                text = text.split("\n", 1)[1]
-            if "```" in text:
-                text = text.rsplit("```", 1)[0]
-            return text.strip()
+                    timeout_seconds=min(10.0, max(0.1, remaining_seconds())),
+                    request_id=req_id,
+                    stage=stage,
+                    request_start_time=start_time,
+                    total_deadline_s=deadline_seconds,
+                )
 
-        def parse_json_safe(text: str) -> dict:
-            import re as _re
-            try:
-                return json.loads(text)
-            except Exception:
-                m = _re.search(r'\{.*\}', text, _re.DOTALL)
-                if m:
-                    try:
-                        return json.loads(m.group())
-                    except Exception:
-                        pass
-            return {}
+            def build_done_meta(pipeline_branch: str) -> dict:
+                elapsed_ms = round((time.time() - start_time) * 1000)
+                p_ms = stage_timings.get("planner_ms", 0) or llm_client.get_stage_ms(req_id, "planner")
+                s_ms = stage_timings.get("synthesis_ms", 0) or llm_client.get_stage_ms(req_id, "synthesis")
+                e_ms = stage_timings.get("execution_ms", 0)
+                unacc_ms = max(0, elapsed_ms - (p_ms + s_ms + e_ms))
+                return {
+                    "route": complexity_route,
+                    "pipeline_branch": pipeline_branch,
+                    "cacheable": True,
+                    "request_id": req_id,
+                    "elapsed_ms": elapsed_ms,
+                    "deadline_ms": int(deadline_seconds * 1000),
+                    "deadline_exceeded": elapsed_ms > int(deadline_seconds * 1000),
+                    "llm_calls": llm_client.get_call_count(req_id),
+                    "planner_ms": p_ms,
+                    "execution_ms": e_ms,
+                    "synthesis_ms": s_ms,
+                    "unaccounted_ms": unacc_ms,
+                }
 
-        def run_code_with_repair(system: str, context: str, code_label: str) -> tuple[str | None, str | None, str | None, str | None]:
-            """Generate code, execute it, repair once on failure. Returns (code, result, chart_b64, chart_json)."""
-            try:
-                code = llm(system, context)
-            except Exception:
-                return None, None, None, None
-
-            for attempt in range(2):
+            def run_code_with_repair(system: str, context: str, code_label: str) -> tuple[str | None, str | None, str | None, str | None]:
+                """Generate code, execute it against df, repair once on failure."""
+                check_deadline()
                 try:
-                    result, chart_b64, chart_json = execute_code(code, df)
-                    return code, result, chart_b64, chart_json
+                    code = llm(system, context)
                 except Exception:
-                    err = traceback.format_exc().strip().splitlines()[-1]
-                    if attempt == 0:
-                        try:
-                            code = llm(system,
-                                       f"{context}\n\nPrevious code failed:\n{code}\nError: {err}\nFix it.")
-                        except Exception:
+                    return None, None, None, None
+
+                for attempt in range(2):
+                    check_deadline()
+                    try:
+                        if code_label == "sql":
+                            res_sql = execute_sql(code, df)
+                            return code, str(res_sql) if res_sql is not None else None, None, None
+                        else:
+                            result, chart_b64, chart_json = execute_code(code, df)
+                            return code, result, chart_b64, chart_json
+                    except Exception:
+                        err = traceback.format_exc().strip().splitlines()[-1]
+                        if attempt == 0:
+                            try:
+                                code = llm(system, f"{context}\n\nPrevious code failed:\n{code}\nError: {err}\nFix it.")
+                            except Exception:
+                                return code, None, None, None
+                        else:
                             return code, None, None, None
-                    else:
-                        return code, None, None, None
-            return code, None, None, None
+                return code, None, None, None
 
-        cached = query_cache.get(cache_key)
-        if cached:
-            yield emit({"step": "analyzing", "message": "Using cached analysis result...",
-                        "meta": {"route": "cache", "cache_hit": True}})
-            yield emit({**cached, "message": "Analysis complete (cached)"})
-            return
+            # ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ CLASSIFY QUERY & RESOLVE LENS ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
+            yield emit({
+                "type": "analysis_started",
+                "request_id": req_id,
+                "status": "running",
+                "timestamp": start_time,
+                "step": "understanding",
+                "message": "Understanding the user's question..."
+            })
 
-        deterministic = deterministic_answer(
-            req.question,
-            df,
-            req.category,
-            conversation_state.get(req.session_id),
-        )
-        if deterministic:
-            plan = deterministic["plan"]
-            followups = suggest_followups(req.question, df, plan, conversation_state.get(req.session_id))
-            yield emit({"step": "planning", "message": "Matched a deterministic analytics intent...",
-                        "meta": {"route": "deterministic", "cache_hit": False}})
-            yield emit({"step": "plan", "message": f"Plan: {plan.get('strategy')}", "plan": plan})
-            if deterministic.get("code"):
-                yield emit({"step": "code", "message": "Deterministic pandas code selected",
-                            "code": deterministic["code"], "code_lang": deterministic.get("code_lang")})
-            yield emit({"step": "executing", "message": "Computing directly from your data..."})
-            done_event = {
+            yield emit({
+                "type": "route_selected",
+                "request_id": req_id,
+                "query_type": q_type,
+                "complexity_route": complexity_route,
+                "effective_lens": lens_res["effective_lens"],
+                "lens_resolution": lens_res,
+                "step": "lens_check",
+                "message": f"Route selected: {q_type.replace('_', ' ').capitalize()} ({complexity_route.upper()}) ÃÂÃÂ· Lens: {lens_res['effective_lens'].capitalize()}"
+            })
+
+            # -- FAST-PATH 0: MODEL RECOMMENDATION -------------------
+            if q_type == "model_recommendation":
+                rec = run_model_recommendation_answer(df, req.question, profile)
+                done_event = dict(DONE_EVENT_TEMPLATE)
+                done_event.update({
+                    "request_id": req_id,
+                    "answer": rec["text"],
+                    "data": rec.get("data"),
+                    "meta": build_done_meta("model_recommendation"),
+                })
+                logger.info("Returning model recommendation request_id=%s target=%s", req_id, rec.get("data", {}).get("target"))
+                yield emit(done_event)
+                return
+
+            # ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ FAST-PATH 0A: UNCLEAR QUERY ("gg", minimal text, greetings) ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
+            if q_type == "unclear_query":
+                is_greeting = any(w in req.question.lower() for w in ["hi", "hello", "hey", "greetings"])
+                intent_name = "greeting" if is_greeting else "clarification"
+                evidence = AnalysisEvidence(
+                    intent=intent_name,
+                    dataset_name=filename_meta,
+                    facts={
+                        "user_input": req.question,
+                        "dataset_loaded": True,
+                        "dataset_name": filename_meta or "uploaded dataset",
+                        "row_count": len(df),
+                        "column_count": len(df.columns),
+                        "available_capabilities": ["row lookup", "statistics", "charts", "data-quality review", "predictive modeling"],
+                    }
+                )
+                gen_ans = synthesize_llm_answer(req.question, evidence, effective_lens=lens_res["effective_lens"], request_id=req_id)
+                steps = [
+                    {"id": "classify", "label": "Query received", "status": "complete", "detail": f"Matched {intent_name} intent."},
+                    {"id": "clarify", "label": "Generated response", "status": "complete", "detail": "Answer wording generated by LLM from verified dataset evidence."}
+                ]
+                done_event = build_query_response(
+                    request_id=req_id,
+                    status="complete",
+                    answer_type="clarification",
+                    answer_text=gen_ans.summary,
+                    generated_answer=gen_ans,
+                    execution_steps=steps,
+                    effective_lens=lens_res["effective_lens"],
+                )
+                done_event.update({
+                    "type": "analysis_completed",
+                    "step": "done",
+                    "message": "Analysis complete",
+                    "result": gen_ans.summary,
+                    "report": gen_ans.explanation or gen_ans.summary,
+                    "lens_resolution": lens_res,
+                    "meta": build_done_meta("unclear_query"),
+                })
+                logger.info("Returning query response request_id=%s payload=%s", req_id, json.dumps(done_event, default=str))
+                yield emit(done_event)
+                return
+
+            # ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ FAST-PATH 0B: DATASET PURPOSE ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
+            if q_type == "dataset_purpose":
+                filename = session_meta.get(req.session_id, {}).get("filename", "uploaded dataset")
+                evidence = AnalysisEvidence(
+                    intent="dataset_purpose",
+                    dataset_name=filename,
+                    facts={
+                        "row_count": len(df),
+                        "column_count": len(df.columns),
+                        "columns": list(df.columns),
+                        "numeric_columns": list(df.select_dtypes(include="number").columns),
+                        "categorical_columns": [c for c in df.columns if not pd.api.types.is_numeric_dtype(df[c])],
+                    }
+                )
+                gen_ans = synthesize_llm_answer(req.question, evidence, effective_lens=lens_res["effective_lens"], request_id=req_id)
+                steps = [
+                    {"id": "classify", "label": "Detected dataset purpose query", "status": "complete", "detail": "Matched dataset overview intent."},
+                    {"id": "summary", "label": "Synthesized dataset purpose overview", "status": "complete", "detail": "Answer wording generated by LLM from verified dataset evidence."}
+                ]
+                done_event = build_query_response(
+                    request_id=req_id,
+                    status="complete",
+                    answer_type="dataset_summary",
+                    answer_text=gen_ans.summary,
+                    generated_answer=gen_ans,
+                    execution_steps=steps,
+                    effective_lens=lens_res["effective_lens"],
+                )
+                done_event.update({
+                    "type": "analysis_completed",
+                    "step": "done",
+                    "message": "Analysis complete",
+                    "result": gen_ans.summary,
+                    "report": gen_ans.explanation or gen_ans.summary,
+                    "lens_resolution": lens_res,
+                    "meta": build_done_meta("dataset_purpose"),
+                })
+                logger.info("Returning query response request_id=%s payload=%s", req_id, json.dumps(done_event, default=str))
+                yield emit(done_event)
+                return
+
+            # ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ FAST-PATH 1: DIRECT ROW LOOKUP ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
+            if q_type == "direct_row_lookup":
+                row_idx = q_meta["row_index"]
+                display_row = q_meta["display_row"]
+
+                yield emit({
+                    "type": "step_started",
+                    "step_id": "row_retrieve",
+                    "label": f"Locating row {display_row}",
+                    "step": "schema",
+                    "message": f"Locating row {display_row} in dataset..."
+                })
+
+                row_data = extract_row_lookup_result(df, row_idx, display_row)
+                evidence = AnalysisEvidence(
+                    intent="row_lookup",
+                    dataset_name=filename_meta,
+                    facts={
+                        "display_row": display_row,
+                        "row_index": row_idx,
+                        "fields": row_data["fields"],
+                        "highlights": row_data["highlights"],
+                    },
+                    generated_code=f"# Direct pandas row lookup\nrow_data = df.iloc[{row_idx}]\nprint(row_data)",
+                )
+                gen_ans = synthesize_llm_answer(req.question, evidence, effective_lens=lens_res["effective_lens"], request_id=req_id)
+
+                steps = [
+                    {"id": "classify", "label": f"Detected direct lookup for row {display_row}", "status": "complete"},
+                    {"id": "retrieve-row", "label": f"Retrieved row {display_row} ({len(row_data['fields'])} columns)", "status": "complete"}
+                ]
+
+                # Emit section update with verified status
+                done_event = build_query_response(
+                    request_id=req_id,
+                    status="complete",
+                    answer_type="row_lookup",
+                    answer_text=gen_ans.summary,
+                    answer_data=row_data,
+                    generated_answer=gen_ans,
+                    execution_steps=steps,
+                    effective_lens=lens_res["effective_lens"],
+                    generated_code=f"# Direct pandas row lookup\nrow_data = df.iloc[{row_idx}]\nprint(row_data)",
+                )
+                done_event.update({
+                    "type": "analysis_completed",
+                    "step": "done",
+                    "message": "Analysis complete",
+                    "result": gen_ans.summary,
+                    "report": gen_ans.explanation or gen_ans.summary,
+                    "chart": None,
+                    "chart_json": None,
+                    "critique": {"verdict": "pass", "confidence": 0.98, "issues": [], "strengths": [f"Exact row {display_row} lookup"]},
+                    "plan": {"strategy": f"Direct index lookup for row {display_row}", "needs_chart": False, "query_type": "direct_row_lookup"},
+                    "code": f"# Direct pandas row lookup\nrow_data = df.iloc[{row_idx}]\nprint(row_data)",
+                    "code_lang": "python",
+                    "row_data": row_data,
+                    "followups": [f"Compare row {display_row} to dataset median", "Show missing values for this row"],
+                    "validation": {
+                        "confidence": 0.98,
+                        "confidence_label": "Verified",
+                        "method": "Direct pandas index lookup & statistical distribution audit",
+                        "row_support": 1,
+                        "source_columns": [c for c in df.columns],
+                        "reasons": [f"Row {display_row} extracted directly from memory."],
+                    },
+                    "lens_resolution": lens_res,
+                    "meta": build_done_meta("direct_row_lookup"),
+                })
+                _cache_set(cache_key, done_event)
+                logger.info("Analysis completed request_id=%s result_type=direct_row_lookup", req_id)
+                logger.info("Sending query response request_id=%s status=complete", req_id)
+                yield emit(done_event)
+                return
+
+            if lens_res["was_auto_switched"]:
+                yield emit({
+                    "step": "lens_switch",
+                    "message": f"Switching to a more suitable lens ({lens_res['selected_lens'].capitalize()} ÃÂ¢ÃÂÃÂ {lens_res['effective_lens'].capitalize()})",
+                    "lens_resolution": lens_res
+                })
+
+            effective_category = lens_res["effective_lens"]
+            category_persona = CATEGORY_PERSONAS.get(effective_category, CATEGORY_PERSONAS["general"])
+
+            # ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ CACHE CHECK ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
+            cached_event = None
+            try:
+                cached_event = _cache_get(cache_key)
+            except Exception:
+                logger.exception("Cache lookup failed cache_key=%s", cache_key)
+                cached_event = None
+
+            if cached_event:
+                yield emit({"step": "thinking", "message": "Fast response: retrieved from session query cache..."})
+                cached_event["request_id"] = req_id
+                cached_event["status"] = "complete"
+                yield emit(cached_event)
+                logger.info("Sending query response request_id=%s status=complete_cached", req_id)
+                return
+
+            # ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ DETERMINISTIC FAST-PATH ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
+            deterministic = try_deterministic_answer(df, req.question)
+            if deterministic:
+                yield emit({"step": "analyst", "message": "Deterministic engine: precise column lookup matched..."})
+                evidence = AnalysisEvidence(
+                    intent="deterministic_calculation",
+                    dataset_name=filename_meta,
+                    facts={
+                        "computed_result": deterministic.get("result"),
+                        "column": deterministic.get("column"),
+                        "operation": deterministic.get("op"),
+                        "row_count": len(df),
+                    },
+                    generated_code=deterministic.get("code"),
+                )
+                gen_ans = synthesize_llm_answer(req.question, evidence, effective_lens=lens_res["effective_lens"], request_id=req_id)
+                done_event = build_query_response(
+                    request_id=req_id,
+                    status="complete",
+                    answer_type="aggregation",
+                    answer_text=gen_ans.summary,
+                    generated_answer=gen_ans,
+                    execution_steps=[
+                        {"id": "deterministic", "label": "Computed exact pandas metrics", "status": "complete", "detail": f"Calculated directly on {len(df):,} rows."},
+                        {"id": "synthesis", "label": "Synthesized natural-language answer", "status": "complete", "detail": "Answer wording generated by LLM from verified dataset evidence."}
+                    ],
+                    effective_lens=lens_res["effective_lens"],
+                    generated_code=deterministic.get("code"),
+                )
+                done_event.update({
+                    "type": "analysis_completed",
+                    "step": "done",
+                    "message": "Analysis complete",
+                    "result": gen_ans.summary,
+                    "chart": deterministic.get("chart"),
+                    "chart_json": deterministic.get("chart_json"),
+                    "report": gen_ans.explanation or gen_ans.summary,
+                    "critique": deterministic.get("critique", {"verdict": "pass", "confidence": 0.98, "issues": [], "strengths": ["Deterministic calculation"]}),
+                    "plan": {"strategy": f"Deterministic aggregation on {deterministic.get('column', 'dataframe')}", "needs_chart": deterministic.get("chart") is not None, "query_type": "deterministic"},
+                    "code": deterministic.get("code"),
+                    "code_lang": deterministic.get("code_lang", "python"),
+                    "followups": suggest_followups(req.question, df, {"relevant_columns": [deterministic.get("column", "")]}, conversation_state.get(req.session_id)),
+                    "validation": build_validation_payload(
+                        df,
+                        method=f"Exact deterministic pandas computation ({deterministic.get('op', 'calc')})",
+                        source_columns=[deterministic["column"]] if deterministic.get("column") else [],
+                        confidence=0.98,
+                        reasons=[
+                            f"Matched question to deterministic pattern '{deterministic.get('op')}' on column '{deterministic.get('column')}'.",
+                            f"Computed directly on {len(df):,} rows without LLM generation risk.",
+                        ],
+                    ),
+                    "lens_resolution": lens_res,
+                    "meta": build_done_meta("deterministic"),
+                })
+                _cache_set(cache_key, done_event)
+                _update_conversation_state(
+                    req.session_id,
+                    req.question,
+                    gen_ans.summary,
+                    done_event["plan"],
+                    deterministic.get("code"),
+                    deterministic.get("code_lang"),
+                )
+                logger.info("Analysis completed request_id=%s result_type=deterministic", req_id)
+                logger.info("Sending query response request_id=%s status=complete", req_id)
+                yield emit(done_event)
+                return
+
+            # ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ STANDARD-PATH: DATA QUALITY GUIDANCE ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
+            if q_type == "data_quality_guidance":
+                t_quality_start = time.time()
+                yield emit({"step": "analyzing", "message": "Loading cached dataset quality profile..."})
+                cached_profile = session_profile_cache.get(req.session_id, {})
+                quality_report = cached_profile.get("quality_report") or {}
+                column_roles = cached_profile.get("column_roles") or infer_column_roles(df)
+                cleaning_plan = cached_profile.get("cleaning_plan") or {}
+                t_profile_ms = round((time.time() - t_quality_start) * 1000)
+
+                yield emit({"step": "analyzing", "message": "Identifying top quality issues from dataset profile..."})
+
+                # Collect verified, deterministic quality facts
+                missing = df.isna().sum()
+                total_rows = len(df)
+                missing_cols = {str(c): int(missing[c]) for c in df.columns if missing[c] > 0}
+                zero_numeric = {str(c): int((df[c] == 0).sum()) for c in df.select_dtypes(include="number").columns}
+                zero_suspicious = {c: v for c, v in zero_numeric.items() if v > 0 and missing_cols.get(c, 0) == 0}
+                duplicates = int(df.duplicated().sum())
+                numeric_cols = [str(c) for c in df.select_dtypes(include="number").columns]
+                outlier_cols: list[str] = []
+                for col in numeric_cols[:10]:
+                    q1, q3 = df[col].quantile([0.25, 0.75])
+                    iqr = q3 - q1
+                    outlier_count = int(((df[col] < q1 - 1.5 * iqr) | (df[col] > q3 + 1.5 * iqr)).sum())
+                    if outlier_count > 0:
+                        outlier_cols.append(f"{col} ({outlier_count:,} outliers)")
+
+                evidence = AnalysisEvidence(
+                    intent="data_quality_guidance",
+                    dataset_name=cached_profile.get("filename", filename_meta) or "uploaded dataset",
+                    facts={
+                        "row_count": total_rows,
+                        "column_count": len(df.columns),
+                        "duplicate_rows": duplicates,
+                        "missing_values_by_column": missing_cols,
+                        "total_missing_cells": int(missing.sum()),
+                        "zero_suspicious_by_column": zero_suspicious,
+                        "columns_with_outliers": outlier_cols[:8],
+                        "numeric_column_count": len(numeric_cols),
+                        "categorical_column_count": len(df.columns) - len(numeric_cols),
+                        "cleaning_plan_summary": cleaning_plan.get("summary", "") if cleaning_plan else "",
+                        "cleaning_actions": [
+                            {"title": a.get("title", ""), "impact": a.get("impact", "")}
+                            for a in (cleaning_plan.get("actions") or [])[:4]
+                        ],
+                        "profile_load_ms": t_profile_ms,
+                    },
+                    warnings=[
+                        w for w in [
+                            f"{len(missing_cols)} column(s) have missing values" if missing_cols else None,
+                            f"{duplicates:,} duplicate rows detected" if duplicates > 0 else None,
+                            f"Zero values in {len(zero_suspicious)} column(s) may represent missing data" if zero_suspicious else None,
+                        ] if w
+                    ],
+                )
+                evidence.warnings = [w for w in evidence.warnings if w]
+
+                yield emit({"step": "reporting", "message": "Generating plain-language quality guidance..."})
+                t_llm_start = time.time()
+                gen_ans = synthesize_llm_answer(req.question, evidence, effective_lens=lens_res["effective_lens"], request_id=req_id)
+                t_llm_ms = round((time.time() - t_llm_start) * 1000)
+                stage_timings["synthesis_ms"] += t_llm_ms
+
+                steps = [
+                    {"id": "profile", "label": "Loaded cached dataset quality profile", "status": "complete", "detail": f"Profile loaded in {t_profile_ms}ms"},
+                    {"id": "quality-facts", "label": "Computed quality facts deterministically", "status": "complete",
+                     "detail": f"{len(missing_cols)} columns with missing values, {duplicates} duplicates, {len(outlier_cols)} columns with outliers"},
+                    {"id": "synthesis", "label": "Generated plain-language guidance", "status": "complete",
+                     "detail": f"Answer wording generated by LLM from verified dataset evidence ({t_llm_ms}ms)"},
+                ]
+                done_event = build_query_response(
+                    request_id=req_id,
+                    status="complete",
+                    answer_type="data_quality_guidance",
+                    answer_text=gen_ans.summary,
+                    generated_answer=gen_ans,
+                    execution_steps=steps,
+                    effective_lens=lens_res["effective_lens"],
+                )
+                done_event.update({
+                    "type": "analysis_completed",
+                    "step": "done",
+                    "message": "Analysis complete",
+                    "result": gen_ans.summary,
+                    "report": gen_ans.explanation or gen_ans.summary,
+                    "chart": None,
+                    "chart_json": None,
+                    "critique": {"verdict": "pass", "confidence": 0.95, "issues": [], "strengths": ["Quality facts computed deterministically from the dataset."]},
+                    "plan": {"strategy": "Data quality guidance from cached dataset profile", "needs_chart": False, "query_type": "data_quality_guidance"},
+                    "followups": ["Show missing value details", "Create a cleaning plan", "Visualize outliers", "Describe this dataset"],
+                    "validation": build_validation_payload(df, method="Deterministic pandas quality audit", source_columns=list(missing_cols.keys())[:5], confidence=0.95),
+                    "lens_resolution": lens_res,
+                    "meta": build_done_meta("standard_quality"),
+                })
+                _cache_set(cache_key, done_event)
+                logger.info(
+                    "Data quality guidance complete request_id=%s route=standard_quality total_ms=%s llm_ms=%s profile_ms=%s",
+                    req_id, done_event["meta"]["elapsed_ms"], t_llm_ms, t_profile_ms
+                )
+                yield emit(done_event)
+                return
+
+            # ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ RAG: retrieve context from uploaded documents ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
+            rag_context = ""
+            rag_sources: list[str] = []
+            store = doc_stores.get(req.session_id)
+            if store and store.chunks:
+                yield emit({"step": "analyzing", "message": f"Retrieving context from {len(store.filenames)} document(s)..."})
+                hits = store.search(req.question, top_k=4)
+                if hits:
+                    rag_context = "\n\n".join(
+                        f"[Source: {h['filename']}]\n{h['text']}" for h in hits
+                    )
+                    rag_sources = list(dict.fromkeys(h["filename"] for h in hits))
+
+            rag_block = f"\n\nRELEVANT DOCUMENTATION:\n{rag_context}" if rag_context else ""
+
+            # ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ STEP 1: Build semantic schema (deterministic) ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
+            semantic_schema = build_semantic_schema(df)
+
+            # ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ STEP 2: Schema-aware LLM planner (1 LLM call) ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
+            yield emit({"step": "planning", "message": "Creating the analysis plan..."})
+            t_agent_plan = time.time()
+
+            # Context isolation: only include prior columns the user explicitly names
+            prior_state = conversation_state.get(req.session_id) if hasattr(req, "session_id") else None
+            explicit_refs = extract_explicit_references(req.question, prior_state)
+
+            planning_context = json.dumps({
+                "current_question": req.question,
+                "dataset_name": filename_meta or "dataset",
+                "lens": effective_category,
+                "semantic_schema": semantic_schema,
+                "explicit_references": explicit_refs,
+                "rag_context": rag_context[:500] if rag_context else None,
+            }, default=str)
+
+            raw_plan_dict: dict = {}
+            try:
+                def parse_json_safe(text: str) -> dict | None:
+                    if not text:
+                        return None
+                    clean = text.strip()
+                    if clean.startswith("```"):
+                        clean = clean.split("\n", 1)[1] if "\n" in clean else clean[3:]
+                    if "```" in clean:
+                        clean = clean.rsplit("```", 1)[0]
+                    clean = clean.strip()
+                    try:
+                        return json.loads(clean)
+                    except Exception:
+                        return None
+
+                plan_raw = llm(SCHEMA_AWARE_PLANNER_SYSTEM, planning_context, stage="planner")
+                raw_plan_dict = parse_json_safe(plan_raw) or {}
+            except Exception as plan_exc:
+                if is_cancelled(req_id) or "cancelled" in str(plan_exc).lower():
+                    raise plan_exc
+                logger.warning("Schema-aware planner failed: %s. Using fallback.", plan_exc)
+                raw_plan_dict = {
+                    "intent": "aggregation",
+                    "dimensions": [],
+                    "measures": [],
+                    "reasoning_summary": f"Fallback plan for: {req.question}",
+                    "confidence": 0.5,
+                }
+
+            # ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ STEP 3: Semantic validation (deterministic) ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
+            resolved_plan, validation_warnings = validate_analysis_plan(raw_plan_dict, df, semantic_schema)
+
+            yield emit({
+                "step": "plan",
+                "message": f"Plan: {resolved_plan.reasoning_summary or 'Validated analysis plan'}",
+                "plan": {
+                    "strategy": resolved_plan.reasoning_summary,
+                    "intent": resolved_plan.intent,
+                    "resolved_dimension": resolved_plan.resolved_dimension_col,
+                    "resolved_measure": resolved_plan.resolved_measure_col,
+                    "resolved_operation": resolved_plan.resolved_operation,
+                    "resolved_chart_type": resolved_plan.resolved_chart_type,
+                    "confidence": resolved_plan.confidence,
+                    "validation_warnings": validation_warnings,
+                },
+            })
+
+            # If low confidence and ambiguity, surface clarification immediately
+            if resolved_plan.confidence < 0.55 and resolved_plan.ambiguity:
+                clarification_text = resolved_plan.ambiguity[0]
+                clarification_evidence = AnalysisEvidence(
+                    intent="clarification",
+                    dataset_name=filename_meta or "dataset",
+                    facts={"question": req.question, "clarification_needed": clarification_text},
+                    warnings=validation_warnings,
+                )
+                clarification_gen = synthesize_llm_answer(req.question, clarification_evidence, effective_lens=effective_category)
+                done_event = build_query_response(
+                    request_id=req_id,
+                    status="complete",
+                    answer_type="text",
+                    answer_text=clarification_text,
+                    generated_answer=GeneratedAnswer(
+                        title="Clarification Needed",
+                        summary=clarification_text,
+                        explanation=f"The planner was unsure how to interpret the question (confidence: {resolved_plan.confidence:.0%}).",
+                        caveats=validation_warnings,
+                        next_action="Please clarify and ask again.",
+                    ),
+                    execution_steps=[{"id": "plan", "label": "Planner requested clarification", "status": "warning"}],
+                    effective_lens=effective_category,
+                )
+                done_event.update({
+                    "type": "analysis_completed",
+                    "step": "done",
+                    "message": "Clarification needed",
+                    "chart": None,
+                    "chart_json": None,
+                    "lens_resolution": lens_res,
+                    "meta": {"route": "clarification", "elapsed_ms": round((time.time() - start_time) * 1000), "request_id": req_id, "llm_calls": 1},
+                })
+                yield emit(done_event)
+                return
+
+            # ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ STEP 4: Deterministic execution ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
+            yield emit({"step": "analyzing", "message": "Executing analysis plan against dataset..."})
+            try:
+                result_df = execute_resolved_plan(df, resolved_plan)
+                analyst_result = result_df.to_string(index=False) if not result_df.empty else "No results produced."
+            except Exception as exec_err:
+                logger.warning("execute_resolved_plan failed: %s", exec_err)
+                result_df = pd.DataFrame()
+                analyst_result = f"Execution error: {exec_err}"
+
+            t_analyst_ms = round((time.time() - t_agent_plan) * 1000)
+
+            yield emit({
+                "type": "partial_result",
+                "request_id": req_id,
+                "section_id": "analysis_result",
+                "version": 1,
+                "status": "preliminary",
+                "payload": {"title": resolved_plan.title or "Analysis Result", "result": analyst_result},
+                "result": analyst_result,
+                "step": "executing",
+                "message": "Plan executed ÃÂ¢ÃÂÃÂ computing chart..."
+            })
+
+            # ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ STEP 5: Chart spec (deterministic) ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
+            chart_b64: str | None = None
+            chart_json: str | None = None
+            if resolved_plan.chart and resolved_plan.resolved_chart_type:
+                yield emit({"step": "visualizing", "message": f"Building {resolved_plan.resolved_chart_type} chart..."})
+                try:
+                    chart_b64, chart_json = build_chart_spec_from_plan(result_df, resolved_plan)
+                except Exception as chart_err:
+                    logger.warning("Chart generation failed: %s", chart_err)
+
+            # ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ STEP 6: LLM explanation (1 LLM call) ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
+            yield emit({"step": "reporting", "message": "Writing plain-language explanation..."})
+            t_reporter_start = time.time()
+
+            deep_evidence = AnalysisEvidence(
+                intent=resolved_plan.intent,
+                dataset_name=filename_meta or "dataset",
+                facts={
+                    "result_table": analyst_result[:3000],
+                    "dimension": resolved_plan.resolved_dimension_col,
+                    "measure_column": resolved_plan.resolved_measure_col,
+                    "operation": resolved_plan.resolved_operation,
+                    "measure_label": resolved_plan.measures[0].label if resolved_plan.measures else "value",
+                    "chart_type": resolved_plan.resolved_chart_type,
+                    "plan_title": resolved_plan.title,
+                    "reasoning": resolved_plan.reasoning_summary,
+                    "row_count": len(df),
+                    "column_count": len(df.columns),
+                    "result_rows": len(result_df),
+                },
+                warnings=validation_warnings,
+                generated_code=None,
+            )
+            from backend.core.errors import LLMSynthesisError
+            try:
+                deep_gen_ans = synthesize_llm_answer(req.question, deep_evidence, effective_lens=effective_category)
+                report = deep_gen_ans.summary
+                if deep_gen_ans.explanation:
+                    report = deep_gen_ans.summary + "\n\n" + deep_gen_ans.explanation
+            except LLMSynthesisError as syn_err:
+                logger.error("Synthesis failed request_id=%s: %s", req_id, syn_err)
+                yield emit({
+                    "type": "analysis_failed",
+                    "request_id": req_id,
+                    "status": "failed",
+                    "step": "done",
+                    "answer": None,
+                    "evidence_summary": {"available": True, "intent": deep_evidence.intent, "facts": deep_evidence.facts},
+                    "error": {
+                        "code": "answer_generation_failed",
+                        "message": str(syn_err),
+                    }
+                })
+                return
+            except Exception:
+                deep_gen_ans = None
+                report = analyst_result
+            t_reporter_ms = round((time.time() - t_reporter_start) * 1000)
+
+            # Validate confidence ÃÂ¢ÃÂÃÂ only show high confidence if plan passed validation cleanly
+            plan_confidence = resolved_plan.confidence if not validation_warnings else min(resolved_plan.confidence, 0.80)
+
+            steps = [
+                {"id": "understand", "label": "Understood query via schema-aware planner", "status": "complete"},
+                {"id": "validate", "label": f"Validated plan: {resolved_plan.resolved_operation} on {resolved_plan.resolved_measure_col or 'rows'} by {resolved_plan.resolved_dimension_col or 'all'}", "status": "complete",
+                 "detail": f"Warnings: {len(validation_warnings)}" if validation_warnings else "No issues"},
+                {"id": "execute", "label": "Executed deterministically against dataset", "status": "complete",
+                 "detail": f"{len(result_df)} result rows in {t_analyst_ms}ms"},
+                {"id": "report", "label": "Generated plain-language explanation", "status": "complete",
+                 "detail": f"LLM explanation in {t_reporter_ms}ms"},
+            ]
+            if resolved_plan.chart and chart_json:
+                steps.insert(3, {"id": "chart", "label": f"Built {resolved_plan.resolved_chart_type} chart from resolved plan", "status": "complete"})
+
+            # Build a backward-compatible plan dict for the response
+            compat_plan = {
+                "strategy": resolved_plan.reasoning_summary,
+                "intent": resolved_plan.intent,
+                "relevant_columns": (
+                    ([resolved_plan.resolved_dimension_col] if resolved_plan.resolved_dimension_col else []) +
+                    ([resolved_plan.resolved_measure_col] if resolved_plan.resolved_measure_col else [])
+                ),
+                "needs_chart": bool(resolved_plan.chart),
+                "chart_type": resolved_plan.resolved_chart_type or "none",
+                "query_type": "structured_plan",
+                "resolved_plan": resolved_plan.model_dump(),
+            }
+
+            done_event = build_query_response(
+                request_id=req_id,
+                status="complete",
+                answer_type="text",
+                answer_text=report or analyst_result,
+                generated_answer=deep_gen_ans if deep_gen_ans else None,
+                execution_steps=steps,
+                effective_lens=effective_category,
+                generated_code=None,
+            )
+            done_event.update({
+                "type": "analysis_completed",
                 "step": "done",
                 "message": "Analysis complete",
-                "result": deterministic["result"],
-                "chart": deterministic.get("chart"),
-                "chart_json": deterministic.get("chart_json"),
-                "report": deterministic.get("report"),
-                "critique": deterministic.get("critique"),
-                "plan": plan,
-                "code": deterministic.get("code"),
-                "code_lang": deterministic.get("code_lang"),
-                "followups": followups,
-                "validation": deterministic.get("validation"),
-                "meta": deterministic.get("meta"),
-            }
+                "result": analyst_result,
+                "chart": chart_b64,
+                "chart_json": chart_json,
+                "report": report,
+                "critique": {
+                    "verdict": "pass" if not validation_warnings else "warn",
+                    "confidence": plan_confidence,
+                    "issues": validation_warnings,
+                    "strengths": ["Plan validated against actual schema", "Execution is deterministic"],
+                    "suggestion": validation_warnings[0] if validation_warnings else "",
+                },
+                "plan": compat_plan,
+                "code": None,
+                "code_lang": "structured_plan",
+                "followups": [
+                    f"Show the top 5 {resolved_plan.resolved_dimension_col or 'rows'}",
+                    f"Compare {resolved_plan.resolved_measure_col or 'values'} over time",
+                    "Add a filter",
+                    "Change chart type to bar",
+                ] if resolved_plan.resolved_dimension_col else ["Describe this dataset", "Show data quality issues"],
+                "validation": build_validation_payload(
+                    df,
+                    method="Schema-aware LLM planner ÃÂ¢ÃÂÃÂ deterministic executor",
+                    source_columns=[c for c in [resolved_plan.resolved_dimension_col, resolved_plan.resolved_measure_col] if c],
+                    confidence=float(plan_confidence),
+                    reasons=[
+                        f"Plan confidence: {plan_confidence:.0%}.",
+                        "Execution is deterministic ÃÂ¢ÃÂÃÂ no LLM-generated arithmetic.",
+                        f"Validator warnings: {len(validation_warnings)}.",
+                    ],
+                ),
+                "lens_resolution": lens_res,
+                "meta": {
+                    "route": complexity_route,
+                    "pipeline_branch": "schema_aware_planner",
+                    "cacheable": True,
+                    "request_id": req_id,
+                    "elapsed_ms": round((time.time() - start_time) * 1000),
+                    "llm_calls": llm_client.get_call_count(req_id),
+                    "planner_ms": llm_client.get_stage_ms(req_id, "planner"),
+                    "synthesis_ms": llm_client.get_stage_ms(req_id, "synthesis"),
+                },
+            })
             _cache_set(cache_key, done_event)
-            _update_conversation_state(
-                req.session_id,
-                req.question,
-                deterministic["result"],
-                plan,
-                deterministic.get("code"),
-                deterministic.get("code_lang"),
+
+            # Update conversation state ÃÂ¢ÃÂÃÂ only store resolved column names (no freeform columns)
+            if hasattr(req, "session_id"):
+                conversation_state[req.session_id] = {
+                    "last_question": req.question,
+                    "result": analyst_result[:500],
+                    "plan": {
+                        "relevant_columns": compat_plan["relevant_columns"],
+                        "intent": resolved_plan.intent,
+                    },
+                }
+
+            logger.info(
+                "Query complete request_id=%s route=schema_aware_planner dim=%s measure=%s op=%s chart=%s warnings=%d elapsed_ms=%s",
+                req_id, resolved_plan.resolved_dimension_col, resolved_plan.resolved_measure_col,
+                resolved_plan.resolved_operation, resolved_plan.resolved_chart_type,
+                len(validation_warnings), done_event["meta"]["elapsed_ms"],
             )
             yield emit(done_event)
-            return
 
-        # ── RAG: retrieve context from uploaded documents ──────────────────
-        rag_context = ""
-        rag_sources: list[str] = []
-        store = doc_stores.get(req.session_id)
-        if store and store.chunks:
-            yield emit({"step": "analyzing", "message": f"Retrieving context from {len(store.filenames)} document(s)..."})
-            hits = store.search(req.question, top_k=4)
-            if hits:
-                rag_context = "\n\n".join(
-                    f"[Source: {h['filename']}]\n{h['text']}" for h in hits
-                )
-                rag_sources = list(dict.fromkeys(h["filename"] for h in hits))
-
-        rag_block = f"\n\nRELEVANT DOCUMENTATION:\n{rag_context}" if rag_context else ""
-
-        # ── AGENT 1: PLANNER ──────────────────────────────────────────────
-        yield emit({"step": "planning", "message": "Planner is mapping your question to the dataset..."})
-        try:
-            plan_raw = llm(
-                PLANNER_SYSTEM,
-                f"Category: {req.category}\nDomain context: {category_persona}\n\nSchema:\n{schema}{rag_block}\n\nQuestion: {req.question}"
-            )
-            plan = parse_json_safe(plan_raw)
-        except Exception:
-            plan = {"needs_chart": True, "strategy": "Direct analysis", "relevant_columns": [], "analysis_steps": [], "chart_type": "auto"}
-
-        plan["rag_sources"] = rag_sources
-        yield emit({"step": "plan", "message": f"Plan: {plan.get('strategy', 'Analyzing...')}", "plan": plan})
-
-        # ── AGENT 2: ANALYST (pandas) or SQL ANALYST ──────────────────────
-        query_type = plan.get("query_type", "pandas")
-        analyst_result = None
-        analyst_code   = None
-
-        if query_type == "sql":
-            yield emit({"step": "analyst", "message": "SQL analyst generating query..."})
-            sql_schema = get_sql_schema(df)
-            sql_context = (
-                f"Domain context: {category_persona}\n"
-                f"Schema:\n{sql_schema}\n"
-                + (f"\nDocumentation context:\n{rag_context}\n" if rag_context else "")
-                + f"\nAnalysis strategy: {plan.get('strategy', '')}\n"
-                f"Question: {req.question}"
-            )
-            sql_query = ""
-            try:
-                sql_query = llm(SQL_ANALYST_SYSTEM, sql_context).strip()
-            except Exception as e:
-                yield emit({"step": "error", "message": f"SQL agent error: {e}"}); return
-
-            yield emit({"step": "code", "message": "SQL query generated", "code": sql_query, "code_lang": "sql"})
-            yield emit({"step": "executing", "message": "Executing SQL on your data..."})
-
-            for attempt in range(2):
-                try:
-                    analyst_result = execute_sql(sql_query, df)
-                    analyst_code = sql_query
-                    break
-                except Exception:
-                    err = traceback.format_exc().strip().splitlines()[-1]
-                    if attempt == 0:
-                        yield emit({"step": "thinking", "message": f"SQL error — fixing… ({err})"})
-                        try:
-                            sql_query = llm(SQL_ANALYST_SYSTEM,
-                                            f"{sql_context}\n\nPrevious query failed:\n{sql_query}\nError: {err}\nWrite a corrected SQL query.")
-                        except Exception:
-                            break
-                    else:
-                        yield emit({"step": "error", "message": f"SQL error: {err}"}); return
-
-            if analyst_result is None:
-                yield emit({"step": "error", "message": "SQL analyst could not produce results."}); return
-
-        else:
-            yield emit({"step": "analyst", "message": "Analyst agent computing statistics..."})
-            analyst_context = (
-                f"Domain context: {category_persona}\n"
-                f"Schema:\n{schema}\n\n"
-                f"Analysis strategy: {plan.get('strategy', '')}\n"
-                f"Focus on columns: {', '.join(plan.get('relevant_columns', []))}\n"
-                f"Steps to follow: {'; '.join(plan.get('analysis_steps', []))}\n"
-                + (f"\nAdditional context from documentation:\n{rag_context}\n" if rag_context else "")
-                + f"\nQuestion: {req.question}"
-            )
-            analyst_code, analyst_result, _, __ = run_code_with_repair(ANALYST_SYSTEM, analyst_context, "analyst")
-            if analyst_code:
-                yield emit({"step": "code", "message": "Analyst code generated", "code": analyst_code, "code_lang": "python"})
-            yield emit({"step": "executing", "message": "Executing analysis on your data..."})
-            if analyst_result is None:
-                yield emit({"step": "error", "message": "Analyst agent could not compute results."}); return
-
-        # ── AGENT 3: VISUALIZER ───────────────────────────────────────────
-        chart_b64 = None
-        chart_json = None
-        if plan.get("needs_chart", True):
-            yield emit({"step": "visualizing", "message": "Visualizer agent creating interactive chart..."})
-            viz_context = (
-                f"Schema:\n{schema}\n\n"
-                f"Question: {req.question}\n"
-                f"Suggested chart type: {plan.get('chart_type', 'auto')}\n"
-                f"Analysis findings to visualize:\n{analyst_result[:800]}"
-            )
-            viz_code, _, chart_b64, chart_json = run_code_with_repair(VISUALIZER_SYSTEM, viz_context, "visualizer")
-            if viz_code:
-                yield emit({"step": "code", "message": "Visualizer code generated", "code": viz_code})
-
-        # ── AGENT 4: CRITIC ───────────────────────────────────────────────
-        yield emit({"step": "critiquing", "message": "Critic agent reviewing the analysis..."})
-        try:
-            critique_raw = llm(
-                CRITIC_SYSTEM,
-                f"Question: {req.question}\nAnalysis strategy: {plan.get('strategy', '')}\n\nFindings:\n{analyst_result}"
-            )
-            critique = parse_json_safe(critique_raw)
-            if not critique:
-                critique = {"verdict": "pass", "confidence": 0.85, "issues": [], "strengths": ["Analysis completed"], "suggestion": ""}
-        except Exception:
-            critique = {"verdict": "pass", "confidence": 0.85, "issues": [], "strengths": [], "suggestion": ""}
-
-        confidence = critique.get("confidence", 0.85)
-        verdict = critique.get("verdict", "pass")
-        yield emit({"step": "critique", "message": f"Critic: {verdict.upper()} · {confidence:.0%} confidence", "critique": critique})
-
-        # ── AGENT 5: REPORTER ─────────────────────────────────────────────
-        yield emit({"step": "reporting", "message": "Report agent writing executive summary..."})
-        try:
-            report = llm(
-                REPORTER_SYSTEM,
-                f"Question: {req.question}\nCategory: {req.category}\n\nFindings:\n{analyst_result}\n\nCritic notes: {critique.get('suggestion', '')}",
-                temperature=0.2,
-            )
-        except Exception:
-            report = analyst_result
-
-        done_event = {
-            "step": "done",
-            "message": "Analysis complete",
-            "result": analyst_result,
-            "chart": chart_b64,
-            "chart_json": chart_json,
-            "report": report,
-            "critique": critique,
-            "plan": plan,
-            "code": analyst_code,
-            "code_lang": "sql" if query_type == "sql" else "python",
-            "followups": suggest_followups(req.question, df, plan, conversation_state.get(req.session_id)),
-            "validation": build_validation_payload(
-                df,
-                method="LLM-generated analysis reviewed by critic and executed against the uploaded dataframe",
-                source_columns=[c for c in plan.get("relevant_columns", []) if c in df.columns],
-                confidence=float(critique.get("confidence", 0.85) or 0.85),
-                reasons=[
-                    f"Execution route: {query_type}.",
-                    f"Critic verdict: {critique.get('verdict', 'pass')}.",
-                    "Generated code or SQL was executed against the in-memory dataframe.",
-                ],
-            ),
-            "meta": {"route": "llm", "cacheable": True},
-        }
-        _cache_set(cache_key, done_event)
-        _update_conversation_state(
-            req.session_id,
-            req.question,
-            analyst_result,
-            plan,
-            analyst_code,
-            "sql" if query_type == "sql" else "python",
-        )
-        yield emit(done_event)
+        except Exception as exc:
+            if is_cancelled(req_id):
+                logger.info("Query cancelled request_id=%s", req_id)
+                yield emit({
+                    "type": "request_cancelled",
+                    "request_id": req_id,
+                    "status": "cancelled",
+                    "step": "done",
+                    "message": "Analysis cancelled by user",
+                })
+            else:
+                logger.exception("Query failed request_id=%s", req_id)
+                err_code = "answer_generation_failed" if "synthesis" in type(exc).__name__.lower() or "synthesis" in str(exc).lower() else "query_execution_failed"
+                yield emit({
+                    "type": "analysis_failed",
+                    "request_id": req_id,
+                    "status": "failed",
+                    "step": "error",
+                    "answer": None,
+                    "evidence_summary": {"available": True},
+                    "message": f"Query failed: {str(exc)}",
+                    "error": {
+                        "code": err_code,
+                        "message": str(exc),
+                    },
+                })
 
     return StreamingResponse(stream(), media_type="text/event-stream")
 
 
 @app.post("/story")
-async def story(req: StoryRequest) -> StreamingResponse:
+async def story(
+    req: StoryRequest,
+    x_session_token: str | None = Header(None, alias="X-Session-Token"),
+    token: str | None = Query(None),
+) -> StreamingResponse:
     """Generate a fact-first dataset story from deterministic analysis facts."""
+    verify_token_for_session(req.session_id, x_session_token, token)
     cleanup_expired_sessions()
     if req.session_id not in dataframes:
         raise HTTPException(status_code=404, detail="Session not found. Upload a CSV first.")
@@ -4138,7 +6015,12 @@ async def story(req: StoryRequest) -> StreamingResponse:
 
 
 @app.post("/predict")
-async def predict(req: PredictRequest) -> StreamingResponse:
+async def predict(
+    req: PredictRequest,
+    x_session_token: str | None = Header(None, alias="X-Session-Token"),
+    token: str | None = Query(None),
+) -> StreamingResponse:
+    verify_token_for_session(req.session_id, x_session_token, token)
     cleanup_expired_sessions()
     if req.session_id not in dataframes:
         raise HTTPException(status_code=404, detail="Session not found. Upload a CSV first.")
@@ -4178,7 +6060,13 @@ def run_predict_job(job_id: str, session_id: str, target: str) -> None:
 
 
 @app.post("/predict_job")
-def predict_job(req: PredictRequest, background_tasks: BackgroundTasks) -> dict:
+def predict_job(
+    req: PredictRequest,
+    background_tasks: BackgroundTasks,
+    x_session_token: str | None = Header(None, alias="X-Session-Token"),
+    token: str | None = Query(None),
+) -> dict:
+    verify_token_for_session(req.session_id, x_session_token, token)
     cleanup_expired_sessions()
     if req.session_id not in dataframes:
         raise HTTPException(status_code=404, detail="Session not found. Upload a CSV first.")
@@ -4196,7 +6084,12 @@ def predict_job(req: PredictRequest, background_tasks: BackgroundTasks) -> dict:
 
 
 @app.get("/model_info/{session_id}")
-def model_info(session_id: str) -> dict:
+def model_info(
+    session_id: str,
+    x_session_token: str | None = Header(None, alias="X-Session-Token"),
+    token: str | None = Query(None),
+) -> dict:
+    verify_token_for_session(session_id, x_session_token, token)
     cleanup_expired_sessions()
     if session_id in dataframes:
         _touch_session(session_id)
@@ -4212,7 +6105,11 @@ def model_info(session_id: str) -> dict:
 
 
 @app.get("/jobs/{job_id}")
-def get_job(job_id: str) -> dict:
+def get_job(
+    job_id: str,
+    x_session_token: str | None = Header(None, alias="X-Session-Token"),
+    token: str | None = Query(None),
+) -> dict:
     cleanup_expired_sessions()
     job = jobs.get(job_id)
     if not job:
@@ -4231,6 +6128,8 @@ def get_job(job_id: str) -> dict:
             jobs[job_id] = job
     if not job:
         raise HTTPException(status_code=404, detail="Job not found.")
+    if job.get("session_id"):
+        verify_token_for_session(str(job["session_id"]), x_session_token, token)
     if job.get("session_id") and is_valid_session(str(job["session_id"])):
         _touch_session(str(job["session_id"]))
     return public_job(job)
@@ -4494,7 +6393,12 @@ def scenario_impact(info: dict, baseline_prediction: dict, scenario_prediction: 
 
 
 @app.post("/predict_input")
-def predict_input(req: PredictInputRequest) -> dict:
+def predict_input(
+    req: PredictInputRequest,
+    x_session_token: str | None = Header(None, alias="X-Session-Token"),
+    token: str | None = Query(None),
+) -> dict:
+    verify_token_for_session(req.session_id, x_session_token, token)
     cleanup_expired_sessions()
     info = models.get(req.session_id)
     if not info:
@@ -4507,10 +6411,75 @@ def predict_input(req: PredictInputRequest) -> dict:
     return predict_model_values(info, req.values)
 
 
-# ── Business report export (PDF + PPTX) ──────────────────────────────────────
+@app.get("/dataset_rows/{session_id}")
+async def get_dataset_rows(
+    session_id: str,
+    page: int = 1,
+    page_size: int = 100,
+    search: str = "",
+    sort_col: str = "",
+    sort_dir: str = "asc",
+    x_session_token: str | None = Header(None, alias="X-Session-Token"),
+    token: str | None = Query(None),
+):
+    """Returns paginated/filtered dataset rows for the Excel-like spreadsheet viewer."""
+    verify_token_for_session(session_id, x_session_token, token)
+    if session_id not in dataframes:
+        raise HTTPException(status_code=404, detail="Session not found.")
+    
+    df = dataframes[session_id]
+    total_rows = len(df)
+    columns = list(df.columns)
+    dtypes = {col: str(dtype) for col, dtype in df.dtypes.items()}
+
+    filtered_df = df
+    if search.strip():
+        q = search.lower().strip()
+        mask = df.apply(lambda row: row.astype(str).str.lower().str.contains(q, regex=False).any(), axis=1)
+        filtered_df = df[mask]
+
+    filtered_count = len(filtered_df)
+
+    if sort_col and sort_col in filtered_df.columns:
+        ascending = (sort_dir.lower() == "asc")
+        try:
+            filtered_df = filtered_df.sort_values(by=sort_col, ascending=ascending)
+        except Exception:
+            pass
+
+    if page_size > 0:
+        start_idx = (page - 1) * page_size
+        end_idx = start_idx + page_size
+        page_df = filtered_df.iloc[start_idx:end_idx]
+    else:
+        page_df = filtered_df
+
+    rows = page_df.replace({np.nan: None}).to_dict(orient="records")
+    row_indices = [int(i) + 1 for i in page_df.index]
+
+    return {
+        "session_id": session_id,
+        "total_rows": total_rows,
+        "filtered_count": filtered_count,
+        "page": page,
+        "page_size": page_size,
+        "total_pages": max(1, (filtered_count + page_size - 1) // page_size) if page_size > 0 else 1,
+        "columns": columns,
+        "dtypes": dtypes,
+        "row_indices": row_indices,
+        "rows": rows,
+    }
+
+
+# ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ Business report export (PDF + PPTX) ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
 
 @app.post("/simulate")
-def simulate_scenario(req: ScenarioRequest) -> dict:
+def simulate_scenario(
+    req: ScenarioRequest,
+    x_session_token: str | None = Header(None, alias="X-Session-Token"),
+    token: str | None = Query(None),
+) -> dict:
+    verify_token_for_session(req.session_id, x_session_token, token)
     cleanup_expired_sessions()
     info = models.get(req.session_id)
     if not info:
@@ -4550,7 +6519,12 @@ def simulate_scenario(req: ScenarioRequest) -> dict:
 
 
 @app.post("/scenario_parse")
-def scenario_parse(req: ScenarioParseRequest) -> dict:
+def scenario_parse(
+    req: ScenarioParseRequest,
+    x_session_token: str | None = Header(None, alias="X-Session-Token"),
+    token: str | None = Query(None),
+) -> dict:
+    verify_token_for_session(req.session_id, x_session_token, token)
     cleanup_expired_sessions()
     info = models.get(req.session_id)
     if not info:
@@ -4670,7 +6644,7 @@ def _generate_pdf(req: ReportRequest, profile: dict) -> bytes:
                             leftMargin=2.5*cm, rightMargin=2.5*cm,
                             topMargin=2.5*cm, bottomMargin=2.5*cm)
 
-    # ── Styles ──
+    # ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ Styles ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
     INDIGO   = HexColor("#4F46E5")
     DARK     = HexColor("#0F172A")
     SOFT     = HexColor("#64748B")
@@ -4724,12 +6698,12 @@ def _generate_pdf(req: ReportRequest, profile: dict) -> bytes:
             return None
 
     PERSONA_HEADERS = {
-        "financial": "CFO Executive Briefing · Focus: Margin, Variance, Capital Efficiency & Risk",
-        "medical": "Clinical Leadership Briefing · Focus: Patient Outcomes & Operational Efficacy",
-        "retail": "Merchandising & Operations Briefing · Focus: Unit Economics & Inventory Turn",
-        "marketing": "CMO Growth Briefing · Focus: CAC, LTV & Campaign Attribution",
-        "hr": "People Operations Briefing · Focus: Attrition, Banding & Workforce Productivity",
-        "general": "Executive Decision Briefing · Focus: Profile, Trends, Predictions & Signals",
+        "financial": "CFO Executive Briefing ÃÂÃÂ· Focus: Margin, Variance, Capital Efficiency & Risk",
+        "medical": "Clinical Leadership Briefing ÃÂÃÂ· Focus: Patient Outcomes & Operational Efficacy",
+        "retail": "Merchandising & Operations Briefing ÃÂÃÂ· Focus: Unit Economics & Inventory Turn",
+        "marketing": "CMO Growth Briefing ÃÂÃÂ· Focus: CAC, LTV & Campaign Attribution",
+        "hr": "People Operations Briefing ÃÂÃÂ· Focus: Attrition, Banding & Workforce Productivity",
+        "general": "Executive Decision Briefing ÃÂÃÂ· Focus: Profile, Trends, Predictions & Signals",
     }
     persona_tag = PERSONA_HEADERS.get(req.category.lower(), PERSONA_HEADERS["general"])
 
@@ -4737,18 +6711,18 @@ def _generate_pdf(req: ReportRequest, profile: dict) -> bytes:
     cat   = req.category.title()
     today = _dt.date.today().strftime("%B %d, %Y")
 
-    # ── Cover ──
+    # ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ Cover ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
     story.append(Spacer(1, 2.5*cm))
     story.append(Paragraph("Analytics Report", S["cover_title"]))
     story.append(Paragraph(req.filename, S["cover_sub"]))
-    story.append(Paragraph(f"{cat} Lens  ·  {today}", S["cover_sub"]))
+    story.append(Paragraph(f"{cat} Lens  ÃÂÃÂ·  {today}", S["cover_sub"]))
     story.append(Paragraph(persona_tag, S["meta"]))
     story.append(Spacer(1, 1.2*cm))
     story.append(HRFlowable(width="80%", thickness=2, color=INDIGO, spaceAfter=18))
-    story.append(Paragraph("Generated by CSV Analyst AI · Powered by Gemini 2.5 Flash-Lite", S["meta"]))
+    story.append(Paragraph("Generated by CSV Analyst AI ÃÂÃÂ· Powered by Gemini 2.5 Flash-Lite", S["meta"]))
     story.append(PageBreak())
 
-    # ── Data Profile ──
+    # ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ Data Profile ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
     story.append(Paragraph("Dataset Profile", S["section"]))
     n_cols = len(profile.get("columns", []))
     n_cat  = n_cols - profile.get("numeric_features", 0)
@@ -4769,9 +6743,9 @@ def _generate_pdf(req: ReportRequest, profile: dict) -> bytes:
         stat_rows = [["Column", "Mean", "Median", "Std Dev", "Min", "Max"]]
         for col, s in list(profile["numeric_stats"].items())[:12]:
             stat_rows.append([col,
-                str(s.get("mean", "—")), str(s.get("median", "—")),
-                str(s.get("std", "—")),  str(s.get("min", "—")),
-                str(s.get("max", "—"))])
+                str(s.get("mean", "ÃÂ¢ÃÂÃÂ")), str(s.get("median", "ÃÂ¢ÃÂÃÂ")),
+                str(s.get("std", "ÃÂ¢ÃÂÃÂ")),  str(s.get("min", "ÃÂ¢ÃÂÃÂ")),
+                str(s.get("max", "ÃÂ¢ÃÂÃÂ"))])
         t2 = Table(stat_rows, colWidths=[4.5*cm, 2.5*cm, 2.5*cm, 2.5*cm, 2.5*cm, 2.5*cm])
         t2.setStyle(TableStyle([
             ("BACKGROUND", (0, 0), (-1, 0), INDIGO),
@@ -4787,9 +6761,9 @@ def _generate_pdf(req: ReportRequest, profile: dict) -> bytes:
         story.append(t2)
     story.append(PageBreak())
 
-    # ── Analysis sections ──
+    # ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ Analysis sections ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
     for i, msg in enumerate(req.messages, 1):
-        q = msg.get("question", "—")
+        q = msg.get("question", "ÃÂ¢ÃÂÃÂ")
         story.append(Paragraph(f"Q{i}: {q}", S["question"]))
 
         # Executive summary
@@ -4797,7 +6771,7 @@ def _generate_pdf(req: ReportRequest, profile: dict) -> bytes:
         if report_text:
             story.append(_safe_para(report_text, S["body"]))
 
-        # Chart (prefer chart_json → PNG via kaleido, fallback to chart_b64)
+        # Chart (prefer chart_json ÃÂ¢ÃÂÃÂ PNG via kaleido, fallback to chart_b64)
         chart_img = None
         if msg.get("chart_json"):
             chart_img = _embed_chart(_plotly_json_to_png(msg["chart_json"]))
@@ -4821,9 +6795,9 @@ def _generate_pdf(req: ReportRequest, profile: dict) -> bytes:
             verdict = c.get("verdict", "pass").upper()
             conf    = c.get("confidence", 0)
             issues  = "; ".join(c.get("issues", []))
-            line    = f"Analysis quality: {verdict}  ·  {conf:.0%} confidence"
+            line    = f"Analysis quality: {verdict}  ÃÂÃÂ·  {conf:.0%} confidence"
             if issues:
-                line += f"  ·  {issues}"
+                line += f"  ÃÂÃÂ·  {issues}"
             story.append(Spacer(1, 0.2*cm))
             story.append(_safe_para(line, S["meta"]))
 
@@ -4832,7 +6806,7 @@ def _generate_pdf(req: ReportRequest, profile: dict) -> bytes:
             lang = msg.get("code_lang", "python").upper()
             story.append(Spacer(1, 0.2*cm))
             story.append(Paragraph(f"Generated {lang} code:", S["meta"]))
-            snippet = msg["code"][:800] + ("…" if len(msg["code"]) > 800 else "")
+            snippet = msg["code"][:800] + ("ÃÂ¢ÃÂÃÂ¦" if len(msg["code"]) > 800 else "")
             story.append(_safe_para(snippet, S["mono"]))
 
         story.append(HRFlowable(width="100%", thickness=0.5, color=BORDER, spaceAfter=12))
@@ -4897,18 +6871,18 @@ def _generate_pptx(req: ReportRequest, profile: dict) -> bytes:
         return shape
 
     PERSONA_HEADERS = {
-        "financial": "CFO Executive Briefing · Focus: Margin, Variance, Capital Efficiency & Risk",
-        "medical": "Clinical Leadership Briefing · Focus: Patient Outcomes & Operational Efficacy",
-        "retail": "Merchandising & Operations Briefing · Focus: Unit Economics & Inventory Turn",
-        "marketing": "CMO Growth Briefing · Focus: CAC, LTV & Campaign Attribution",
-        "hr": "People Operations Briefing · Focus: Attrition, Banding & Workforce Productivity",
-        "general": "Executive Decision Briefing · Focus: Profile, Trends, Predictions & Signals",
+        "financial": "CFO Executive Briefing ÃÂÃÂ· Focus: Margin, Variance, Capital Efficiency & Risk",
+        "medical": "Clinical Leadership Briefing ÃÂÃÂ· Focus: Patient Outcomes & Operational Efficacy",
+        "retail": "Merchandising & Operations Briefing ÃÂÃÂ· Focus: Unit Economics & Inventory Turn",
+        "marketing": "CMO Growth Briefing ÃÂÃÂ· Focus: CAC, LTV & Campaign Attribution",
+        "hr": "People Operations Briefing ÃÂÃÂ· Focus: Attrition, Banding & Workforce Productivity",
+        "general": "Executive Decision Briefing ÃÂÃÂ· Focus: Profile, Trends, Predictions & Signals",
     }
     persona_tag = PERSONA_HEADERS.get(req.category.lower(), PERSONA_HEADERS["general"])
 
     today = _dt.date.today().strftime("%B %d, %Y")
 
-    # ── Title slide ──
+    # ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ Title slide ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
     s = _slide()
     _rect(s, 0, 0, 13.33, 7.5, RGBColor(0xF8, 0xFA, 0xFC))
     _rect(s, 0, 0, 13.33, 1.5, INDIGO)
@@ -4916,14 +6890,14 @@ def _generate_pptx(req: ReportRequest, profile: dict) -> bytes:
            color=RGBColor(0xFF, 0xFF, 0xFF), align=PP_ALIGN.CENTER)
     _txbox(s, 0.5, 2.2, 12, 0.6, req.filename, size=22, bold=True,
            color=DARK, align=PP_ALIGN.CENTER)
-    _txbox(s, 0.5, 2.9, 12, 0.5, f"{req.category.title()} Lens  ·  {today}",
+    _txbox(s, 0.5, 2.9, 12, 0.5, f"{req.category.title()} Lens  ÃÂÃÂ·  {today}",
            size=14, color=SOFT, align=PP_ALIGN.CENTER)
     _txbox(s, 0.5, 3.5, 12, 0.5, persona_tag,
            size=12, color=INDIGO, align=PP_ALIGN.CENTER)
-    _txbox(s, 0.5, 6.8, 12, 0.5, "Generated by CSV Analyst AI · Gemini 2.5 Flash-Lite",
+    _txbox(s, 0.5, 6.8, 12, 0.5, "Generated by CSV Analyst AI ÃÂÃÂ· Gemini 2.5 Flash-Lite",
            size=11, color=SOFT, align=PP_ALIGN.CENTER)
 
-    # ── Profile slide ──
+    # ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ Profile slide ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
     s = _slide()
     _rect(s, 0, 0, 13.33, 1.1, INDIGO)
     _txbox(s, 0.4, 0.15, 12, 0.8, "Dataset Profile", size=24, bold=True,
@@ -4946,7 +6920,7 @@ def _generate_pptx(req: ReportRequest, profile: dict) -> bytes:
         _txbox(s, left + 0.15, top + 0.7, 3.7, 0.5, k,
                size=11, color=SOFT, align=PP_ALIGN.CENTER)
 
-    # ── Per-message slides ──
+    # ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ Per-message slides ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
     for i, msg in enumerate(req.messages, 1):
         s = _slide()
         _rect(s, 0, 0, 13.33, 1.1, INDIGO)
@@ -4975,7 +6949,7 @@ def _generate_pptx(req: ReportRequest, profile: dict) -> bytes:
         # Critique footer
         if msg.get("critique"):
             c = msg["critique"]
-            footer = f"Quality: {c.get('verdict','pass').upper()}  ·  {c.get('confidence',0):.0%} confidence"
+            footer = f"Quality: {c.get('verdict','pass').upper()}  ÃÂÃÂ·  {c.get('confidence',0):.0%} confidence"
             _txbox(s, 0.4, 6.8, 12.5, 0.5, footer, size=10, color=SOFT, align=PP_ALIGN.CENTER)
 
     buf = io.BytesIO()
@@ -4988,8 +6962,11 @@ async def export_report(
     session_id: str,
     req: ReportRequest,
     format: str = Query(default="pdf", pattern="^(pdf|pptx)$"),
+    x_session_token: str | None = Header(None, alias="X-Session-Token"),
+    token: str | None = Query(None),
 ) -> dict:
     """Generate a PDF or PPTX report from the session data and conversation messages."""
+    verify_token_for_session(session_id, x_session_token, token)
     cleanup_expired_sessions()
     if session_id not in dataframes:
         raise HTTPException(status_code=404, detail="Session not found. Upload a CSV first.")
@@ -5013,8 +6990,11 @@ async def export_report_job(
     req: ReportRequest,
     background_tasks: BackgroundTasks,
     format: str = Query(default="pdf", pattern="^(pdf|pptx)$"),
+    x_session_token: str | None = Header(None, alias="X-Session-Token"),
+    token: str | None = Query(None),
 ) -> dict:
     """Queue PDF/PPTX report generation and return a polling URL."""
+    verify_token_for_session(session_id, x_session_token, token)
     cleanup_expired_sessions()
     if session_id not in dataframes:
         raise HTTPException(status_code=404, detail="Session not found. Upload a CSV first.")
@@ -5029,10 +7009,10 @@ async def export_report_job(
     }
 
 
-# ── Benchmark evaluation framework ───────────────────────────────────────────
+# ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ Benchmark evaluation framework ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
 
 BENCHMARK_QUESTIONS = [
-    # ── General statistics ────────────────────────────────────────────────
+    # ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ General statistics ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
     {"question": "What are the summary statistics for all numeric columns?",            "category": "general",   "expects_chart": False, "expects_sql": False},
     {"question": "How many rows and columns does the dataset have?",                    "category": "general",   "expects_chart": False, "expects_sql": True},
     {"question": "Show a correlation heatmap of all numeric columns",                   "category": "general",   "expects_chart": True,  "expects_sql": False},
@@ -5041,55 +7021,55 @@ BENCHMARK_QUESTIONS = [
     {"question": "What percentage of values are missing in each column?",               "category": "general",   "expects_chart": False, "expects_sql": False},
     {"question": "Are there any duplicate rows?",                                       "category": "general",   "expects_chart": False, "expects_sql": True},
     {"question": "Show a box plot of all numeric columns to detect outliers",           "category": "general",   "expects_chart": True,  "expects_sql": False},
-    # ── SQL-type (filter / group-by / top-N) ─────────────────────────────
+    # ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ SQL-type (filter / group-by / top-N) ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
     {"question": "Show the top 10 rows sorted by the highest numeric column",           "category": "general",   "expects_chart": False, "expects_sql": True},
     {"question": "Count records in each category and sort by count descending",         "category": "general",   "expects_chart": False, "expects_sql": True},
     {"question": "What is the average of each numeric column grouped by the main category?", "category": "general", "expects_chart": False, "expects_sql": True},
     {"question": "Show all records where the first numeric column is above its average","category": "general",   "expects_chart": False, "expects_sql": True},
     {"question": "What are the top 5 categories by total of the main numeric column?",  "category": "general",   "expects_chart": False, "expects_sql": True},
-    # ── Financial ─────────────────────────────────────────────────────────
+    # ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ Financial ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
     {"question": "What is the total revenue?",                                          "category": "financial", "expects_chart": False, "expects_sql": True},
     {"question": "Show total revenue by category sorted descending as a bar chart",     "category": "financial", "expects_chart": True,  "expects_sql": True},
     {"question": "Calculate mean, standard deviation and CV of the main numeric metric","category": "financial", "expects_chart": False, "expects_sql": False},
     {"question": "What are the top 5 items by revenue? Show a bar chart",               "category": "financial", "expects_chart": True,  "expects_sql": True},
     {"question": "Plot total revenue over time as a line chart",                        "category": "financial", "expects_chart": True,  "expects_sql": False},
     {"question": "What is the period-over-period growth rate of the main metric?",      "category": "financial", "expects_chart": True,  "expects_sql": False},
-    # ── Retail ────────────────────────────────────────────────────────────
+    # ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ Retail ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
     {"question": "Which product or category has the highest total sales?",              "category": "retail",    "expects_chart": False, "expects_sql": True},
     {"question": "Show a bar chart of revenue by region or segment",                    "category": "retail",    "expects_chart": True,  "expects_sql": True},
     {"question": "What is the average order value?",                                    "category": "retail",    "expects_chart": False, "expects_sql": True},
     {"question": "Show a scatter plot of quantity vs revenue",                          "category": "retail",    "expects_chart": True,  "expects_sql": False},
     {"question": "What percentage of total revenue does each category contribute?",     "category": "retail",    "expects_chart": True,  "expects_sql": False},
     {"question": "Show the top 10 best-selling products by revenue as a bar chart",     "category": "retail",    "expects_chart": True,  "expects_sql": True},
-    # ── Marketing ─────────────────────────────────────────────────────────
+    # ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ Marketing ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
     {"question": "Break down totals by each categorical column",                        "category": "marketing", "expects_chart": True,  "expects_sql": True},
     {"question": "Which segment or channel performs best by total metric?",             "category": "marketing", "expects_chart": True,  "expects_sql": True},
     {"question": "Show the share of each category as a pie or bar chart",               "category": "marketing", "expects_chart": True,  "expects_sql": False},
     {"question": "Compare the mean numeric values across segments with a bar chart",    "category": "marketing", "expects_chart": True,  "expects_sql": False},
-    # ── HR ────────────────────────────────────────────────────────────────
+    # ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ HR ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
     {"question": "Show the headcount by department or category as a bar chart",         "category": "hr",        "expects_chart": True,  "expects_sql": True},
     {"question": "Plot the distribution of the main numeric column across the dataset", "category": "hr",        "expects_chart": True,  "expects_sql": False},
     {"question": "Compare the mean of each numeric feature between groups",             "category": "hr",        "expects_chart": True,  "expects_sql": False},
     {"question": "What is the average of the main numeric column by group?",            "category": "hr",        "expects_chart": False, "expects_sql": True},
-    # ── Correlation & statistics ──────────────────────────────────────────
+    # ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ Correlation & statistics ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
     {"question": "Which two columns are most strongly correlated?",                     "category": "general",   "expects_chart": True,  "expects_sql": False},
     {"question": "Show the covariance matrix of numeric columns",                       "category": "general",   "expects_chart": False, "expects_sql": False},
     {"question": "What is the skewness and kurtosis of each numeric column?",           "category": "general",   "expects_chart": False, "expects_sql": False},
     {"question": "Are there significant differences in means between groups? Show statistical test", "category": "general", "expects_chart": False, "expects_sql": False},
-    # ── Time series ───────────────────────────────────────────────────────
+    # ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ Time series ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
     {"question": "Plot the trend of the main numeric column over time",                 "category": "financial", "expects_chart": True,  "expects_sql": False},
     {"question": "Show a monthly or yearly breakdown of the main metric",               "category": "financial", "expects_chart": True,  "expects_sql": True},
-    # ── Edge cases ────────────────────────────────────────────────────────
+    # ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ Edge cases ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
     {"question": "Show me something interesting about this data",                       "category": "general",   "expects_chart": True,  "expects_sql": False},
     {"question": "What story does this dataset tell?",                                  "category": "general",   "expects_chart": False, "expects_sql": False},
     {"question": "Identify the most important pattern or anomaly in this data",         "category": "general",   "expects_chart": True,  "expects_sql": False},
-    # ── Medical ───────────────────────────────────────────────────────────
+    # ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ Medical ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
     {"question": "Which features correlate most with the outcome variable?",            "category": "medical",   "expects_chart": True,  "expects_sql": False},
     {"question": "Compare the mean of each numeric feature between outcome groups",     "category": "medical",   "expects_chart": True,  "expects_sql": False},
     {"question": "Show the distribution of age split by outcome group",                 "category": "medical",   "expects_chart": True,  "expects_sql": False},
     {"question": "What is the prevalence of each outcome class?",                       "category": "medical",   "expects_chart": True,  "expects_sql": True},
     {"question": "Show a violin plot comparing groups on the main clinical metric",     "category": "medical",   "expects_chart": True,  "expects_sql": False},
-    # ── Multi-step ────────────────────────────────────────────────────────
+    # ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ Multi-step ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
     {"question": "Rank all categories by revenue, show top 5 and bottom 5",            "category": "retail",    "expects_chart": True,  "expects_sql": True},
     {"question": "Calculate the Pareto principle: what top % of categories drive 80% of the main metric?", "category": "financial", "expects_chart": True, "expects_sql": False},
 ]
@@ -5247,8 +7227,14 @@ def build_benchmark_payload(session_id: str, n: int = 15) -> dict:
 
 
 @app.get("/benchmark/{session_id}")
-async def run_benchmark(session_id: str, n: int = 15) -> dict:
+async def run_benchmark(
+    session_id: str,
+    n: int = 15,
+    x_session_token: str | None = Header(None, alias="X-Session-Token"),
+    token: str | None = Query(None),
+) -> dict:
     """Run up to n benchmark questions against the uploaded dataset and return metrics."""
+    verify_token_for_session(session_id, x_session_token, token)
     cleanup_expired_sessions()
     if session_id not in dataframes:
         raise HTTPException(status_code=404, detail="Session not found. Upload a CSV first.")
@@ -5267,8 +7253,15 @@ def run_benchmark_job(job_id: str, session_id: str, n: int) -> None:
 
 
 @app.post("/benchmark_job/{session_id}")
-async def benchmark_job(session_id: str, background_tasks: BackgroundTasks, n: int = 15) -> dict:
+async def benchmark_job(
+    session_id: str,
+    background_tasks: BackgroundTasks,
+    n: int = 15,
+    x_session_token: str | None = Header(None, alias="X-Session-Token"),
+    token: str | None = Query(None),
+) -> dict:
     """Queue benchmark evaluation and return a polling URL."""
+    verify_token_for_session(session_id, x_session_token, token)
     cleanup_expired_sessions()
     if session_id not in dataframes:
         raise HTTPException(status_code=404, detail="Session not found. Upload a CSV first.")

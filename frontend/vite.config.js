@@ -37,6 +37,7 @@ export default defineConfig({
       '/forecast': 'http://localhost:8001',
       '/import_url': 'http://localhost:8001',
       '/compare': 'http://localhost:8001',
+      '/dataset_rows': 'http://localhost:8001',
       '/health': 'http://localhost:8001',
     }
   }
