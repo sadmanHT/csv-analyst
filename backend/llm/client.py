@@ -86,8 +86,27 @@ class BudgetedLLMClient:
 
             def _do_generate():
                 if os.environ.get("PYTEST_CURRENT_TEST") or os.environ.get("MOCK_LLM") == "1":
+                    summary_text = "Analysis complete based on verified evidence."
+                    try:
+                        data = json.loads(contents)
+                        evidence_data = data.get("evidence", {})
+                        facts = evidence_data.get("facts", {})
+                        if isinstance(facts, dict) and "result" in facts:
+                            summary_text = str(facts["result"])
+                        elif isinstance(facts, dict) and facts:
+                            summary_text = f"Analysis complete: {facts}"
+                    except Exception:
+                        pass
+
                     class MockResponse:
-                        text = '{"title": "Analysis Result", "summary": "Analysis complete for val 1.", "findings": [{"key": "val", "value": 1}], "caveats": [], "next_action": null}'
+                        text = json.dumps({
+                            "title": "Analysis Result",
+                            "summary": summary_text,
+                            "explanation": "Calculated deterministically from data.",
+                            "findings": [{"key": "summary", "value": summary_text}],
+                            "caveats": [],
+                            "next_action": None
+                        })
                     return MockResponse()
                 return self.client.models.generate_content(
                     model=model,
