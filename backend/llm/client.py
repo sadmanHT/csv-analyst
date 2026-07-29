@@ -87,7 +87,7 @@ class BudgetedLLMClient:
             def _do_generate():
                 if os.environ.get("PYTEST_CURRENT_TEST") or os.environ.get("MOCK_LLM") == "1":
                     class MockResponse:
-                        text = '{"title": "Analysis Result", "summary": "Analysis complete for val 1.", "findings": ["val: 1"], "caveats": [], "next_action": null}'
+                        text = '{"title": "Analysis Result", "summary": "Analysis complete for val 1.", "findings": [{"key": "val", "value": 1}], "caveats": [], "next_action": null}'
                     return MockResponse()
                 return self.client.models.generate_content(
                     model=model,
