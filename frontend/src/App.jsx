@@ -2773,6 +2773,57 @@ function classifyStreamEvent(event) {
   return 'progress'
 }
 
+function toDisplayText(value, fallback = '') {
+  if (value == null) return fallback
+
+  if (
+    typeof value === 'string' ||
+    typeof value === 'number' ||
+    typeof value === 'boolean'
+  ) {
+    return String(value)
+  }
+
+  if (Array.isArray(value)) {
+    return value
+      .map((item) => toDisplayText(item))
+      .filter(Boolean)
+      .join('\n')
+  }
+
+  if (typeof value === 'object') {
+    return (
+      toDisplayText(value.message) ||
+      toDisplayText(value.summary) ||
+      toDisplayText(value.text) ||
+      toDisplayText(value.detail) ||
+      toDisplayText(value.code) ||
+      fallback
+    )
+  }
+
+  return fallback
+}
+
+function normalizeApiError(error) {
+  if (!error) return null
+
+  if (typeof error === 'string') {
+    return {
+      code: 'request_failed',
+      message: error,
+    }
+  }
+
+  return {
+    code: toDisplayText(error.code, 'request_failed'),
+    message: toDisplayText(
+      error.message ?? error.detail,
+      'The analysis could not be completed.'
+    ),
+  }
+}
+
 function normalizeStreamStatus(event) {
   const eventClass = classifyStreamEvent(event)
   if (eventClass === 'terminal-success') return 'complete'
@@ -2781,10 +2832,11 @@ function normalizeStreamStatus(event) {
   return 'running'
 }
 
-function normalizeQueryResponse(raw, fallbackRequestId) {
+function normalizeQueryResponse(raw = {}, fallbackRequestId) {
   const rawIsObject = raw !== null && typeof raw === 'object'
   const isStreamEvent = Boolean(raw?.type || raw?.step)
-  const defaultStatus = isStreamEvent ? normalizeStreamStatus(raw) : 'complete'
+  const error = normalizeApiError(raw?.error)
+  const defaultStatus = isStreamEvent ? normalizeStreamStatus(raw) : (error ? 'failed' : 'complete')
 
   const nestedResult =
     rawIsObject && raw.result !== null && typeof raw.result === 'object'
@@ -2808,7 +2860,18 @@ function normalizeQueryResponse(raw, fallbackRequestId) {
     getPrimitiveText(raw?.result) ??
     getPrimitiveText(nestedResult?.result)
 
-  let answerText = primitiveResultText
+  let answerText =
+    toDisplayText(answerObject?.summary) ||
+    toDisplayText(answerObject?.explanation) ||
+    toDisplayText(answerObject?.text) ||
+    toDisplayText(answerObject) ||
+    primitiveResultText ||
+    toDisplayText(raw?.report) ||
+    toDisplayText(raw?.answer) ||
+    toDisplayText(raw?.response) ||
+    toDisplayText(raw?.output) ||
+    error?.message ||
+    ''
 
   let answerType =
     nestedResult.answer_type ??
@@ -2819,28 +2882,13 @@ function normalizeQueryResponse(raw, fallbackRequestId) {
   if (typeof answerObject === 'string') {
     answerText = answerObject.trim() || answerText
   } else if (answerObject && typeof answerObject === 'object') {
-    answerText =
-      getPrimitiveText(answerObject.text) ??
-      getPrimitiveText(answerObject.summary) ??
-      getPrimitiveText(answerObject.content) ??
-      getPrimitiveText(answerObject.message) ??
-      answerText
-
     answerType = answerObject.type ?? answerType
-
     answerData =
       answerObject.data ??
       answerObject.payload ??
       answerObject.rows ??
       answerObject.values
   }
-
-  answerText =
-    answerText ??
-    getPrimitiveText(raw?.report) ??
-    getPrimitiveText(raw?.answer) ??
-    getPrimitiveText(raw?.response) ??
-    getPrimitiveText(raw?.output)
 
   if (!answerData) {
     answerData = raw?.row_data ?? raw?.payload?.row_data ?? nestedResult?.row_data
@@ -2871,7 +2919,9 @@ function normalizeQueryResponse(raw, fallbackRequestId) {
       fallbackRequestId
     ),
     status: normalizeStatus(nestedResult.status ?? raw?.status ?? defaultStatus),
-    answerText,
+    answer: raw?.answer ?? nestedResult.answer ?? null,
+    error,
+    answerText: typeof answerText === 'string' ? answerText : toDisplayText(answerText),
     answerType: answerType || (answerData?.fields ? 'row_lookup' : 'text'),
     answerData,
     executionSteps: Array.isArray(rawSteps)
@@ -3151,10 +3201,18 @@ function StructuredAnswerSection({ answer }) {
 }
 
 function AnalysisAnswer({ msg, isError }) {
-  if (isError) {
+  const errorMessage = toDisplayText(msg?.error?.message || msg?.error)
+  const summary = toDisplayText(msg?.answer?.summary)
+  const explanation = toDisplayText(msg?.answer?.explanation)
+  const legacyText = toDisplayText(msg?.answerText || msg?.report || msg?.result)
+
+  if (msg?.status === 'failed' || isError) {
     return (
-      <div className="analysis-error-state" style={{ padding: '12px', background: '#FEF2F2', borderRadius: '8px', border: '1px solid #FCA5A5' }}>
-        <p style={{ color: 'var(--accent-red, #EF4444)', fontWeight: 600, margin: 0 }}>{msg.error || 'The analysis could not be completed.'}</p>
+      <div className="analysis-error-state" style={{ padding: '12px', background: '#FEF2F2', borderRadius: '8px', border: '1px solid #FCA5A5' }} role="alert">
+        <strong style={{ color: 'var(--accent-red, #EF4444)', display: 'block', marginBottom: '4px' }}>Analysis failed</strong>
+        <p style={{ color: 'var(--accent-red, #EF4444)', margin: 0 }}>
+          {errorMessage || legacyText || 'The analysis could not be completed.'}
+        </p>
         {import.meta.env.DEV && (msg.rawResponse || msg.debugPayload) && (
           <details className="debug-payload-details" style={{ marginTop: '8px', fontSize: '11px' }}>
             <summary style={{ cursor: 'pointer', color: 'var(--text-muted)' }}>Raw API response debug payload</summary>
@@ -3167,6 +3225,14 @@ function AnalysisAnswer({ msg, isError }) {
     )
   }
 
+  if (msg?.status === 'cancelled') {
+    return (
+      <div className="analysis-cancelled" style={{ padding: '12px', background: '#F3F4F6', borderRadius: '8px', border: '1px solid #E5E7EB' }} role="status">
+        <p style={{ margin: 0, color: '#4B5563' }}>{errorMessage || legacyText || 'Analysis stopped.'}</p>
+      </div>
+    )
+  }
+
   const ansObj = msg.answer && typeof msg.answer === 'object' ? msg.answer : null
   if (ansObj && (ansObj.summary || ansObj.title || ansObj.explanation)) {
     return <StructuredAnswerSection answer={ansObj} />
@@ -3175,6 +3241,15 @@ function AnalysisAnswer({ msg, isError }) {
   const rowData = msg.answerData || msg.row_data
   if (rowData && (rowData.fields || rowData.values)) {
     return <RowTableSection rowData={rowData} />
+  }
+
+  if (summary || explanation) {
+    return (
+      <div className="analysis-answer">
+        {summary && <p>{summary}</p>}
+        {explanation && <p>{explanation}</p>}
+      </div>
+    )
   }
 
   if (typeof msg.answerText === 'string' && msg.answerText.trim()) {
@@ -3550,7 +3625,7 @@ function ChatArea({ upload, category, messages, onAsk, onStory, onInvestigate, o
 
 // ─── App ───────────────────────────────────────────────────────────────────────
 
-export default function App() {
+function App() {
   const [upload, setUpload] = useState(null)
   const [datasets, setDatasets] = useState([])
   const [uploading, setUploading] = useState(false)
@@ -4198,3 +4273,43 @@ export default function App() {
     </div>
   )
 }
+
+class AppErrorBoundary extends React.Component {
+  constructor(props) {
+    super(props)
+    this.state = { error: null }
+  }
+
+  static getDerivedStateFromError(error) {
+    return { error }
+  }
+
+  componentDidCatch(error, info) {
+    console.error('Application rendering error', error, info)
+  }
+
+  render() {
+    if (this.state.error) {
+      return (
+        <main className="fatal-error" role="alert" style={{ padding: '32px', textAlign: 'center' }}>
+          <h1>Something went wrong</h1>
+          <p>The interface encountered an unexpected rendering error.</p>
+          <button onClick={() => window.location.reload()} style={{ padding: '8px 16px', marginTop: '16px', cursor: 'pointer' }}>
+            Reload application
+          </button>
+        </main>
+      )
+    }
+
+    return this.props.children
+  }
+}
+
+export default function AppWithBoundary() {
+  return (
+    <AppErrorBoundary>
+      <App />
+    </AppErrorBoundary>
+  )
+}
+export { App, AppErrorBoundary }

@@ -109,12 +109,14 @@ class BudgetedLLMClient:
                             "next_action": None
                         })
                     return MockResponse()
+                afc = types.AutomaticFunctionCallingConfig(disable=True)
                 return self.client.models.generate_content(
                     model=model,
                     contents=contents,
                     config=types.GenerateContentConfig(
                         system_instruction=system_instruction,
                         temperature=temperature,
+                        automatic_function_calling=afc,
                     ),
                 )
 

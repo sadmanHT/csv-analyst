@@ -400,13 +400,23 @@ Requirements:
 """
 
 
+MIN_SYNTHESIS_RETRY_SECONDS = 2.0
+
+
 def synthesize_llm_answer(
     question: str,
     evidence: AnalysisEvidence,
     effective_lens: str = "general",
     request_id: str | None = None,
+    deadline_at: float | None = None,
 ) -> GeneratedAnswer:
     """Generate structured natural-language response strictly grounded in verified facts."""
+    if deadline_at is not None:
+        rem_initial = deadline_at - time.monotonic()
+        if rem_initial <= 0:
+            from backend.core.errors import ExecutionBudgetExceededError
+            raise ExecutionBudgetExceededError("The request deadline expired before answer generation.")
+
     payload = {
         "user_question": question,
         "effective_lens": effective_lens,
@@ -422,13 +432,23 @@ def synthesize_llm_answer(
 
     def _call_model(payload_str: str) -> str:
         from backend.llm.client import llm_client
+        calc_timeout = 10.0
+        if deadline_at is not None:
+            rem = deadline_at - time.monotonic()
+            if rem <= 0:
+                from backend.core.errors import ExecutionBudgetExceededError
+                raise ExecutionBudgetExceededError("The request deadline expired before answer generation.")
+            calc_timeout = min(LLM_CALL_TIMEOUT_SECONDS, max(0.5, rem))
+
         return llm_client.generate_content(
             system_instruction=SYNTHESIS_SYSTEM_PROMPT,
             contents=payload_str,
             temperature=0.1,
-            timeout_seconds=10.0,
+            timeout_seconds=calc_timeout,
             request_id=request_id,
             stage="synthesis",
+            request_start_time=time.monotonic(),
+            total_deadline_s=calc_timeout,
         )
 
     raw_text = ""
@@ -438,6 +458,14 @@ def synthesize_llm_answer(
         if "cancelled" in str(e).lower():
             raise e
         logger.warning("LLM synthesis attempt 1 failed: %s. Retrying with trimmed payload.", e)
+
+        if deadline_at is not None:
+            rem = deadline_at - time.monotonic()
+            if rem < MIN_SYNTHESIS_RETRY_SECONDS:
+                logger.warning("Insufficient time remaining (%.2fs < %.2fs) for LLM synthesis retry.", rem, MIN_SYNTHESIS_RETRY_SECONDS)
+                from backend.core.errors import LLMSynthesisError
+                raise LLMSynthesisError("The calculations completed, but the explanation could not be generated.")
+
         try:
             trimmed_payload = {
                 "user_question": question,

@@ -38,8 +38,60 @@ function normalizeStatus(val) {
   return 'running'
 }
 
-function normalizeQueryResponse(raw, fallbackRequestId) {
+function toDisplayText(value, fallback = '') {
+  if (value == null) return fallback
+
+  if (
+    typeof value === 'string' ||
+    typeof value === 'number' ||
+    typeof value === 'boolean'
+  ) {
+    return String(value)
+  }
+
+  if (Array.isArray(value)) {
+    return value
+      .map((item) => toDisplayText(item))
+      .filter(Boolean)
+      .join('\n')
+  }
+
+  if (typeof value === 'object') {
+    return (
+      toDisplayText(value.message) ||
+      toDisplayText(value.summary) ||
+      toDisplayText(value.text) ||
+      toDisplayText(value.detail) ||
+      toDisplayText(value.code) ||
+      fallback
+    )
+  }
+
+  return fallback
+}
+
+function normalizeApiError(error) {
+  if (!error) return null
+
+  if (typeof error === 'string') {
+    return {
+      code: 'request_failed',
+      message: error,
+    }
+  }
+
+  return {
+    code: toDisplayText(error.code, 'request_failed'),
+    message: toDisplayText(
+      error.message ?? error.detail,
+      'The analysis could not be completed.'
+    ),
+  }
+}
+
+function normalizeQueryResponse(raw = {}, fallbackRequestId) {
   const rawIsObject = raw !== null && typeof raw === 'object'
+  const error = normalizeApiError(raw?.error)
 
   const nestedResult =
     rawIsObject && raw.result !== null && typeof raw.result === 'object'
@@ -63,7 +115,18 @@ function normalizeQueryResponse(raw, fallbackRequestId) {
     getPrimitiveText(raw?.result) ??
     getPrimitiveText(nestedResult?.result)
 
-  let answerText = primitiveResultText
+  let answerText =
+    toDisplayText(answerObject?.summary) ||
+    toDisplayText(answerObject?.explanation) ||
+    toDisplayText(answerObject?.text) ||
+    toDisplayText(answerObject) ||
+    primitiveResultText ||
+    toDisplayText(raw?.report) ||
+    toDisplayText(raw?.answer) ||
+    toDisplayText(raw?.response) ||
+    toDisplayText(raw?.output) ||
+    error?.message ||
+    ''
 
   let answerType =
     nestedResult.answer_type ??
@@ -74,28 +137,13 @@ function normalizeQueryResponse(raw, fallbackRequestId) {
   if (typeof answerObject === 'string') {
     answerText = answerObject.trim() || answerText
   } else if (answerObject && typeof answerObject === 'object') {
-    answerText =
-      getPrimitiveText(answerObject.text) ??
-      getPrimitiveText(answerObject.summary) ??
-      getPrimitiveText(answerObject.content) ??
-      getPrimitiveText(answerObject.message) ??
-      answerText
-
     answerType = answerObject.type ?? answerType
-
     answerData =
       answerObject.data ??
       answerObject.payload ??
       answerObject.rows ??
       answerObject.values
   }
-
-  answerText =
-    answerText ??
-    getPrimitiveText(raw?.report) ??
-    getPrimitiveText(raw?.answer) ??
-    getPrimitiveText(raw?.response) ??
-    getPrimitiveText(raw?.output)
 
   if (!answerData) {
     answerData = raw?.row_data ?? raw?.payload?.row_data ?? nestedResult?.row_data
@@ -125,8 +173,10 @@ function normalizeQueryResponse(raw, fallbackRequestId) {
       raw?.requestId ??
       fallbackRequestId
     ),
-    status: normalizeStatus(nestedResult.status ?? raw?.status ?? 'complete'),
-    answerText,
+    status: normalizeStatus(nestedResult.status ?? raw?.status ?? (error ? 'failed' : 'complete')),
+    answer: raw?.answer ?? nestedResult.answer ?? null,
+    error,
+    answerText: typeof answerText === 'string' ? answerText : toDisplayText(answerText),
     answerType: answerType || (answerData?.fields ? 'row_lookup' : 'text'),
     answerData,
     executionSteps: Array.isArray(rawSteps)
@@ -399,6 +449,25 @@ describe('getStreamStatus and Card State Logic', () => {
     const hasAnswer = false
     const isCompleteWithoutAnswer = status === 'complete' && !hasAnswer
     expect(isCompleteWithoutAnswer).toBe(true)
+  })
+
+  test('does not place error objects into answerText', () => {
+    const raw = {
+      status: 'failed',
+      answer: null,
+      error: {
+        code: 'answer_generation_failed',
+        message: 'Generation failed.',
+      },
+    }
+
+    const normalized = normalizeQueryResponse(raw, 'fallback')
+    expect(normalized.answerText).toBe('Generation failed.')
+    expect(typeof normalized.answerText).toBe('string')
+    expect(normalized.error).toEqual({
+      code: 'answer_generation_failed',
+      message: 'Generation failed.',
+    })
   })
 })
 
