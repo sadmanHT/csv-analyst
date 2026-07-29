@@ -412,7 +412,7 @@ def synthesize_llm_answer(
 ) -> GeneratedAnswer:
     """Generate structured natural-language response strictly grounded in verified facts."""
     if deadline_at is not None:
-        rem_initial = deadline_at - time.monotonic()
+        rem_initial = deadline_at - time.time()
         if rem_initial <= 0:
             from backend.core.errors import ExecutionBudgetExceededError
             raise ExecutionBudgetExceededError("The request deadline expired before answer generation.")
@@ -434,7 +434,7 @@ def synthesize_llm_answer(
         from backend.llm.client import llm_client
         calc_timeout = 10.0
         if deadline_at is not None:
-            rem = deadline_at - time.monotonic()
+            rem = deadline_at - time.time()
             if rem <= 0:
                 from backend.core.errors import ExecutionBudgetExceededError
                 raise ExecutionBudgetExceededError("The request deadline expired before answer generation.")
@@ -447,7 +447,7 @@ def synthesize_llm_answer(
             timeout_seconds=calc_timeout,
             request_id=request_id,
             stage="synthesis",
-            request_start_time=time.monotonic(),
+            request_start_time=time.time(),
             total_deadline_s=calc_timeout,
         )
 
@@ -460,7 +460,7 @@ def synthesize_llm_answer(
         logger.warning("LLM synthesis attempt 1 failed: %s. Retrying with trimmed payload.", e)
 
         if deadline_at is not None:
-            rem = deadline_at - time.monotonic()
+            rem = deadline_at - time.time()
             if rem < MIN_SYNTHESIS_RETRY_SECONDS:
                 logger.warning("Insufficient time remaining (%.2fs < %.2fs) for LLM synthesis retry.", rem, MIN_SYNTHESIS_RETRY_SECONDS)
                 from backend.core.errors import LLMSynthesisError
