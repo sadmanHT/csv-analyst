@@ -17,6 +17,14 @@ class ExecutionBudget(BaseModel):
     allow_code_repair: bool = True
 
 
+ROUTE_BUDGETS: dict[str, ExecutionBudget] = {
+    "fast_path": ExecutionBudget(route="fast_path", max_llm_calls=1, max_execution_time_s=5.0, timeout_s=8.0, allow_chart=False, allow_code_repair=False),
+    "standard": ExecutionBudget(route="standard", max_llm_calls=3, max_execution_time_s=15.0, timeout_s=20.0, allow_chart=True, allow_code_repair=True),
+    "complex": ExecutionBudget(route="complex", max_llm_calls=5, max_execution_time_s=30.0, timeout_s=35.0, allow_chart=True, allow_code_repair=True),
+    "fallback": ExecutionBudget(route="fallback", max_llm_calls=2, max_execution_time_s=10.0, timeout_s=15.0, allow_chart=False, allow_code_repair=False),
+}
+
+
 class QueryRequest(BaseModel):
     session_id: str
     question: str
