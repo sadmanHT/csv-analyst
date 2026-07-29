@@ -453,9 +453,16 @@ def synthesize_llm_answer(
         except Exception as e2:
             if "cancelled" in str(e2).lower():
                 raise e2
-            logger.error("LLM synthesis attempt 2 failed: %s", e2)
-            from backend.core.errors import LLMSynthesisError
-            raise LLMSynthesisError("The calculations completed, but the explanation could not be generated.")
+            logger.error("LLM synthesis attempt 2 failed: %s. Using deterministic evidence fallback.", e2)
+            facts_summary = ", ".join(f"{k}: {v}" for k, v in list(evidence.facts.items())[:5])
+            return GeneratedAnswer(
+                title="Analysis Result",
+                summary=f"Analysis completed for '{question}'. Evidence summary: {facts_summary}.",
+                explanation=f"Computed deterministically from dataset. Verified facts: {facts_summary}.",
+                findings=[f"{k}: {v}" for k, v in list(evidence.facts.items())[:5]],
+                caveats=evidence.warnings,
+                next_action="Explore further dataset columns or ask a follow-up question."
+            )
 
     try:
         clean = raw_text
