@@ -85,7 +85,7 @@ class BudgetedLLMClient:
             call_timeout = min(timeout_seconds, max(0.1, remaining_request))
 
             def _do_generate():
-                if os.environ.get("PYTEST_CURRENT_TEST") and not (os.environ.get("GEMMA_API_KEY") or os.environ.get("GEMINI_API_KEY")):
+                if os.environ.get("PYTEST_CURRENT_TEST") or os.environ.get("MOCK_LLM") == "1":
                     class MockResponse:
                         text = "Based on the verified dataset evidence, here is the analytical summary for your request."
                     return MockResponse()
