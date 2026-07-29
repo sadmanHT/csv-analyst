@@ -4,6 +4,7 @@ Budgeted LLM Client Wrapper with Explicit Deadlines, Request Accounting, Retries
 
 import os
 import time
+import json
 import logging
 import concurrent.futures
 from typing import Any
