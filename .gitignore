@@ -26,3 +26,11 @@ app_start_commands.txt
 
 # Local Codex workspace/skills
 .codex/skills/
+
+# Local Kaggle submission drafts
+submission_claims_audit.md
+kaggle_writeup.md
+kaggle_writeup_plain.txt
+kaggle_submission_checklist.md
+demo_script.md
+architecture_for_writeup.md
