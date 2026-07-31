@@ -24,3 +24,5 @@ Thumbs.db
 backend/data/
 app_start_commands.txt
 
+# Local Codex workspace/skills
+.codex/skills/
