@@ -3,7 +3,8 @@ Pydantic Schemas for Request/Response Models, Data Contracts, and Execution Evid
 """
 
 from typing import Any, Literal
-from pydantic import BaseModel, Field
+import re
+from pydantic import BaseModel, Field, model_validator
 from backend.core.config import APP_BUILD_ID
 
 
@@ -19,9 +20,11 @@ class ExecutionBudget(BaseModel):
 
 ROUTE_BUDGETS: dict[str, ExecutionBudget] = {
     "fast_path": ExecutionBudget(route="fast_path", max_llm_calls=1, max_execution_time_s=5.0, timeout_s=8.0, allow_chart=False, allow_code_repair=False),
+    "dataset_purpose": ExecutionBudget(route="dataset_purpose", max_llm_calls=1, max_execution_time_s=12.0, timeout_s=12.0, allow_chart=False, allow_code_repair=False),
     "standard": ExecutionBudget(route="standard", max_llm_calls=3, max_execution_time_s=15.0, timeout_s=20.0, allow_chart=True, allow_code_repair=True),
     "complex": ExecutionBudget(route="complex", max_llm_calls=5, max_execution_time_s=30.0, timeout_s=35.0, allow_chart=True, allow_code_repair=True),
     "fallback": ExecutionBudget(route="fallback", max_llm_calls=2, max_execution_time_s=10.0, timeout_s=15.0, allow_chart=False, allow_code_repair=False),
+    "direct": ExecutionBudget(route="direct", max_llm_calls=1, max_execution_time_s=15.0, timeout_s=12.0, allow_chart=False, allow_code_repair=False),
 }
 
 
@@ -75,13 +78,107 @@ class AnalysisEvidence(BaseModel):
     generated_code: str | None = None
 
 
-class GeneratedAnswer(BaseModel):
-    title: str | None = None
+class GeneratedFinding(BaseModel):
+    label: str
+    detail: str
+
+
+class DirectAnswer(BaseModel):
     summary: str
-    explanation: str | None = None
-    findings: list[dict[str, Any]] = Field(default_factory=list)
+    next_action: str = ""
+
+    @model_validator(mode="after")
+    def validate_direct_answer(self) -> "DirectAnswer":
+        if not self.summary.strip():
+            raise ValueError("Summary must be non-empty.")
+        if len(self.summary.split()) > 70:
+            raise ValueError("Summary must be 70 words or fewer.")
+        if len(self.next_action.split()) > 25:
+            raise ValueError("Next action must be 25 words or fewer.")
+        html_pattern = re.compile(r"<[^>]+>")
+        if html_pattern.search(self.summary) or html_pattern.search(self.next_action):
+            raise ValueError("HTML is not allowed in generated text.")
+        if "```" in self.summary or "```" in self.next_action:
+            raise ValueError("Markdown fences are not allowed in generated text.")
+        return self
+
+
+class GeneratedAnswer(BaseModel):
+    title: str = ""
+    summary: str
+    explanation: str = ""
+    findings: list[GeneratedFinding] = Field(default_factory=list)
     caveats: list[str] = Field(default_factory=list)
-    next_action: str | None = None
+    next_action: str = ""
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_bounded_fields(cls, data: Any) -> Any:
+        """Apply safe normalization before strict content validation."""
+        if not isinstance(data, dict):
+            return data
+
+        normalized = dict(data)
+        for key in ("title", "summary", "explanation", "next_action"):
+            value = normalized.get(key, "")
+            normalized[key] = re.sub(r"\s+", " ", str(value or "")).strip()
+
+        findings = normalized.get("findings") or []
+        if isinstance(findings, list):
+            normalized["findings"] = findings[:4]
+        else:
+            normalized["findings"] = []
+
+        caveats = normalized.get("caveats") or []
+        if isinstance(caveats, list):
+            normalized["caveats"] = [str(item) for item in caveats[:3]]
+        else:
+            normalized["caveats"] = []
+
+        return normalized
+
+    @model_validator(mode="after")
+    def validate_content_quality(self) -> "GeneratedAnswer":
+        if len(self.title.split()) > 8:
+            raise ValueError("Title must be 8 words or fewer.")
+        if not self.summary.strip():
+            raise ValueError("Summary must be non-empty.")
+        if len(self.summary.split()) > 80:
+            raise ValueError("Summary must be 80 words or fewer.")
+        if len(self.explanation.split()) > 120:
+            raise ValueError("Explanation must be 120 words or fewer.")
+            
+        if len(self.findings) > 4:
+            raise ValueError("Maximum four findings allowed.")
+        for f in self.findings:
+            if len(f.detail.split()) > 30:
+                raise ValueError("Finding detail must be 30 words or fewer.")
+                
+        if len(self.caveats) > 3:
+            raise ValueError("Maximum three caveats allowed.")
+            
+        html_pattern = re.compile(r"<[^>]+>")
+        if html_pattern.search(self.summary) or html_pattern.search(self.explanation):
+            raise ValueError("HTML is not allowed in generated text.")
+            
+        if "```" in self.summary or "```" in self.explanation:
+            raise ValueError("Markdown fences are not allowed in generated text.")
+            
+        def has_repetition(text: str) -> bool:
+            words = text.split()
+            if len(words) < 20: return False
+            seen = set()
+            for i in range(len(words) - 5):
+                phrase = " ".join(words[i:i+5]).lower()
+                if phrase in seen:
+                    return True
+                seen.add(phrase)
+            return False
+            
+        if has_repetition(self.summary) or has_repetition(self.explanation):
+            raise ValueError("Excessive phrase repetition detected.")
+            
+        return self
 
 
 # ── Schema-aware Analytics Plan Models ──────────────────────────────────────
@@ -121,6 +218,15 @@ class AnalysisPlan(BaseModel):
     confidence: float = 0.8
     ambiguity: list[str] = Field(default_factory=list)
     reasoning_summary: str = ""
+
+    @model_validator(mode="before")
+    @classmethod
+    def unwrap_single_element_list(cls, data: Any) -> Any:
+        if isinstance(data, list):
+            if len(data) == 1 and isinstance(data[0], dict):
+                return data[0]
+            raise ValueError("AnalysisPlan must be a single object, not a multi-element list.")
+        return data
 
 
 class ResolvedAnalysisPlan(AnalysisPlan):

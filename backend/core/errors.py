@@ -16,3 +16,9 @@ class LLMSynthesisError(RuntimeError):
 
 class ExecutionBudgetExceededError(RuntimeError):
     """Raised when request LLM call quota or timeout budget is exceeded."""
+
+class LLMProviderTimeoutError(RuntimeError):
+    """Raised when the LLM provider times out."""
+
+class LLMProviderUnavailableError(RuntimeError):
+    """Raised when the LLM provider is temporarily unavailable (e.g. DNS or network failure)."""

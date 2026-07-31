@@ -16,6 +16,9 @@ ALLOWED_ORIGINS = [o.strip() for o in _raw_origins.split(",")] if _raw_origins !
 
 # LLM Models
 GEMMA_MODEL = os.environ.get("GEMMA_MODEL", "gemma-4-31b-it")
+PLANNER_MODEL = os.environ.get("PLANNER_MODEL", "gemma-4-26b-a4b-it")
+SYNTHESIS_MODEL = os.environ.get("SYNTHESIS_MODEL", "gemma-4-26b-a4b-it")
+DEEP_ANALYSIS_MODEL = os.environ.get("DEEP_ANALYSIS_MODEL", "gemma-4-31b-it")
 GEMINI_MODEL = GEMMA_MODEL
 
 # Production Limits & Safety Bounds
@@ -31,6 +34,9 @@ MAX_JOBS = int(os.environ.get("MAX_JOBS", 200))
 MAX_SANDBOX_SECONDS = int(os.environ.get("MAX_SANDBOX_SECONDS", 15))
 MAX_RESULT_CHARS = int(os.environ.get("MAX_RESULT_CHARS", 15_000))
 LLM_CALL_TIMEOUT_SECONDS = float(os.environ.get("LLM_CALL_TIMEOUT_SECONDS", 15.0))
+DIRECT_DEADLINE_SECONDS = 15.0
+DIRECT_MAX_LLM_CALLS = 1
+DIRECT_SYNTHESIS_TIMEOUT_SECONDS = 12.0
 
 # RAG Configuration
 EMBED_DIM = 768

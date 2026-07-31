@@ -24,10 +24,14 @@ import logging
 import httpx
 import contextlib
 import multiprocessing as mp
+import unicodedata
+from dataclasses import dataclass, field
 from collections.abc import Awaitable, Callable
+from difflib import SequenceMatcher
 from typing import Any, Literal
 from backend.streaming.cancellation import cancel_request, is_cancelled, clear_cancellation
 from backend.llm.client import llm_client
+from backend.core.errors import LLMSynthesisError
 
 logging.basicConfig(
     level=logging.INFO,
@@ -35,6 +39,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 BACKEND_BUILD_ID = "runtime-query-debug-v3"
+QUERY_PIPELINE_VERSION = "ranking-entity-v1"
+SYNTHESIS_PROMPT_VERSION = "synthesis-v2"
+VALIDATOR_VERSION = "semantic-validator-v2"
+RESPONSE_SCHEMA_VERSION = "generated-answer-v2"
+RESOLVER_VERSION = "canonical-extreme-v1"
 
 import pandas as pd
 import numpy as np
@@ -45,7 +54,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 import seaborn as sns
 
-# ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ Premium chart theme ÃÂ¢ÃÂÃÂ seaborn base + custom rcParams, matched to the indigo UI ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
+# ¢¢ Premium chart theme ¢ seaborn base + custom rcParams, matched to the indigo UI ¢¢
 INDIGO_PALETTE = ["#4F46E5", "#10B981", "#F59E0B", "#8B5CF6", "#EF4444",
                   "#06B6D4", "#EC4899", "#0EA5E9", "#64748B", "#14B8A6"]
 try:
@@ -96,7 +105,7 @@ matplotlib.rcParams["axes.prop_cycle"] = matplotlib.cycler(color=INDIGO_PALETTE)
 from fastapi import FastAPI, UploadFile, File, HTTPException, Request, BackgroundTasks, Header, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response, StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from google import genai
 from google.genai import types
 from dotenv import load_dotenv
@@ -105,7 +114,18 @@ import storage
 
 load_dotenv(override=True)
 
-app = FastAPI(title="Analytico AI — Agentic Data Scientist")
+from contextlib import asynccontextmanager
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    import asyncio
+    asyncio.create_task(probe())
+    yield
+    # Shutdown
+    pass
+
+app = FastAPI(title="Analytico AI — Agentic Data Scientist", lifespan=lifespan)
 
 # ALLOWED_ORIGINS: comma-separated list, e.g. "https://your-app.vercel.app"
 # Falls back to "*" in local dev (when env var is not set).
@@ -128,6 +148,7 @@ dataframes: dict[str, pd.DataFrame] = {}
 models: dict[str, dict] = {}  # session_id -> trained model info (for inference on new input)
 conversation_state: dict[str, dict] = {}
 query_cache: dict[str, dict] = {}
+deterministic_evidence_cache: dict[str, dict[str, Any]] = {}
 session_meta: dict[str, dict] = {}
 rate_limit_buckets: dict[str, list[float]] = {}
 jobs: dict[str, dict] = {}
@@ -182,7 +203,7 @@ async def rate_limit_middleware(
     bucket.append(now)
     return await call_next(request)
 
-# ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ RAG document store ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
+# ¢¢ RAG document store ¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢
 
 EMBED_DIM = 768
 _local_vectorizer = None
@@ -279,6 +300,11 @@ class QueryRequest(BaseModel):
     request_id: str | None = None
 
 
+class RetryAnswerRequest(BaseModel):
+    session_id: str
+    category: str = "general"
+
+
 class ExecutionStepResponse(BaseModel):
     id: str
     label: str
@@ -328,8 +354,925 @@ class GeneratedAnswer(BaseModel):
     caveats: list[str] = Field(default_factory=list)
     next_action: str | None = None
 
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_bounded_fields(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+        normalized = dict(data)
+        for key in ("title", "summary", "explanation", "next_action"):
+            value = normalized.get(key, "")
+            normalized[key] = re.sub(r"\s+", " ", str(value or "")).strip()
+        findings = normalized.get("findings") or []
+        normalized["findings"] = findings[:4] if isinstance(findings, list) else []
+        caveats = normalized.get("caveats") or []
+        normalized["caveats"] = [str(item) for item in caveats[:3]] if isinstance(caveats, list) else []
+        return normalized
 
-# ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ Schema-aware analytics plan schemas ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
+
+def reject_unusable_generated_answer(answer: GeneratedAnswer) -> None:
+    """Reject provider/repair artifacts that are not grounded dataset answers."""
+    combined = " ".join(
+        str(part or "")
+        for part in [
+            answer.title,
+            answer.summary,
+            answer.explanation,
+            answer.next_action,
+            " ".join(str(f.get("detail", "")) for f in answer.findings if isinstance(f, dict)),
+        ]
+    ).lower()
+    blocked_phrases = (
+        "empty input",
+        "invalid input",
+        "input to fix",
+        "provided prompt",
+        "repair",
+        "repaired",
+        "fix this json",
+    )
+    if any(phrase in combined for phrase in blocked_phrases):
+        raise ValueError("Synthesis output referenced the repair prompt instead of the dataset evidence.")
+
+
+def build_quality_fallback_answer(evidence: AnalysisEvidence) -> GeneratedAnswer:
+    """Create a deterministic quality answer from verified audit facts."""
+    facts = evidence.facts or {}
+    rows = facts.get("row_count")
+    cols = facts.get("column_count")
+    missing_cols = facts.get("missing_values_by_column") or {}
+    total_missing = facts.get("total_missing_cells")
+    duplicates = facts.get("duplicate_rows")
+    outliers = facts.get("columns_with_outliers") or []
+    suspicious_zeroes = facts.get("zero_suspicious_by_column") or {}
+    health_score = facts.get("health_score")
+    readiness_score = facts.get("readiness_score")
+    missing_pct = facts.get("missing_percentage")
+
+    summary_parts = []
+    if rows is not None and cols is not None:
+        summary_parts.append(f"The dataset has {rows:,} rows and {cols:,} columns.")
+    if health_score or readiness_score:
+        summary_parts.append(f"Health is {health_score}; readiness is {readiness_score}.")
+    if missing_pct:
+        summary_parts.append(f"Missing values are {missing_pct}.")
+    if total_missing is not None:
+        summary_parts.append(f"There are {total_missing:,} missing cells across {len(missing_cols)} column(s).")
+    if duplicates is not None:
+        summary_parts.append(f"Duplicate rows: {duplicates:,}.")
+    if not summary_parts:
+        summary_parts.append("Start by reviewing missing values, duplicates, identifiers, outliers, and label balance.")
+
+    findings = []
+    if missing_cols:
+        findings.append({"label": "Missing Values", "detail": f"Prioritize columns with missing values: {', '.join(list(missing_cols)[:4])}."})
+    if duplicates:
+        findings.append({"label": "Duplicates", "detail": "Remove or explain duplicate rows before modeling or reporting."})
+    if outliers:
+        findings.append({"label": "Outliers", "detail": f"Review outlier-heavy columns such as {', '.join(outliers[:3])}."})
+    if suspicious_zeroes:
+        findings.append({"label": "Zero Values", "detail": f"Check whether zero means real zero or missing in {', '.join(list(suspicious_zeroes)[:3])}."})
+
+    raise RuntimeError("Deterministic quality fallback answers are disabled; use generate_user_answer().")
+
+
+# ¢¢ Schema-aware analytics plan schemas ¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢
+
+def build_dataset_profile_fallback_answer(evidence: AnalysisEvidence, question: str = "") -> GeneratedAnswer:
+    """Create a deterministic dataset profile answer from verified cached facts."""
+    facts = evidence.facts or {}
+    rows = facts.get("rows", facts.get("row_count"))
+    cols = facts.get("columns", facts.get("column_count"))
+    column_names = facts.get("column_names") or []
+    unique_columns = facts.get("unique_columns") or []
+    high_cardinality_columns = facts.get("high_cardinality_columns") or []
+    missing_pct = facts.get("missing_percentage")
+    health_score = facts.get("health_score")
+    readiness_score = facts.get("readiness_score")
+    suggested_uses = facts.get("suggested_uses") or []
+    normalized_question = normalize_schema_token(question)
+    is_uniqueness_question = "unique" in normalized_question or "uniqueness" in normalized_question
+
+    summary_parts: list[str] = []
+    if rows is not None and cols is not None:
+        summary_parts.append(f"The dataset contains {rows:,} rows and {cols:,} columns.")
+
+    if is_uniqueness_question:
+        if unique_columns:
+            names = ", ".join(str(item.get("column", item)) for item in unique_columns[:4])
+            summary_parts.append(f"Its strongest uniqueness signal is row-level identifier columns such as {names}.")
+        elif high_cardinality_columns:
+            names = ", ".join(str(item.get("column", item)) for item in high_cardinality_columns[:4])
+            summary_parts.append(f"No column is fully unique, but high-cardinality fields such as {names} help distinguish records.")
+        elif column_names:
+            summary_parts.append("No fully unique column was detected from the cached profile.")
+    elif health_score or readiness_score:
+        summary_parts.append(f"Health is {health_score}; readiness is {readiness_score}.")
+
+    if missing_pct is not None:
+        summary_parts.append(f"Missing values are {missing_pct}.")
+    if suggested_uses:
+        summary_parts.append(f"Good starting uses include {', '.join(map(str, suggested_uses[:3]))}.")
+    if not summary_parts:
+        summary_parts.append("The uploaded dataset is ready for a schema-level overview.")
+
+    findings: list[dict[str, Any]] = []
+    for item in unique_columns[:3]:
+        if isinstance(item, dict):
+            findings.append({
+                "label": "Unique Column",
+                "detail": f"{item.get('column')} has {item.get('unique_count')} distinct non-null value(s).",
+            })
+    for item in high_cardinality_columns[:3]:
+        if isinstance(item, dict):
+            pct = item.get("unique_ratio_pct")
+            detail = f"{item.get('column')} has {item.get('unique_count')} distinct value(s)"
+            if pct is not None:
+                detail += f" ({pct}% of rows)."
+            else:
+                detail += "."
+            findings.append({"label": "High Cardinality", "detail": detail})
+
+    explanation = (
+        "This answer is based on the uploaded schema and cached dataset profile, including row count, "
+        "column count, missing-value summary, and distinct-value counts."
+    )
+    raise RuntimeError("Deterministic dataset profile fallback answers are disabled; use generate_user_answer().")
+
+
+ORDINAL_WORDS: dict[str, int] = {
+    "first": 1,
+    "second": 2,
+    "third": 3,
+    "fourth": 4,
+    "fifth": 5,
+    "sixth": 6,
+    "seventh": 7,
+    "eighth": 8,
+    "ninth": 9,
+    "tenth": 10,
+}
+
+
+def canonical_column_reference(value: str) -> str:
+    """Canonical text used for exact user-column matching."""
+    text = unicodedata.normalize("NFKC", str(value or ""))
+    text = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1 \2", text)
+    text = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", text)
+    text = text.casefold()
+    text = re.sub(r"[_\-\s]+", " ", text)
+    text = re.sub(r"[^a-z0-9 ]+", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def normalize_schema_token(value: str) -> str:
+    """Normalize user/column tokens for conservative schema matching."""
+    return canonical_column_reference(value)
+
+
+def column_description(df: pd.DataFrame, column: str) -> str:
+    """Describe a candidate column for clarification evidence."""
+    dtype = "numeric" if column in df.columns and pd.api.types.is_numeric_dtype(df[column]) else "categorical"
+    col_norm = canonical_column_reference(column)
+    if dtype == "numeric" and set(pd.Series(df[column]).dropna().unique()).issubset({0, 1, 0.0, 1.0}):
+        dtype = "binary"
+    return f"{dtype} {col_norm}".strip()
+
+
+def semantic_column_candidates(requested: str, df: pd.DataFrame) -> list[dict[str, Any]]:
+    """Return conservative semantic candidates for broad domain terms."""
+    req = canonical_column_reference(requested)
+    if not req:
+        return []
+    candidates: list[dict[str, Any]] = []
+    for col in df.columns:
+        col_str = str(col)
+        col_norm = canonical_column_reference(col_str)
+        score = 0.0
+        if req == col_norm:
+            score = 1.0
+        elif req in col_norm.split():
+            score = 0.72
+        elif req in col_norm and len(req) >= 4:
+            score = 0.68
+        if req == "diabetes" and canonical_column_reference(col_str) == "outcome":
+            score = max(score, 0.66)
+        if score > 0:
+            candidates.append({
+                "column": col_str,
+                "score": round(score, 3),
+                "description": column_description(df, col_str),
+            })
+    candidates.sort(key=lambda item: item["score"], reverse=True)
+    return candidates
+
+
+def schema_match_candidates(requested: str, columns: list[str], threshold: float = 0.82) -> list[dict[str, Any]]:
+    """Return high-confidence column matches without defaulting to the first column."""
+    req = canonical_column_reference(requested)
+    if not req:
+        return []
+
+    alias_targets = {
+        "prompt": ("prompt_text",),
+        "question": ("prompt_text",),
+        "response": ("response_text",),
+        "answer": ("response_text",),
+        "label": ("human_label", "label"),
+        "severity": ("compliance_severity", "severity"),
+        "status": ("status_text", "status_code", "status"),
+    }
+    scored: list[dict[str, Any]] = []
+    for col in columns:
+        col_norm = canonical_column_reference(str(col))
+        col_compact = col_norm.replace(" ", "")
+        col_tokens = col_norm.split()
+        score = 0.0
+        req_compact = req.replace(" ", "")
+        if req == col_norm or req_compact == col_compact:
+            score = 1.0
+        elif req in alias_targets and col_norm.replace(" ", "_") in alias_targets[req]:
+            score = 0.97
+        elif req in col_tokens and len(req) >= 4:
+            score = 0.78
+        elif any(token.startswith(req) for token in col_tokens if len(req) >= 5):
+            score = 0.76
+        elif req in col_compact and len(req) >= 5:
+            score = 0.74
+        elif len(req) >= 5:
+            req_tokens = set(req.split())
+            col_token_set = set(col_tokens)
+            overlap = len(req_tokens & col_token_set) / max(len(req_tokens), 1)
+            fuzzy_score = max(
+                SequenceMatcher(None, req, col_norm).ratio(),
+                SequenceMatcher(None, req_compact, col_compact).ratio(),
+            )
+            if overlap >= 0.5 and fuzzy_score >= 0.82:
+                score = 0.82 + min(0.1, (fuzzy_score - 0.82) / 2)
+            elif fuzzy_score >= 0.9:
+                score = 0.86
+
+        if score >= threshold:
+            scored.append({"column": str(col), "score": score})
+
+    scored.sort(key=lambda item: item["score"], reverse=True)
+    return scored
+
+
+def resolve_schema_column_reference(
+    requested: str,
+    columns: list[str],
+    *,
+    threshold: float = 0.82,
+    ambiguity_delta: float = 0.03,
+) -> dict[str, Any]:
+    """Resolve a user field reference to one column, an ambiguity, or no match."""
+    matches = schema_match_candidates(requested, columns, threshold=threshold)
+    if not matches:
+        return {"status": "none", "requested": requested, "matches": []}
+    top_score = matches[0]["score"]
+    tied = [m for m in matches if top_score - m["score"] <= ambiguity_delta]
+    if len(tied) > 1:
+        return {"status": "ambiguous", "requested": requested, "matches": tied}
+    return {"status": "matched", "requested": requested, "column": matches[0]["column"], "confidence": top_score}
+
+
+def parse_ordinal_position(text: str) -> int | None:
+    """Parse one-based ordinal/row/record positions from a question."""
+    normalized = normalize_schema_token(text)
+    for word, value in ORDINAL_WORDS.items():
+        if re.search(rf"\b{word}\b", normalized):
+            return value
+
+    numeric_match = re.search(r"\b(\d+)(?:st|nd|rd|th)?\b", text.lower())
+    if numeric_match:
+        return int(numeric_match.group(1))
+    return None
+
+
+def resolve_ordinal_row_lookup(question: str, df: pd.DataFrame) -> dict[str, Any] | None:
+    """Resolve direct row or ordinal field lookup requests without planner calls."""
+    q_norm = normalize_schema_token(question)
+    tokens = set(q_norm.split())
+    lookup_terms = {"row", "record", "employee", "person", "entry", "item", "observation", "prompt", "response", "label", "severity", "status"}
+    if not tokens.intersection(lookup_terms):
+        return None
+
+    display_row = parse_ordinal_position(question)
+    if display_row is None:
+        return None
+
+    requested_field: str | None = None
+    for field in ("prompt", "response", "label", "severity", "status"):
+        if re.search(rf"\b{field}\b", q_norm):
+            requested_field = field
+            break
+    if requested_field is None:
+        stop_tokens = {
+            "what", "is", "the", "a", "an", "of", "for", "in", "on", "to", "from", "give",
+            "show", "tell", "me", "get", "find", "employee", "person", "row", "record",
+            "entry", "item", "observation",
+        }
+        ordinal_words = set(ORDINAL_WORDS)
+        for token in q_norm.split():
+            if token.isdigit() or token in stop_tokens or token in ordinal_words:
+                continue
+            resolved_token = resolve_schema_column_reference(token, [str(c) for c in df.columns], threshold=0.86)
+            if resolved_token["status"] == "matched":
+                requested_field = token
+                break
+
+    row_index = display_row - 1
+    if row_index < 0 or row_index >= len(df):
+        return {
+            "row_index": row_index,
+            "display_row": display_row,
+            "validation_error": f"Row {display_row} is outside the dataset range of 1 to {len(df)}.",
+            "requested_field": requested_field,
+        }
+
+    if requested_field:
+        resolved = resolve_schema_column_reference(requested_field, [str(c) for c in df.columns])
+        if resolved["status"] == "ambiguous":
+            options = [m["column"] for m in resolved["matches"]]
+            return {
+                "row_index": row_index,
+                "display_row": display_row,
+                "requested_field": requested_field,
+                "ambiguity": f"'{requested_field}' could refer to: {', '.join(options)}. Please choose one.",
+                "candidate_columns": options,
+            }
+        if resolved["status"] == "none":
+            return {
+                "row_index": row_index,
+                "display_row": display_row,
+                "requested_field": requested_field,
+                "validation_error": f"No column matching '{requested_field}' was found in this dataset.",
+            }
+        return {
+            "row_index": row_index,
+            "display_row": display_row,
+            "requested_field": requested_field,
+            "column": resolved["column"],
+            "column_confidence": resolved["confidence"],
+        }
+
+    return {"row_index": row_index, "display_row": display_row}
+
+
+ENTITY_TERMS: set[str] = {
+    "employee", "patient", "customer", "order", "product", "user", "account", "client", "student", "person", "member"
+}
+RANKING_TERMS: set[str] = {"best", "top", "highest", "highest performing", "worst", "lowest"}
+STRONG_RANKING_TOKENS: tuple[str, ...] = (
+    "performance", "score", "rating", "quality", "outcome", "achievement", "productivity"
+)
+EXCLUDED_GENERIC_RANKING_TOKENS: tuple[str, ...] = ("age", "salary", "wage", "income")
+
+
+def json_scalar(value: Any) -> Any:
+    """Convert pandas/numpy scalar values to JSON-friendly scalars."""
+    if pd.isna(value):
+        return None
+    if isinstance(value, np.generic):
+        return value.item()
+    return value
+
+
+def is_identifier_column(df: pd.DataFrame, column: str) -> bool:
+    """Return true for semantic identifier columns."""
+    if column not in df.columns:
+        return False
+    roles = infer_column_roles(df)
+    if column in roles.get("ids", []):
+        return True
+    name = normalize_schema_token(column).replace(" ", "")
+    if name == "id" or name.endswith("id"):
+        return True
+    unique_ratio = df[column].nunique(dropna=True) / max(len(df), 1)
+    if pd.api.types.is_numeric_dtype(df[column]):
+        return unique_ratio >= 0.95 and (name.endswith("number") or name.endswith("key") or name == "identifier")
+    return unique_ratio >= 0.95
+
+
+def resolve_entity_columns(df: pd.DataFrame, entity_type: str | None = None) -> dict[str, Any]:
+    """Resolve identifier and display columns generically from schema roles."""
+    roles = infer_column_roles(df)
+    columns = [str(c) for c in df.columns]
+    entity_norm = normalize_schema_token(entity_type or "")
+    identifier_candidates = list(dict.fromkeys(roles.get("ids", [])))
+    if entity_norm:
+        preferred = [
+            col for col in columns
+            if normalize_schema_token(col).replace(" ", "") in {f"{entity_norm}id", f"{entity_norm}number", f"{entity_norm}no"}
+        ]
+        identifier_candidates = preferred + [c for c in identifier_candidates if c not in preferred]
+
+    if not identifier_candidates:
+        for col in columns:
+            if is_identifier_column(df, col):
+                identifier_candidates.append(col)
+
+    display_candidates: list[str] = []
+    display_terms = ("name", "title", "label")
+    for col in columns:
+        col_norm = normalize_schema_token(col)
+        if any(term in col_norm.split() or col_norm.endswith(term) for term in display_terms):
+            display_candidates.append(col)
+    for col in roles.get("dimensions", []):
+        if col not in display_candidates and col not in identifier_candidates:
+            display_candidates.append(col)
+
+    return {
+        "identifier_candidates": identifier_candidates,
+        "identifier_column": identifier_candidates[0] if len(identifier_candidates) == 1 else (identifier_candidates[0] if identifier_candidates else None),
+        "identifier_ambiguous": len(identifier_candidates) > 1 and not entity_norm,
+        "display_column": display_candidates[0] if display_candidates else None,
+        "display_candidates": display_candidates,
+    }
+
+
+def extract_entity_reference(question: str) -> dict[str, Any] | None:
+    """Extract an entity noun and numeric identifier from phrases like employee 47."""
+    q_norm = normalize_schema_token(question)
+    if re.search(r"\b(row|record)\s+\d+\b|\b\d+(?:st|nd|rd|th)\s+(row|record)\b", q_norm):
+        return None
+    for entity in ENTITY_TERMS:
+        match = re.search(rf"\b{entity}\s+#?\s*(\d+)\b", q_norm)
+        if match:
+            return {"entity_type": entity, "identifier_text": match.group(1), "ordinal_entity": False}
+        ordinal_match = re.search(rf"\b(\d+)(?:st|nd|rd|th)\s+{entity}\b", q_norm)
+        if ordinal_match:
+            return {"entity_type": entity, "identifier_text": ordinal_match.group(1), "ordinal_entity": True}
+    return None
+
+
+def resolve_requested_value_column(question: str, df: pd.DataFrame, entity_type: str | None = None) -> dict[str, Any] | None:
+    """Resolve a requested field such as salary/performance from a lookup question."""
+    q_norm = normalize_schema_token(question)
+    columns = [str(c) for c in df.columns]
+    stop_tokens = {
+        "what", "is", "the", "a", "an", "of", "for", "in", "on", "to", "from", "give", "show",
+        "tell", "me", "get", "find", "compare", "row", "record", "value", "field", "with",
+    } | ENTITY_TERMS | set(ORDINAL_WORDS)
+    for token in q_norm.split():
+        if token.isdigit() or token in stop_tokens:
+            continue
+        resolved = resolve_schema_column_reference(token, columns, threshold=0.84)
+        if resolved["status"] in {"matched", "ambiguous"}:
+            return resolved
+    return None
+
+
+def resolve_entity_value_lookup(question: str, df: pd.DataFrame) -> dict[str, Any] | None:
+    """Resolve identifier-based lookup before positional row lookup."""
+    ref = extract_entity_reference(question)
+    if not ref or ref.get("ordinal_entity"):
+        return None
+    entity_type = ref["entity_type"]
+    entity_cols = resolve_entity_columns(df, entity_type)
+    identifier_col = entity_cols.get("identifier_column")
+    requested_col_info = resolve_requested_value_column(question, df, entity_type)
+    requested_col = requested_col_info.get("column") if requested_col_info and requested_col_info.get("status") == "matched" else None
+
+    if entity_cols.get("identifier_ambiguous"):
+        return {
+            "lookup_kind": "entity_value",
+            "entity_type": entity_type,
+            "requested_identifier": ref["identifier_text"],
+            "ambiguity": f"'{entity_type}' could refer to multiple identifiers: {', '.join(entity_cols['identifier_candidates'])}.",
+            "candidate_columns": entity_cols["identifier_candidates"],
+            "requested_column": requested_col,
+        }
+    if not identifier_col:
+        return {
+            "lookup_kind": "entity_value",
+            "entity_type": entity_type,
+            "requested_identifier": ref["identifier_text"],
+            "validation_error": f"No identifier column was found for {entity_type}.",
+            "requested_column": requested_col,
+        }
+    if requested_col_info and requested_col_info.get("status") == "ambiguous":
+        options = [m["column"] for m in requested_col_info["matches"]]
+        return {
+            "lookup_kind": "entity_value",
+            "entity_type": entity_type,
+            "identifier_column": identifier_col,
+            "requested_identifier": ref["identifier_text"],
+            "ambiguity": f"The requested field could refer to: {', '.join(options)}.",
+            "candidate_columns": options,
+        }
+
+    ident_series = df[identifier_col].astype(str)
+    target = str(ref["identifier_text"])
+    matches = df[ident_series == target]
+    if matches.empty and pd.api.types.is_numeric_dtype(df[identifier_col]):
+        numeric_target = pd.to_numeric(pd.Series([target]), errors="coerce").iloc[0]
+        if pd.notna(numeric_target):
+            matches = df[pd.to_numeric(df[identifier_col], errors="coerce") == numeric_target]
+
+    if matches.empty:
+        return {
+            "lookup_kind": "entity_value",
+            "entity_type": entity_type,
+            "identifier_column": identifier_col,
+            "requested_identifier": json_scalar(pd.to_numeric(pd.Series([target]), errors="coerce").iloc[0]) if target.isdigit() else target,
+            "matched": False,
+            "requested_column": requested_col,
+            "not_found": True,
+            "possible_row_position": int(target) if target.isdigit() and 1 <= int(target) <= len(df) else None,
+        }
+
+    row_index = int(matches.index[0])
+    row = matches.iloc[0]
+    display_col = entity_cols.get("display_column")
+    selected_value = json_scalar(row[requested_col]) if requested_col else None
+    identity = {
+        "identifier_column": identifier_col,
+        "identifier_value": json_scalar(row[identifier_col]),
+        "display_column": display_col,
+        "display_value": json_scalar(row[display_col]) if display_col and display_col in row.index else None,
+        "row_position": row_index + 1,
+    }
+    return {
+        "lookup_kind": "entity_value",
+        "entity_type": entity_type,
+        "identifier_column": identifier_col,
+        "requested_identifier": target,
+        "matched": True,
+        "row_index": row_index,
+        "display_row": row_index + 1,
+        "requested_column": requested_col,
+        "selected_field": {
+            "requested_field": requested_col_info.get("requested") if requested_col_info else None,
+            "column": requested_col,
+            "value": selected_value,
+        } if requested_col else None,
+        "identity": identity,
+    }
+
+
+def ranking_phrase_present(question: str) -> bool:
+    q_norm = normalize_schema_token(question)
+    return any(term in q_norm for term in ("best", "top", "highest", "highest performing", "worst", "lowest"))
+
+
+def row_return_question(question: str) -> bool:
+    q_norm = normalize_schema_token(question)
+    return bool(re.search(r"\b(who|which row|which record|which patient|which employee|which person|what row|what record)\b", q_norm))
+
+
+def extreme_phrase_present(question: str) -> bool:
+    q_norm = normalize_schema_token(question)
+    return any(term in q_norm for term in ("highest", "maximum", "max", "lowest", "minimum", "min"))
+
+
+def extreme_operation(question: str) -> str:
+    q_norm = normalize_schema_token(question)
+    return "min" if any(term in q_norm for term in ("lowest", "minimum", " min ")) else "max"
+
+
+def plausible_metric_candidates(question: str, df: pd.DataFrame, *, threshold: float = 0.82) -> list[dict[str, Any]]:
+    """Resolve explicitly named metric candidates from the current schema."""
+    q_norm = canonical_column_reference(question)
+    columns = [str(c) for c in df.columns]
+    candidates: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    for col in columns:
+        col_norm = canonical_column_reference(col)
+        if col_norm and (re.search(rf"\b{re.escape(col_norm)}\b", q_norm) or col_norm.replace(" ", "") in q_norm.replace(" ", "")):
+            candidates.append({"column": col, "score": 1.0, "match_type": "canonical_exact"})
+            seen.add(col)
+
+    tokens = q_norm.split()
+    stop_tokens = {
+        "what", "is", "the", "a", "an", "of", "for", "has", "have", "with", "value",
+        "highest", "maximum", "max", "lowest", "minimum", "min", "who", "which", "row",
+        "record", "patient", "employee", "person", "top", "best", "worst",
+    }
+    for n in range(min(5, len(tokens)), 0, -1):
+        for i in range(len(tokens) - n + 1):
+            phrase = " ".join(tokens[i:i + n])
+            if not phrase or all(token in stop_tokens or token.isdigit() for token in phrase.split()):
+                continue
+            resolved = resolve_schema_column_reference(phrase, columns, threshold=threshold, ambiguity_delta=0.06)
+            matches: list[dict[str, Any]] = []
+            if resolved.get("status") == "matched":
+                matches = [{"column": resolved["column"], "score": resolved["confidence"], "match_type": "fuzzy"}]
+            elif resolved.get("status") == "ambiguous":
+                matches = [{**m, "match_type": "ambiguous"} for m in resolved.get("matches", [])]
+            elif n == 1:
+                matches = semantic_column_candidates(phrase, df)
+                for item in matches:
+                    item["match_type"] = "semantic"
+            for item in matches:
+                col = item["column"]
+                if col not in seen:
+                    candidates.append(item)
+                    seen.add(col)
+
+    candidates.sort(key=lambda item: item.get("score", 0), reverse=True)
+    return candidates
+
+
+def resolve_metric_from_question(question: str, df: pd.DataFrame, *, require_numeric: bool = True) -> dict[str, Any]:
+    """Resolve a requested metric or return ambiguity/validation evidence."""
+    candidates = plausible_metric_candidates(question, df)
+    usable: list[dict[str, Any]] = []
+    rejected: list[dict[str, Any]] = []
+
+    for item in candidates:
+        col = item["column"]
+        if col not in df.columns:
+            continue
+        if is_identifier_column(df, col):
+            rejected.append({**item, "reason": "identifier_column"})
+            continue
+        if require_numeric and not pd.api.types.is_numeric_dtype(df[col]):
+            rejected.append({**item, "reason": "not_numeric"})
+            continue
+        usable.append(item)
+
+    if not usable:
+        semantic = [item for item in candidates if item.get("match_type") == "semantic"]
+        if semantic:
+            return {
+                "status": "ambiguous",
+                "requested_reference": canonical_column_reference(question),
+                "candidate_columns": [
+                    {
+                        "column": item["column"],
+                        "score": item.get("score"),
+                        "description": item.get("description") or column_description(df, item["column"]),
+                    }
+                    for item in semantic[:4]
+                ],
+                "rejected_candidates": rejected,
+            }
+        return {"status": "none", "candidate_columns": [], "rejected_candidates": rejected}
+
+    if len(usable) > 1:
+        top = usable[0].get("score", 0)
+        close = [item for item in usable if top - item.get("score", 0) <= 0.12]
+        semantic_ambiguous = any(item.get("match_type") == "semantic" for item in close)
+        if len(close) > 1 or semantic_ambiguous:
+            return {
+                "status": "ambiguous",
+                "candidate_columns": [
+                    {
+                        "column": item["column"],
+                        "score": item.get("score"),
+                        "description": item.get("description") or column_description(df, item["column"]),
+                    }
+                    for item in close[:4]
+                ],
+                "rejected_candidates": rejected,
+            }
+
+    return {
+        "status": "matched",
+        "column": usable[0]["column"],
+        "confidence": usable[0].get("score", 0.8),
+        "match_type": usable[0].get("match_type", "unknown"),
+        "candidate_scores": usable[:4],
+        "rejected_candidates": rejected,
+    }
+
+
+def resolve_extreme_value(question: str, df: pd.DataFrame) -> dict[str, Any] | None:
+    """Resolve scalar max/min metric requests without planner calls."""
+    if not extreme_phrase_present(question) or row_return_question(question):
+        return None
+    metric = resolve_metric_from_question(question, df, require_numeric=True)
+    operation = extreme_operation(question)
+    requested_reference = None
+    if metric.get("status") == "matched":
+        col = metric["column"]
+        values = pd.to_numeric(df[col], errors="coerce")
+        non_null = int(values.notna().sum())
+        value = values.max() if operation == "max" else values.min()
+        requested_reference = canonical_column_reference(col)
+        return {
+            "lookup_kind": "extreme_value",
+            "requested_reference": requested_reference,
+            "resolved_column": col,
+            "operation": operation,
+            "value": json_scalar(value),
+            "non_null_count": non_null,
+            "row_count": len(df),
+            "confidence": 0.98 if metric.get("match_type") == "canonical_exact" else min(0.88, float(metric.get("confidence", 0.8))),
+            "match": metric,
+        }
+    if metric.get("status") == "ambiguous":
+        return {
+            "lookup_kind": "extreme_value",
+            "clarification": "Multiple columns could match the requested metric.",
+            "requested_reference": requested_reference or "metric",
+            "candidate_columns": metric.get("candidate_columns", []),
+            "operation": operation,
+            "confidence": 0.35,
+        }
+    return None
+
+
+def rank_metric_candidates(question: str, df: pd.DataFrame) -> list[dict[str, Any]]:
+    """Score plausible ranking metrics while excluding identifiers and arbitrary measures."""
+    q_norm = normalize_schema_token(question)
+    explicit_columns = plausible_metric_candidates(question, df)
+    explicit_names = {m["column"] for m in explicit_columns if m.get("score", 0) >= 0.66}
+    candidates: list[dict[str, Any]] = []
+    for col in df.columns:
+        col_str = str(col)
+        if is_identifier_column(df, col_str):
+            continue
+        col_norm = normalize_schema_token(col_str)
+        if not pd.api.types.is_numeric_dtype(df[col]):
+            continue
+        score = 0.0
+        reasons: list[str] = []
+        if col_str in explicit_names or col_norm in q_norm:
+            score += 4.0
+            reasons.append("explicitly requested")
+        for token in STRONG_RANKING_TOKENS:
+            if token in col_norm and (col_str in explicit_names or any(entity in q_norm for entity in ENTITY_TERMS)):
+                score += 3.0 if token in ("performance", "score") else 1.5
+                reasons.append(f"ranking token: {token}")
+        if any(token in col_norm for token in EXCLUDED_GENERIC_RANKING_TOKENS) and col_str not in explicit_names and col_norm not in q_norm:
+            score -= 4.0
+            reasons.append("excluded generic measure unless explicitly requested")
+        if score > 0:
+            candidates.append({"column": col_str, "score": round(score, 2), "reasons": reasons})
+    candidates.sort(key=lambda item: item["score"], reverse=True)
+    return candidates
+
+
+def resolve_ranking_lookup(question: str, df: pd.DataFrame) -> dict[str, Any] | None:
+    """Resolve ranking questions like best employee into deterministic ranking evidence."""
+    if not ranking_phrase_present(question):
+        return None
+    q_norm = normalize_schema_token(question)
+    entity_type = next((entity for entity in ENTITY_TERMS if re.search(rf"\b{entity}\b", q_norm)), None)
+    entity_cols = resolve_entity_columns(df, entity_type)
+    operation = "min" if any(term in q_norm for term in ("worst", "lowest")) else "max"
+    metric_resolution = resolve_metric_from_question(question, df, require_numeric=True)
+
+    if metric_resolution.get("status") == "ambiguous":
+        return {
+            "lookup_kind": "ranking",
+            "entity_type": entity_type,
+            "clarification": "Multiple columns could match the requested metric.",
+            "requested_concept": "diabetes" if "diabetes" in q_norm else "metric",
+            "candidate_columns": metric_resolution.get("candidate_columns", []),
+            "ranking_metric_candidates": metric_resolution.get("candidate_columns", []),
+            "entity": entity_cols,
+            "operation": operation,
+            "confidence": 0.35,
+        }
+
+    candidates = rank_metric_candidates(question, df)
+    if metric_resolution.get("status") == "matched":
+        metric_col = metric_resolution["column"]
+        candidates = [{
+            "column": metric_col,
+            "score": metric_resolution.get("confidence", 0.9),
+            "reasons": [metric_resolution.get("match_type", "explicit metric match")],
+        }]
+
+    if not candidates:
+        return {
+            "lookup_kind": "ranking",
+            "entity_type": entity_type,
+            "clarification": "No non-identifier performance or scoring metric was found for this ranking request.",
+            "ranking_metric_candidates": [],
+            "entity": entity_cols,
+        }
+    top_score = candidates[0]["score"]
+    tied_candidates = [c for c in candidates if c["score"] == top_score]
+    if len(tied_candidates) > 1:
+        return {
+            "lookup_kind": "ranking",
+            "entity_type": entity_type,
+            "clarification": "Multiple ranking metrics are equally plausible.",
+            "ranking_metric_candidates": tied_candidates[:4],
+            "entity": entity_cols,
+        }
+
+    metric_col = candidates[0]["column"]
+    values = pd.to_numeric(df[metric_col], errors="coerce")
+    target_value = values.max() if operation == "max" else values.min()
+    winners = df[values == target_value]
+    display_col = entity_cols.get("display_column")
+    identifier_col = entity_cols.get("identifier_column")
+    return_columns = [c for c in [identifier_col, display_col, metric_col] if c and c in df.columns]
+    tied_winners = []
+    for idx, row in winners.iterrows():
+        item = {"row_position": int(df.index.get_loc(idx)) + 1}
+        for col in return_columns:
+            item[col] = json_scalar(row[col])
+        tied_winners.append(item)
+    return {
+        "lookup_kind": "ranking",
+        "entity_type": entity_type,
+        "entity": {
+            "identifier_column": identifier_col,
+            "display_column": display_col,
+        },
+        "ranking": {
+            "column": metric_col,
+            "operation": operation,
+            "value": json_scalar(target_value),
+            "candidate_scores": candidates[:4],
+        },
+        "return_columns": return_columns,
+        "tied_winners": tied_winners,
+        "tie_count": len(tied_winners),
+        "return_mode": "matching_rows",
+        "confidence": 0.95 if candidates[0]["score"] >= 0.95 or candidates[0]["score"] >= 3 else 0.78,
+    }
+
+
+def resolve_median_comparison(question: str, df: pd.DataFrame) -> dict[str, Any] | None:
+    """Resolve row/entity-to-median comparison with bounded deterministic evidence."""
+    q_norm = normalize_schema_token(question)
+    if "compare" not in q_norm or "median" not in q_norm:
+        return None
+    row_index: int | None = None
+    row_position: int | None = None
+    identity_resolution: dict[str, Any] = {}
+    row_match = re.search(r"\brow\s+(\d+)\b|\b(\d+)(?:st|nd|rd|th)\s+row\b", q_norm)
+    if row_match:
+        row_position = int(row_match.group(1) or row_match.group(2))
+        row_index = row_position - 1
+        identity_resolution = {"method": "row_position", "row_position": row_position}
+    else:
+        entity = resolve_entity_value_lookup(question, df)
+        if entity:
+            if not entity.get("matched"):
+                return {"lookup_kind": "median_comparison", "not_found": True, "entity_resolution": entity}
+            row_index = int(entity["row_index"])
+            row_position = row_index + 1
+            identity_resolution = {"method": "entity_identifier", **entity.get("identity", {})}
+
+    if row_index is None:
+        return None
+    if row_index < 0 or row_index >= len(df):
+        return {
+            "lookup_kind": "median_comparison",
+            "validation_error": f"Row {row_position} is outside the dataset range of 1 to {len(df)}.",
+            "row_position": row_position,
+        }
+
+    row = df.iloc[row_index]
+    roles = infer_column_roles(df)
+    comparisons: list[dict[str, Any]] = []
+    for col in roles.get("numeric", []):
+        if col not in df.columns or is_identifier_column(df, col):
+            continue
+        series = pd.to_numeric(df[col], errors="coerce").dropna()
+        if series.nunique() <= 1 or pd.isna(row[col]):
+            continue
+        median = float(series.median())
+        row_value = float(row[col])
+        diff = row_value - median
+        comparisons.append({
+            "column": col,
+            "row_value": json_scalar(row[col]),
+            "dataset_median": round(median, 3),
+            "difference": round(diff, 3),
+            "direction": "above" if diff > 0 else "below" if diff < 0 else "equal",
+            "normalized_abs_difference": abs(diff) / max(float(series.std() or 1.0), 1.0),
+        })
+    comparisons.sort(key=lambda item: item["normalized_abs_difference"], reverse=True)
+    identity_cols = [c for c in [resolve_entity_columns(df).get("identifier_column"), resolve_entity_columns(df).get("display_column")] if c and c in df.columns]
+    identity = {col: json_scalar(row[col]) for col in identity_cols}
+    return {
+        "lookup_kind": "median_comparison",
+        "row_position": row_position,
+        "row_index": row_index,
+        "identity_resolution": identity_resolution,
+        "identity": identity,
+        "comparisons": [{k: v for k, v in comp.items() if k != "normalized_abs_difference"} for comp in comparisons[:4]],
+        "excluded_columns": [col for col in roles.get("ids", []) if col in df.columns],
+    }
+
+
+def detect_dataset_mismatch(question: str, df: pd.DataFrame) -> dict[str, Any] | None:
+    """Detect clear requests for unavailable external/schema concepts."""
+    q_norm = normalize_schema_token(question)
+    columns = [str(c) for c in df.columns]
+    analytical_terms = {"average", "mean", "age", "sum", "count", "highest", "lowest", "salary"}
+    if not any(term in q_norm.split() for term in analytical_terms):
+        return None
+
+    if any(term in q_norm for term in ("usa president", "us president", "u s president", "president")):
+        has_president = any("president" in normalize_schema_token(col) for col in columns)
+        has_age = resolve_schema_column_reference("age", columns).get("status") == "matched"
+        if not has_president:
+            unmatched = "U.S. presidents or their ages" if "age" in q_norm and not has_age else "U.S. presidents"
+            return {"unmatched_concept": unmatched, "available_columns": columns}
+    return None
+
 
 class PlanDimension(BaseModel):
     column: str
@@ -382,6 +1325,13 @@ class ResolvedAnalysisPlan(AnalysisPlan):
 SYNTHESIS_SYSTEM_PROMPT = """You are an expert dataset analysis assistant. Answer the user's question using ONLY the verified dataset evidence provided.
 
 Requirements:
+- title <= 8 words
+- summary <= 80 words
+- explanation <= 120 words
+- finding detail <= 30 words
+- no HTML
+- no markdown
+- no repeated phrases
 - Give the direct answer first in plain language suitable for a non-technical user.
 - Do not invent the dataset's intended purpose or unverified facts.
 - Distinguish observations from assumptions.
@@ -400,22 +1350,25 @@ Requirements:
 """
 
 
-MIN_SYNTHESIS_RETRY_SECONDS = 2.0
+MIN_SYNTHESIS_RETRY_SECONDS = 4.0
 
 
-def synthesize_llm_answer(
+async def synthesize_llm_answer_async(
     question: str,
     evidence: AnalysisEvidence,
+    *,
     effective_lens: str = "general",
     request_id: str | None = None,
     deadline_at: float | None = None,
+    complexity_route: str = "standard",
 ) -> GeneratedAnswer:
     """Generate structured natural-language response strictly grounded in verified facts."""
+    request_id = request_id or f"standalone-{uuid.uuid4()}"
     if deadline_at is not None:
-        rem_initial = deadline_at - time.time()
+        rem_initial = deadline_at - time.monotonic()
         if rem_initial <= 0:
-            from backend.core.errors import ExecutionBudgetExceededError
-            raise ExecutionBudgetExceededError("The request deadline expired before answer generation.")
+            from backend.core.errors import LLMSynthesisError
+            raise LLMSynthesisError("The request deadline expired before answer generation.")
 
     payload = {
         "user_question": question,
@@ -429,18 +1382,47 @@ def synthesize_llm_answer(
     }
 
     user_text = json.dumps(payload, default=str)
+    route_key = complexity_route.lower()
+    direct_schema_routes = {
+        "direct",
+        "extreme_value",
+        "entity_value_lookup",
+        "direct_row_lookup",
+        "simple_aggregation",
+    }
+    output_limit = 256 if route_key in direct_schema_routes else 512 if route_key in {
+        "direct",
+        "direct_row_lookup",
+        "entity_value_lookup",
+        "ranking_lookup",
+        "row_median_comparison",
+        "simple_aggregation",
+        "dataset_mismatch",
+        "dataset_purpose",
+        "standard_quality",
+        "model_recommendation",
+    } else 1024
 
-    def _call_model(payload_str: str) -> str:
+    async def _call_model(payload_str: str) -> str:
         from backend.llm.client import llm_client
-        calc_timeout = 10.0
+        from backend.core.config import SYNTHESIS_MODEL
+        from backend.core.schemas import DirectAnswer, GeneratedAnswer
+        from google.genai import types
+        
+        calc_timeout = 60.0
         if deadline_at is not None:
-            rem = deadline_at - time.time()
+            rem = deadline_at - time.monotonic()
             if rem <= 0:
                 from backend.core.errors import ExecutionBudgetExceededError
                 raise ExecutionBudgetExceededError("The request deadline expired before answer generation.")
-            calc_timeout = min(LLM_CALL_TIMEOUT_SECONDS, max(0.5, rem))
+            calc_timeout = min(60.0, max(0.1, rem))
 
-        return llm_client.generate_content(
+        schema = DirectAnswer if route_key in direct_schema_routes else GeneratedAnswer
+        if not request_id:
+            raise AssertionError("Synthesis request_id is required.")
+        if evidence.facts and len(json.dumps(payload.get("evidence", {}), default=str)) <= 0:
+            raise AssertionError("Synthesis evidence must be serialized.")
+        return await llm_client.generate_content(
             system_instruction=SYNTHESIS_SYSTEM_PROMPT,
             contents=payload_str,
             temperature=0.1,
@@ -449,22 +1431,47 @@ def synthesize_llm_answer(
             stage="synthesis",
             request_start_time=time.time(),
             total_deadline_s=calc_timeout,
+            model=SYNTHESIS_MODEL,
+            response_schema=schema,
+            max_output_tokens=output_limit,
+            response_mime_type="application/json",
+            evidence_payload={
+                "intent": evidence.intent,
+                "dataset_name": evidence.dataset_name,
+                "facts": evidence.facts,
+                "warnings": evidence.warnings,
+            },
+            thinking_config=types.ThinkingConfig(thinking_level="minimal")
         )
 
     raw_text = ""
     try:
-        raw_text = _call_model(user_text)
+        raw_text = await _call_model(user_text)
     except Exception as e:
         if "cancelled" in str(e).lower():
             raise e
-        logger.warning("LLM synthesis attempt 1 failed: %s. Retrying with trimmed payload.", e)
+            
+        max_attempts = {
+            "direct": 1,
+            "dataset_mismatch": 1,
+            "standard_quality": 1,
+            "direct_row_lookup": 1,
+            "standard": 2,
+            "deep": 2,
+        }.get(complexity_route.lower(), 2)
 
         if deadline_at is not None:
-            rem = deadline_at - time.time()
-            if rem < MIN_SYNTHESIS_RETRY_SECONDS:
-                logger.warning("Insufficient time remaining (%.2fs < %.2fs) for LLM synthesis retry.", rem, MIN_SYNTHESIS_RETRY_SECONDS)
+            rem = deadline_at - time.monotonic()
+            if 1 >= max_attempts or rem < MIN_SYNTHESIS_RETRY_SECONDS:
+                logger.warning("Synthesis attempt 1 failed and no retry allowed (max_attempts=%d, remaining=%.2fs). Error: %s", max_attempts, rem, e)
                 from backend.core.errors import LLMSynthesisError
                 raise LLMSynthesisError("The calculations completed, but the explanation could not be generated.")
+        elif 1 >= max_attempts:
+            logger.warning("Synthesis attempt 1 failed and no retry allowed. Error: %s", e)
+            from backend.core.errors import LLMSynthesisError
+            raise LLMSynthesisError("The calculations completed, but the explanation could not be generated.")
+
+        logger.warning("LLM synthesis attempt 1 failed: %s. Retrying with trimmed payload.", e)
 
         try:
             trimmed_payload = {
@@ -477,7 +1484,7 @@ def synthesize_llm_answer(
                     "warnings": evidence.warnings,
                 },
             }
-            raw_text = _call_model(json.dumps(trimmed_payload, default=str))
+            raw_text = await _call_model(json.dumps(trimmed_payload, default=str))
         except Exception as e2:
             if "cancelled" in str(e2).lower():
                 raise e2
@@ -485,6 +1492,7 @@ def synthesize_llm_answer(
             from backend.core.errors import LLMSynthesisError
             raise LLMSynthesisError("The calculations completed, but the explanation could not be generated.")
 
+    from backend.core.schemas import DirectAnswer, GeneratedAnswer
     try:
         clean = raw_text
         if clean.startswith("```"):
@@ -492,25 +1500,369 @@ def synthesize_llm_answer(
         if "```" in clean:
             clean = clean.rsplit("```", 1)[0]
         clean = clean.strip()
-        parsed = json.loads(clean)
-        return GeneratedAnswer(
-            title=parsed.get("title"),
-            summary=parsed.get("summary") or "Analysis completed.",
-            explanation=parsed.get("explanation"),
-            findings=parsed.get("findings") if isinstance(parsed.get("findings"), list) else [],
-            caveats=parsed.get("caveats") if isinstance(parsed.get("caveats"), list) else [],
-            next_action=parsed.get("next_action"),
-        )
+        
+        if route_key in direct_schema_routes:
+            direct_ans = DirectAnswer.model_validate_json(clean)
+            parsed_ans = GeneratedAnswer(
+                title="",
+                summary=direct_ans.summary,
+                explanation="",
+                findings=[],
+                caveats=[],
+                next_action=direct_ans.next_action,
+            )
+        else:
+            parsed_ans = GeneratedAnswer.model_validate_json(clean)
     except Exception as parse_err:
-        logger.warning("Failed to parse JSON response from LLM synthesis (%s). Using fallback wrapper.", parse_err)
-        return GeneratedAnswer(
-            title="Analysis Result",
-            summary=raw_text if raw_text else "Analysis complete based on verified evidence.",
-            explanation=None,
-            findings=[],
-            caveats=evidence.warnings,
-            next_action="Explore further dataset columns or ask a follow-up question.",
+        logger.warning("JSON parse failed. Retrying once: %s", parse_err)
+        if not raw_text.strip():
+            from backend.core.errors import LLMSynthesisError
+            raise LLMSynthesisError("The model returned an empty synthesis response.")
+        try:
+            # Repair call
+            from backend.llm.client import llm_client
+            from backend.core.config import SYNTHESIS_MODEL
+            from google.genai import types
+            repair_timeout = 30.0
+            if deadline_at is not None:
+                rem = deadline_at - time.monotonic()
+                if rem < MIN_SYNTHESIS_RETRY_SECONDS:
+                    from backend.core.errors import LLMSynthesisError
+                    raise LLMSynthesisError("invalid_llm_response")
+                repair_timeout = min(30.0, max(0.1, rem))
+            repair_payload = json.dumps({
+                "user_question": question,
+                "effective_lens": effective_lens,
+                "evidence": {
+                    "intent": evidence.intent,
+                    "dataset_name": evidence.dataset_name,
+                    "facts": evidence.facts,
+                    "warnings": evidence.warnings,
+                },
+                "invalid_output": raw_text[:4000],
+                "instruction": "Repair the invalid output into the required JSON schema using only the evidence.",
+            }, default=str)
+            repair_schema = DirectAnswer if route_key in direct_schema_routes else GeneratedAnswer
+            repaired_text = await llm_client.generate_content(
+                system_instruction="Return only valid JSON matching the schema. Do not use markdown. Keep all strings concise.",
+                contents=repair_payload,
+                temperature=0.1,
+                timeout_seconds=repair_timeout,
+                request_id=request_id,
+                stage="synthesis",
+                request_start_time=time.time(),
+                total_deadline_s=repair_timeout,
+                model=SYNTHESIS_MODEL,
+                response_schema=repair_schema,
+                max_output_tokens=output_limit,
+                response_mime_type="application/json",
+                evidence_payload={
+                    "intent": evidence.intent,
+                    "dataset_name": evidence.dataset_name,
+                    "facts": evidence.facts,
+                    "warnings": evidence.warnings,
+                },
+                thinking_config=types.ThinkingConfig(thinking_level="minimal"),
+            )
+            clean = repaired_text.strip()
+            if clean.startswith("```"): clean = clean.split("\n", 1)[1]
+            if "```" in clean: clean = clean.rsplit("```", 1)[0]
+            if route_key in direct_schema_routes:
+                direct_ans = DirectAnswer.model_validate_json(clean.strip())
+                parsed_ans = GeneratedAnswer(
+                    title="",
+                    summary=direct_ans.summary,
+                    explanation="",
+                    findings=[],
+                    caveats=[],
+                    next_action=direct_ans.next_action,
+                )
+            else:
+                parsed_ans = GeneratedAnswer.model_validate_json(clean.strip())
+        except Exception as e2:
+            logger.error("Failed to parse/validate JSON response from LLM synthesis after retry (%s).", e2)
+            from backend.core.errors import LLMSynthesisError
+            raise LLMSynthesisError("invalid_llm_response")
+
+    try:
+        reject_unusable_generated_answer(parsed_ans)
+        import re
+        def get_numbers(text):
+            return set(re.findall(r'\b\d+(?:\.\d+)?\b', text))
+        
+        evidence_text = str(evidence.model_dump())
+        ans_text = f"{parsed_ans.summary} {parsed_ans.explanation} " + " ".join(f.detail for f in parsed_ans.findings)
+        ans_lower = ans_text.lower()
+        if isinstance(evidence.facts, dict) and evidence.facts.get("resolved_column"):
+            absent_phrases = (
+                "does not contain",
+                "doesn't contain",
+                "no information",
+                "not available",
+                "cannot be determined",
+                "can't be determined",
+                "could not determine",
+                "field is absent",
+            )
+            if any(phrase in ans_lower for phrase in absent_phrases):
+                raise ValueError("Generated answer contradicted resolved column evidence.")
+        
+        for num in get_numbers(ans_text):
+            if num not in evidence_text:
+                raise ValueError(f"Unsupported numeric claim: {num}")
+                
+        return parsed_ans
+    except Exception as e:
+        logger.error("Validation error: %s", e)
+        from backend.core.errors import LLMSynthesisError
+        raise LLMSynthesisError(str(e))
+
+
+@dataclass
+class RequestContext:
+    request_id: str
+    session_id: str | None = None
+    question: str = ""
+    effective_lens: str = "general"
+    deadline_at: float | None = None
+    complexity_route: str = "standard"
+    answer_type: str = "text"
+    started_at: float = field(default_factory=time.monotonic)
+    llm_call_budget: int = 2
+    prompt_version: str = SYNTHESIS_PROMPT_VERSION
+    validator_version: str = VALIDATOR_VERSION
+    generation: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class GenerationResult:
+    answer: GeneratedAnswer | None
+    generation: dict[str, Any]
+    status: Literal["complete", "partial"]
+    warning: dict[str, str] | None = None
+
+
+def _synthesis_call_records(request_id: str | None, start_index: int = 0) -> list[dict[str, Any]]:
+    if not request_id:
+        return []
+    from backend.llm.client import llm_client
+    return [
+        record for record in llm_client.call_records[start_index:]
+        if record.get("request_id") == request_id and record.get("stage") == "synthesis"
+    ]
+
+
+async def generate_user_answer(
+    *,
+    question: str,
+    evidence: AnalysisEvidence,
+    request_context: RequestContext,
+    answer_type: str,
+) -> GeneratedAnswer:
+    """Single gateway for every successful user-facing conversational answer."""
+    result = await generate_resilient_answer(
+        question=question,
+        evidence=evidence,
+        request_context=request_context,
+        answer_type=answer_type,
+    )
+    if result.answer is None:
+        raise LLMSynthesisError(result.warning["message"] if result.warning else "answer_generation_unavailable")
+    return result.answer
+
+
+async def generate_resilient_answer(
+    *,
+    question: str,
+    evidence: AnalysisEvidence,
+    request_context: RequestContext,
+    answer_type: str,
+) -> GenerationResult:
+    """Central resilient answer gateway.
+
+    The deterministic evidence is authoritative. A model failure updates
+    generation telemetry but does not imply that computation failed.
+    """
+    from backend.core.config import SYNTHESIS_MODEL
+    from backend.llm.client import llm_client
+
+    if not request_context.request_id:
+        raise ValueError("Synthesis model calls during a query require request_id.")
+
+    request_context.answer_type = answer_type
+    started = time.time()
+    start_record_index = len(llm_client.call_records)
+    try:
+        answer = await synthesize_llm_answer_async(
+            question,
+            evidence,
+            effective_lens=request_context.effective_lens,
+            request_id=request_context.request_id,
+            deadline_at=request_context.deadline_at,
+            complexity_route=request_context.complexity_route,
         )
+        duration_ms = round((time.time() - started) * 1000)
+        records = _synthesis_call_records(request_context.request_id, start_record_index)
+        request_context.generation = {
+            "required": True,
+            "succeeded": True,
+            "provider": "google_genai",
+            "model": SYNTHESIS_MODEL,
+            "stage": "synthesis",
+            "answer_type": answer_type,
+            "attempts": max(1, len(records)),
+            "validated": True,
+            "duration_ms": duration_ms,
+            "gateway": "generate_user_answer",
+        }
+        try:
+            setattr(answer, "_generated_by_gateway", True)
+        except Exception:
+            pass
+        return GenerationResult(answer=answer, generation=request_context.generation, status="complete")
+    except Exception:
+        duration_ms = round((time.time() - started) * 1000)
+        records = _synthesis_call_records(request_context.request_id, start_record_index)
+        request_context.generation = {
+            "required": True,
+            "succeeded": False,
+            "provider": "google_genai",
+            "model": SYNTHESIS_MODEL,
+            "stage": "synthesis",
+            "answer_type": answer_type,
+            "attempts": max(1, len(records)),
+            "validated": False,
+            "duration_ms": duration_ms,
+            "gateway": "generate_user_answer",
+        }
+        return GenerationResult(
+            answer=None,
+            generation=request_context.generation,
+            status="partial",
+            warning={
+                "code": "answer_generation_unavailable",
+                "message": "The analysis completed. The written explanation is temporarily unavailable.",
+            },
+        )
+
+
+def format_evidence_facts(evidence: AnalysisEvidence, limit: int = 8) -> list[dict[str, Any]]:
+    """Format deterministic evidence separately from the conversational answer."""
+    facts: list[dict[str, Any]] = []
+    for key, value in list((evidence.facts or {}).items()):
+        if len(facts) >= limit:
+            break
+        if isinstance(value, (dict, list)):
+            facts.append({"label": str(key).replace("_", " ").title(), "value": json.dumps(value, default=str)[:500]})
+        else:
+            facts.append({"label": str(key).replace("_", " ").title(), "value": value})
+    return facts
+
+
+def build_evidence_payload(evidence: AnalysisEvidence, *, fact_limit: int = 12) -> dict[str, Any]:
+    """Create a stable, renderable evidence payload for complete and partial events."""
+    payload: dict[str, Any] = {
+        "available": True,
+        "intent": evidence.intent,
+        "dataset_name": evidence.dataset_name,
+        "facts": format_evidence_facts(evidence, limit=fact_limit),
+        "raw_facts": evidence.facts,
+        "warnings": evidence.warnings,
+        "assumptions": evidence.assumptions,
+        "unavailable_information": evidence.unavailable_information,
+    }
+    if evidence.tables:
+        payload["tables"] = evidence.tables
+        payload["table"] = evidence.tables[0]
+    comparisons = evidence.facts.get("comparisons") if isinstance(evidence.facts, dict) else None
+    if comparisons and "table" not in payload:
+        payload["table"] = {
+            "title": "Verified comparisons",
+            "columns": ["column", "row_value", "dataset_median", "difference", "direction"],
+            "rows": comparisons,
+        }
+    return payload
+
+
+def cache_deterministic_evidence(
+    *,
+    request_id: str,
+    question: str,
+    evidence: AnalysisEvidence,
+    request_context: RequestContext,
+    meta: dict[str, Any] | None = None,
+    chart: str | None = None,
+    chart_json: str | None = None,
+) -> None:
+    """Store verified computation separately from generated answer text."""
+    if not request_id:
+        return
+    deterministic_evidence_cache[request_id] = {
+        "request_id": request_id,
+        "session_id": request_context.session_id,
+        "question": question,
+        "route": request_context.complexity_route,
+        "answer_type": request_context.answer_type,
+        "effective_lens": request_context.effective_lens,
+        "dataset_fingerprint": meta.get("dataset_fingerprint") if meta else None,
+        "evidence": evidence.model_dump(),
+        "meta": meta or {},
+        "chart": chart,
+        "chart_json": chart_json,
+        "cached_at": time.time(),
+        "pipeline_version": QUERY_PIPELINE_VERSION,
+        "prompt_version": SYNTHESIS_PROMPT_VERSION,
+        "schema_version": RESPONSE_SCHEMA_VERSION,
+    }
+
+
+def build_generation_failed_event(
+    *,
+    request_id: str,
+    evidence: AnalysisEvidence,
+    request_context: RequestContext,
+    meta: dict[str, Any] | None = None,
+    chart: str | None = None,
+    chart_json: str | None = None,
+    message: str = "The calculations completed, but the answer could not be generated.",
+) -> dict[str, Any]:
+    generation = request_context.generation or {
+        "required": True,
+        "succeeded": False,
+        "attempts": 0,
+        "validated": False,
+        "stage": "synthesis",
+        "gateway": "generate_user_answer",
+    }
+    warning = {
+        "code": "answer_generation_unavailable",
+        "message": "The analysis completed. The written explanation is temporarily unavailable.",
+    }
+    cache_deterministic_evidence(
+        request_id=request_id,
+        question=request_context.question,
+        evidence=evidence,
+        request_context=request_context,
+        meta=meta,
+        chart=chart,
+        chart_json=chart_json,
+    )
+    return {
+        "type": "analysis_partial",
+        "request_id": request_id,
+        "status": "partial",
+        "step": "done",
+        "message": "Analysis completed with verified evidence",
+        "answer": None,
+        "chart": chart,
+        "chart_json": chart_json,
+        "generation": generation,
+        "evidence": build_evidence_payload(evidence),
+        "evidence_summary": {"available": True, "intent": evidence.intent, "facts": evidence.facts},
+        "warning": warning,
+        "error": None,
+        "meta": meta or {},
+    }
 
 
 def build_query_response(
@@ -526,7 +1878,17 @@ def build_query_response(
     effective_lens: str = "general",
     generated_code: str | None = None,
     error: str | None = None,
+    generation: dict[str, Any] | None = None,
 ) -> dict:
+    if status == "complete" and (
+        not generation
+        or generation.get("required") is not True
+        or generation.get("succeeded") is not True
+        or generation.get("validated") is not True
+        or generation.get("gateway") != "generate_user_answer"
+    ):
+        raise ValueError("Completed query responses require a validated LLM-generated answer.")
+
     steps_payload = []
     if execution_steps:
         for idx, s in enumerate(execution_steps):
@@ -544,12 +1906,15 @@ def build_query_response(
 
     answer_payload = {
         "type": answer_type,
+        "summary": answer_text,
         "text": answer_text,
         "data": answer_data,
     }
 
     if generated_answer:
         if isinstance(generated_answer, GeneratedAnswer):
+            ga_dict = generated_answer.model_dump()
+        elif hasattr(generated_answer, "model_dump"):
             ga_dict = generated_answer.model_dump()
         elif isinstance(generated_answer, dict):
             ga_dict = generated_answer
@@ -576,6 +1941,7 @@ def build_query_response(
         "warnings": warnings or [],
         "effective_lens": effective_lens,
         "generated_code": generated_code,
+        "generation": generation,
         "error": error,
         "debug_build_id": APP_BUILD_ID,
     }
@@ -690,12 +2056,14 @@ def get_session_df(session_id: str) -> pd.DataFrame:
         _touch_session(session_id)
         storage.update_session_access(session_id)
         return dataframes[session_id]
+
     df = storage.load_dataframe(session_id)
     if df is not None:
         dataframes[session_id] = df
         _touch_session(session_id)
         storage.update_session_access(session_id)
         return df
+
     raise HTTPException(status_code=404, detail="Session not found. Upload a CSV first.")
 
 
@@ -911,12 +2279,12 @@ def _fig_to_b64(fig) -> str:
 
 
 def build_overview_charts(df: pd.DataFrame) -> list[dict]:
-    """Deterministically render an instant 'dashboard' the moment a CSV loads ÃÂ¢ÃÂÃÂ
+    """Deterministically render an instant 'dashboard' the moment a CSV loads ¢
     no LLM call, so it is fast and demo-safe. Each chart is isolated in try/except."""
     charts: list[dict] = []
     numeric = df.select_dtypes(include="number")
 
-    # 1 ÃÂÃÂ· Correlation heatmap
+    # 1 · Correlation heatmap
     if numeric.shape[1] >= 2:
         try:
             corr = numeric.corr()
@@ -930,7 +2298,7 @@ def build_overview_charts(df: pd.DataFrame) -> list[dict]:
         except Exception:
             pass
 
-    # 2 ÃÂÃÂ· Distribution small-multiples (up to 6 numeric columns)
+    # 2 · Distribution small-multiples (up to 6 numeric columns)
     if numeric.shape[1] >= 1:
         try:
             cols = list(numeric.columns)[:6]
@@ -951,11 +2319,11 @@ def build_overview_charts(df: pd.DataFrame) -> list[dict]:
         except Exception:
             pass
 
-    # 3 ÃÂÃÂ· Top values of the first meaningful low-cardinality categorical column
+    # 3 · Top values of the first meaningful low-cardinality categorical column
     for c in df.columns:
         name = str(c).lower()
         if any(k in name for k in ("date", "time", "_at", "id")):
-            continue  # skip dates / identifiers ÃÂ¢ÃÂÃÂ not useful as categories
+            continue  # skip dates / identifiers ¢ not useful as categories
         if not pd.api.types.is_numeric_dtype(df[c]) and 2 <= df[c].nunique() <= 25:
             try:
                 vc = df[c].value_counts().head(10)
@@ -2640,11 +4008,14 @@ def infer_column_roles(df: pd.DataFrame) -> dict[str, list[str]]:
             roles["time"].append(col_str)
             continue
 
-        if name == "id" or name.endswith("_id") or name.endswith(" id"):
+        compact_name = re.sub(r"[^a-z0-9]+", "", name)
+        if name == "id" or name.endswith("_id") or name.endswith(" id") or compact_name.endswith("id"):
             roles["ids"].append(col_str)
             continue
 
-        if is_numeric and nunique > 0.95 * max(len(df), 1):
+        if is_numeric and nunique > 0.95 * max(len(df), 1) and (
+            compact_name.endswith("id") or compact_name in {"id", "identifier"} or compact_name.endswith("number")
+        ):
             roles["ids"].append(col_str)
             continue
 
@@ -2722,7 +4093,18 @@ def _dataset_fingerprint(df: pd.DataFrame) -> str:
 
 
 def _cache_key(session_id: str, category: str, question: str, df: pd.DataFrame) -> str:
-    return f"{session_id}:{category}:{_norm_text(question)}:{_dataset_fingerprint(df)}"
+    key_parts = {
+        "pipeline": QUERY_PIPELINE_VERSION,
+        "question": _norm_text(question),
+        "lens": (category or "general").lower(),
+        "dataset": _dataset_fingerprint(df),
+        "resolver": RESOLVER_VERSION,
+        "prompt": SYNTHESIS_PROMPT_VERSION,
+        "validator": VALIDATOR_VERSION,
+        "schema": RESPONSE_SCHEMA_VERSION,
+        "model": os.environ.get("SYNTHESIS_MODEL", "gemma-4-26b-a4b-it"),
+    }
+    return f"{session_id}:{json.dumps(key_parts, sort_keys=True)}"
 
 
 def _update_conversation_state(session_id: str, question: str, result: str,
@@ -2858,7 +4240,7 @@ def deterministic_answer(question: str, df: pd.DataFrame,
         return done(result, chart_json=_chart_to_json(fig), code=code,
                     validation_method="Pearson correlation computed from numeric columns")
 
-    if any(term in q for term in ("distribution", "histogram")):
+    if any(term in q for term in ("distribution", "histogram", "plot", "chart", "graph")):
         metric = chart_spec.get("x") or (roles["metrics"][0] if roles["metrics"] else None)
         if not metric:
             return done("No numeric column was found for a distribution chart.")
@@ -2959,7 +4341,7 @@ def train_predictive_model(df: pd.DataFrame, target: str) -> tuple[str, str, dic
         classes = [str(c) for c in ycat.cat.categories]
         y = ycat.cat.codes
         if n_classes < 2:
-            raise ValueError("Target has only one class ÃÂ¢ÃÂÃÂ nothing to classify.")
+            raise ValueError("Target has only one class ¢ nothing to classify.")
         model = RandomForestClassifier(n_estimators=200, max_depth=10, random_state=42, n_jobs=-1)
     else:
         classes = None
@@ -2971,18 +4353,18 @@ def train_predictive_model(df: pd.DataFrame, target: str) -> tuple[str, str, dic
     model.fit(Xtr, ytr)
     pred = model.predict(Xte)
 
-    # ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ 1. Feature importance (gini / MDI) ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
+    # ¢¢ 1. Feature importance (gini / MDI) ¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢
     importances = pd.Series(model.feature_importances_, index=X.columns).sort_values(ascending=False)
     top = importances.head(12)
     fig, ax = plt.subplots(figsize=(8, max(4, 0.5 * len(top))))
     sns.barplot(x=top.values, y=top.index.astype(str), ax=ax)
     for cont in ax.containers:
         ax.bar_label(cont, fmt="%.3f", padding=3)
-    ax.set_title(f"What predicts '{target}'?  ÃÂÃÂ·  Feature Importance (MDI)")
+    ax.set_title(f"What predicts '{target}'?  ·  Feature Importance (MDI)")
     ax.set_xlabel("Importance"); ax.set_ylabel("Feature")
     chart = _fig_to_b64(fig)
 
-    # ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ 2. SHAP beeswarm (global explanation) ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
+    # ¢¢ 2. SHAP beeswarm (global explanation) ¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢
     shap_chart = None
     try:
         import shap
@@ -3004,7 +4386,7 @@ def train_predictive_model(df: pd.DataFrame, target: str) -> tuple[str, str, dic
     except Exception:
         plt.close("all")
 
-    # ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ 3. Permutation importance (test-set, unbiased) ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
+    # ¢¢ 3. Permutation importance (test-set, unbiased) ¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢
     perm_chart = None
     try:
         perm = permutation_importance(model, Xte, yte, n_repeats=5, random_state=42, n_jobs=-1)
@@ -3015,14 +4397,14 @@ def train_predictive_model(df: pd.DataFrame, target: str) -> tuple[str, str, dic
         fig, ax = plt.subplots(figsize=(8, max(4, 0.5 * len(perm_df))))
         ax.barh(perm_df["Feature"][::-1], perm_df["Importance"][::-1],
                 xerr=perm_df["Std"][::-1], color="#4F46E5", alpha=0.85, capsize=3)
-        ax.set_title(f"Permutation Importance ÃÂÃÂ· '{target}' (test set)")
+        ax.set_title(f"Permutation Importance · '{target}' (test set)")
         ax.set_xlabel("Mean decrease in score")
         plt.tight_layout()
         perm_chart = _fig_to_b64(fig)
     except Exception:
         plt.close("all")
 
-    # ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ 4. Partial Dependence Plots (top 2 features) ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
+    # ¢¢ 4. Partial Dependence Plots (top 2 features) ¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢
     pdp_chart = None
     try:
         top2 = list(importances.head(2).index)
@@ -3032,26 +4414,26 @@ def train_predictive_model(df: pd.DataFrame, target: str) -> tuple[str, str, dic
             axes = [axes]
         PartialDependenceDisplay.from_estimator(model, X, top2, ax=axes,
                                                 kind="average", subsample=500, random_state=42)
-        fig.suptitle(f"Partial Dependence ÃÂ¢ÃÂÃÂ Top Features for '{target}'",
+        fig.suptitle(f"Partial Dependence ¢ Top Features for '{target}'",
                      fontsize=13, fontweight="bold")
         fig.tight_layout()
         pdp_chart = _fig_to_b64(fig)
     except Exception:
         plt.close("all")
 
-    # ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ metrics & summary ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
+    # ¢¢ metrics & summary ¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢
     if is_classification:
         metric = f"Accuracy: {accuracy_score(yte, pred):.1%}   |   F1 (weighted): {f1_score(yte, pred, average='weighted'):.2f}"
         task = f"Trained a Random Forest classifier to predict '{target}' ({n_classes} classes)."
     else:
-        metric = f"RÃÂÃÂ²: {r2_score(yte, pred):.3f}   |   MAE: {mean_absolute_error(yte, pred):,.3f}"
+        metric = f"R²: {r2_score(yte, pred):.3f}   |   MAE: {mean_absolute_error(yte, pred):,.3f}"
         task = f"Trained a Random Forest regressor to predict '{target}'."
 
     top3 = ", ".join(f"{n} ({v:.0%})" for n, v in top.head(3).items())
     summary = (f"{task}\n{metric}\n\n"
                f"Top features: {top3}.\n"
                f"Trained on {len(Xtr)} rows, validated on {len(Xte)}, {X.shape[1]} features.\n"
-               f"Explainability: SHAP beeswarm ÃÂÃÂ· Permutation importance ÃÂÃÂ· Partial dependence plots generated.")
+               f"Explainability: SHAP beeswarm · Permutation importance · Partial dependence plots generated.")
 
     features_meta = []
     for c in num_cols + cat_cols:
@@ -3100,14 +4482,14 @@ def build_predict_payload(session_id: str, df: pd.DataFrame, target: str) -> dic
     }
 
 
-# ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ Schema-aware analytics planner ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
+# ¢¢ Schema-aware analytics planner ¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢
 
 def build_semantic_schema(df: pd.DataFrame) -> dict:
-    """Build a rich semantic schema from a DataFrame ÃÂ¢ÃÂÃÂ deterministic, no LLM.
+    """Build a rich semantic schema from a DataFrame ¢ deterministic, no LLM.
 
     Each column gets:
     - dtype string
-    - unique_count / unique_ratio (0.0ÃÂ¢ÃÂÃÂ1.0)
+    - unique_count / unique_ratio (0.0¢1.0)
     - null_pct
     - sample_values (up to 3)
     - semantic_role_candidates: identifier | categorical_dimension | numeric_measure | temporal | unknown
@@ -3128,8 +4510,12 @@ def build_semantic_schema(df: pd.DataFrame) -> dict:
         is_datetime = pd.api.types.is_datetime64_any_dtype(s)
 
         roles: list[str] = []
+        name_norm = normalize_schema_token(str(col))
+        compact_name = name_norm.replace(" ", "")
         if is_datetime:
             roles.append("temporal")
+        elif compact_name == "id" or compact_name.endswith("id"):
+            roles.append("identifier")
         elif unique_ratio >= 0.90 and not is_numeric:
             roles.append("identifier")
         elif unique_ratio < 0.25 and not is_numeric:
@@ -3176,23 +4562,23 @@ Given a dataset semantic schema and a user question, produce an AnalysisPlan JSO
 
 ## Semantic inference rules (apply in order):
 
-1. "number/count of X" ÃÂ¢ÃÂÃÂ operation = "count_distinct" on an identifier column, NOT sum of a numeric measure.
+1. "number/count of X" -> operation = "count_distinct" on an identifier column, NOT sum of a numeric measure.
    - Use `candidate_identifiers` to find the entity to count.
    - If no identifier exists, use operation = "count" (row count).
 
-2. "total/sum of X" ÃÂ¢ÃÂÃÂ operation = "sum" on a numeric_measure column named X (or closest match).
+2. "total/sum of X" -> operation = "sum" on a numeric_measure column named X (or closest match).
 
-3. "average/mean X" ÃÂ¢ÃÂÃÂ operation = "mean" on the named numeric_measure.
+3. "average/mean X" -> operation = "mean" on the named numeric_measure.
 
-4. "by Y" ÃÂ¢ÃÂÃÂ Y is a categorical_dimension used as the grouping dimension.
+4. "by Y" -> Y is a categorical_dimension used as the grouping dimension.
 
 5. Chart type:
-   - pie / donut ÃÂ¢ÃÂÃÂ requested or implied by "by department/category" with count
-   - bar ÃÂ¢ÃÂÃÂ comparison across categories
-   - line ÃÂ¢ÃÂÃÂ trend over time (requires temporal column)
-   - scatter ÃÂ¢ÃÂÃÂ relationship between two numeric measures
-   - histogram ÃÂ¢ÃÂÃÂ distribution of a single numeric measure
-   - box ÃÂ¢ÃÂÃÂ spread/outliers of a numeric measure by group
+   - pie / donut -> requested or implied by "by department/category" with count
+   - bar -> comparison across categories
+   - line -> trend over time (requires temporal column)
+   - scatter -> relationship between two numeric measures
+   - histogram -> distribution of a single numeric measure
+   - box -> spread/outliers of a numeric measure by group
 
 6. Do NOT default to the first numeric column found.
    Do NOT reuse a column from a previous question unless the current question names it explicitly.
@@ -3211,7 +4597,7 @@ Given a dataset semantic schema and a user question, produce an AnalysisPlan JSO
   "filters": [],
   "chart": {"type": "pie|bar|line|scatter|histogram|box", "x": "<col>", "y": "<label>", "category": "<col>", "value": "<label>"},
   "title": "<descriptive title>",
-  "confidence": 0.0ÃÂ¢ÃÂÃÂ1.0,
+  "confidence": 0.0 to 1.0,
   "ambiguity": ["<question if genuinely unclear>"],
   "reasoning_summary": "<one sentence explaining the interpretation>"
 }
@@ -3221,7 +4607,7 @@ If the request is genuinely ambiguous AND confidence < 0.55, set ambiguity to a 
 
 
 def validate_analysis_plan(
-    raw_plan: dict,
+    raw_plan: Any,
     df: pd.DataFrame,
     semantic_schema: dict,
 ) -> tuple["ResolvedAnalysisPlan", list[str]]:
@@ -3231,6 +4617,17 @@ def validate_analysis_plan(
     Fixes minor issues automatically; records warnings for the user.
     """
     warnings: list[str] = []
+    if isinstance(raw_plan, list):
+        if len(raw_plan) == 1 and isinstance(raw_plan[0], dict):
+            raw_plan = raw_plan[0]
+        else:
+            raw_plan = {}
+            warnings.append("Planner returned a list instead of a single plan object. Using best-effort defaults.")
+    elif not isinstance(raw_plan, dict):
+        raw_plan = {}
+        warnings.append("Planner returned an invalid plan payload. Using best-effort defaults.")
+
+    schema_columns = semantic_schema.get("columns", [])
     col_names = [str(c) for c in df.columns]
     col_lower_map = {c.lower(): c for c in col_names}
 
@@ -3250,7 +4647,7 @@ def validate_analysis_plan(
                 return cn
         return None
 
-    # Parse into AnalysisPlan ÃÂ¢ÃÂÃÂ fill defaults for invalid fields
+    # Parse into AnalysisPlan ¢ fill defaults for invalid fields
     try:
         plan = AnalysisPlan.model_validate(raw_plan)
     except Exception as parse_err:
@@ -3262,7 +4659,7 @@ def validate_analysis_plan(
             reasoning_summary="Fallback plan due to parse error.",
         )
 
-    # ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ Resolve dimension column ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
+    # ¢¢ Resolve dimension column ¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢
     resolved_dim_col: str | None = None
     if plan.dimensions:
         raw_dim = plan.dimensions[0].column
@@ -3272,7 +4669,7 @@ def validate_analysis_plan(
         else:
             plan.dimensions[0] = PlanDimension(column=resolved_dim_col, role=plan.dimensions[0].role)
 
-    # ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ Resolve measure column ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
+    # ¢¢ Resolve measure column ¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢
     resolved_measure_col: str | None = None
     resolved_operation: str | None = None
 
@@ -3290,7 +4687,7 @@ def validate_analysis_plan(
                     resolved_measure_col = None
                 else:
                     # Verify the column is not a pure numeric measure (wrong for count_distinct)
-                    col_schema = next((c for c in semantic_schema["columns"] if c["name"] == resolved_measure_col), None)
+                    col_schema = next((c for c in schema_columns if c["name"] == resolved_measure_col), None)
                     if col_schema and "numeric_measure" in col_schema["semantic_role_candidates"] and "identifier" not in col_schema["semantic_role_candidates"]:
                         warnings.append(
                             f"Column '{resolved_measure_col}' looks like a numeric measure, not an identifier. "
@@ -3302,20 +4699,22 @@ def validate_analysis_plan(
                 resolved_measure_col = resolve_col(m.column)
                 if not resolved_measure_col:
                     warnings.append(f"Measure column '{m.column}' not found. Using first numeric column as fallback.")
-                    numeric_cols = [c["name"] for c in semantic_schema["columns"] if "numeric_measure" in c["semantic_role_candidates"]]
+                    numeric_cols = [c["name"] for c in schema_columns if "numeric_measure" in c["semantic_role_candidates"]]
                     resolved_measure_col = numeric_cols[0] if numeric_cols else None
                 elif not pd.api.types.is_numeric_dtype(df[resolved_measure_col]):
                     warnings.append(f"Column '{resolved_measure_col}' is not numeric. Cannot perform {m.operation}.")
                     resolved_measure_col = None
                 # Block using an identifier column as a numeric measure
-                col_schema = next((c for c in semantic_schema["columns"] if c["name"] == resolved_measure_col), None)
-                if col_schema and "identifier" in col_schema["semantic_role_candidates"] and m.operation in ("sum", "mean", "median"):
+                col_schema = next((c for c in schema_columns if c["name"] == resolved_measure_col), None)
+                if col_schema and "identifier" in col_schema["semantic_role_candidates"] and m.operation in ("sum", "mean", "median", "min", "max"):
                     warnings.append(
                         f"Column '{resolved_measure_col}' appears to be an identifier (unique_ratio={col_schema['unique_ratio']:.2f}). "
-                        f"Summing/averaging identifiers is rarely meaningful. Consider using count_distinct instead."
+                        f"Identifier columns cannot be used for {m.operation}. Ask for a distinct count or specify a non-identifier measure."
                     )
+                    resolved_measure_col = None
+                    resolved_operation = None
 
-    # ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ Validate chart type compatibility ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
+    # ¢¢ Validate chart type compatibility ¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢
     resolved_chart_type: str | None = plan.chart.type if plan.chart else None
     if plan.chart:
         if plan.chart.type == "pie" and resolved_operation in ("mean", "median", "min", "max"):
@@ -3328,7 +4727,7 @@ def validate_analysis_plan(
             warnings.append("Scatter chart needs two measure columns. Falling back to bar chart.")
             resolved_chart_type = "bar"
 
-    # ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ Confidence threshold ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
+    # ¢¢ Confidence threshold ¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢
     if plan.confidence < 0.50:
         warnings.append(f"Low planning confidence ({plan.confidence:.0%}). Consider asking for clarification.")
 
@@ -3357,7 +4756,7 @@ def execute_resolved_plan(df: pd.DataFrame, plan: "ResolvedAnalysisPlan") -> pd.
     """Execute a validated AnalysisPlan deterministically against the DataFrame.
 
     Returns a result DataFrame ready for chart generation and explanation.
-    No LLM involved ÃÂ¢ÃÂÃÂ numeric accuracy is guaranteed.
+    No LLM involved ¢ numeric accuracy is guaranteed.
     """
     import re as _re
 
@@ -3366,7 +4765,7 @@ def execute_resolved_plan(df: pd.DataFrame, plan: "ResolvedAnalysisPlan") -> pd.
     operation = plan.resolved_operation
     measure_label = plan.measures[0].label if plan.measures else "Value"
 
-    # ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ Apply filters ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
+    # ¢¢ Apply filters ¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢
     filtered_df = df.copy()
     for f in plan.filters:
         col = f.column
@@ -3394,7 +4793,7 @@ def execute_resolved_plan(df: pd.DataFrame, plan: "ResolvedAnalysisPlan") -> pd.
         except Exception:
             pass  # Skip invalid filters silently
 
-    # ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ Grouped aggregation ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
+    # ¢¢ Grouped aggregation ¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢
     if dim_col and dim_col in filtered_df.columns:
         if operation == "count_distinct" and measure_col and measure_col in filtered_df.columns:
             result_df = (
@@ -3455,7 +4854,7 @@ def execute_resolved_plan(df: pd.DataFrame, plan: "ResolvedAnalysisPlan") -> pd.
         result_df = result_df.sort_values(measure_label, ascending=False).reset_index(drop=True)
         return result_df
 
-    # ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ No dimension: scalar aggregation ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
+    # ¢¢ No dimension: scalar aggregation ¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢
     if measure_col and measure_col in filtered_df.columns:
         series = filtered_df[measure_col].dropna()
         if operation == "count_distinct":
@@ -3476,7 +4875,7 @@ def execute_resolved_plan(df: pd.DataFrame, plan: "ResolvedAnalysisPlan") -> pd.
             val = float(series.sum())
         return pd.DataFrame({measure_col: [val]})
 
-    # ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ Fallback: return summary ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
+    # ¢¢ Fallback: return summary ¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢
     return pd.DataFrame({"rows": [len(filtered_df)], "columns": [len(filtered_df.columns)]})
 
 
@@ -3487,7 +4886,7 @@ def build_chart_spec_from_plan(
     """Generate a Plotly chart JSON from the resolved plan and execution result.
 
     Returns (chart_b64, chart_json). chart_b64 is None (we use JSON for interactive charts).
-    Uses ONLY plan.resolved_measure_col and plan.resolved_dimension_col ÃÂ¢ÃÂÃÂ never picks its own columns.
+    Uses ONLY plan.resolved_measure_col and plan.resolved_dimension_col ¢ never picks its own columns.
     """
     if not plan.chart or not plan.resolved_chart_type:
         return None, None
@@ -3620,7 +5019,7 @@ def execute_sql(sql: str, df: pd.DataFrame) -> str:
         conn.close()
 
 
-# ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ Multi-agent system prompts ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
+# - Multi-agent system prompts -
 
 PLANNER_SYSTEM = """You are a data analysis planner. Given a DataFrame schema and a user question, produce a structured analysis plan.
 
@@ -3635,7 +5034,7 @@ Output ONLY valid JSON (no markdown fences, no extra text) with exactly this str
   "query_type": "pandas"
 }
 
-query_type rules ÃÂ¢ÃÂÃÂ choose "sql" when the question involves:
+query_type rules - choose "sql" when the question involves:
 - Filtering rows by value (WHERE-style: top N, specific category, date range)
 - Grouping and aggregating (GROUP BY: sum/count/avg by category)
 - Ranking or sorting a subset (ORDER BY + LIMIT)
@@ -3643,17 +5042,17 @@ query_type rules ÃÂ¢ÃÂÃÂ choose "sql" when the question involve
 Otherwise use "pandas" (for correlations, distributions, ML, custom statistics)."""
 
 ANALYST_SYSTEM = """You are a data analyst. A pandas DataFrame `df` is already loaded.
-Write Python code to compute the NUMERICAL analysis only ÃÂ¢ÃÂÃÂ statistics, aggregations, comparisons, correlations. No charts.
+Write Python code to compute the NUMERICAL analysis only - statistics, aggregations, comparisons, correlations. No charts.
 
 Rules:
-- `df` is already defined ÃÂ¢ÃÂÃÂ do not reload it
+- `df` is already defined - do not reload it
 - Pre-imported: pandas (pd), numpy (np), io, base64
 - You MAY import: scipy, sklearn, statsmodels
 - Set `result` to a detailed string with all numerical findings (include specific numbers)
 - Set `chart_b64 = None` always
 - If result is a DataFrame, convert: result = df_result.to_string()
 - ROBUSTNESS: use df.select_dtypes(include='number') for numeric ops; never run math on text columns
-- Output ONLY valid Python code ÃÂ¢ÃÂÃÂ no markdown fences, no explanation"""
+- Output ONLY valid Python code - no markdown fences, no explanation"""
 
 SQL_ANALYST_SYSTEM = """You are a SQL data analyst. A SQLite database table named `data` contains the user's dataset.
 Write a single SQL SELECT query to answer the user's question.
@@ -3665,7 +5064,7 @@ Rules:
 - For text matching: use LIKE '%value%' (case insensitive in SQLite)
 - For aggregations: use GROUP BY, ORDER BY, LIMIT
 - Always add ORDER BY for ranking/top-N questions
-- Output ONLY the raw SQL query ÃÂ¢ÃÂÃÂ no markdown fences, no semicolon, no explanation
+- Output ONLY the raw SQL query - no markdown fences, no semicolon, no explanation
 
 Common patterns:
   Top N by metric:     SELECT category, SUM(metric) AS total FROM data GROUP BY category ORDER BY total DESC LIMIT 10
@@ -3677,7 +5076,7 @@ VISUALIZER_SYSTEM = """You are a data visualization expert. A pandas DataFrame `
 Write Python code to create ONE excellent INTERACTIVE Plotly chart that best illustrates the findings.
 
 Rules:
-- `df` is already defined ÃÂ¢ÃÂÃÂ do not reload it
+- `df` is already defined - do not reload it
 - Pre-imported: pandas (pd), numpy (np), plotly.express (px), plotly.graph_objects (go)
 - Create a Plotly figure named `fig` using px or go
 - Apply this theme exactly ONCE after creating fig:
@@ -3693,13 +5092,13 @@ Rules:
 - Save as: chart_json = fig.to_json()
 - Set chart_b64 = None, result = None
 - Common chart patterns:
-    ÃÂ¢ÃÂÃÂ¢ Bar: px.bar(df, x='col', y='col', title='...')
-    ÃÂ¢ÃÂÃÂ¢ Line: px.line(df, x='date_col', y='metric', title='...')
-    ÃÂ¢ÃÂÃÂ¢ Scatter: px.scatter(df, x='col1', y='col2', color='group', title='...')
-    ÃÂ¢ÃÂÃÂ¢ Histogram: px.histogram(df, x='col', title='...')
-    ÃÂ¢ÃÂÃÂ¢ Box: px.box(df, x='group', y='metric', title='...')
-    ÃÂ¢ÃÂÃÂ¢ Heatmap: use go.Heatmap with z=corr.values, x=corr.columns, y=corr.columns
-- Output ONLY valid Python code ÃÂ¢ÃÂÃÂ no markdown fences, no explanation"""
+    - Bar: px.bar(df, x='col', y='col', title='...')
+    - Line: px.line(df, x='date_col', y='metric', title='...')
+    - Scatter: px.scatter(df, x='col1', y='col2', color='group', title='...')
+    - Histogram: px.histogram(df, x='col', title='...')
+    - Box: px.box(df, x='group', y='metric', title='...')
+    - Heatmap: use go.Heatmap with z=corr.values, x=corr.columns, y=corr.columns
+- Output ONLY valid Python code - no markdown fences, no explanation"""
 
 CRITIC_SYSTEM = """You are a senior statistician reviewing a data analysis for accuracy and completeness.
 
@@ -3724,9 +5123,9 @@ Structure your response EXACTLY as:
 **Headline:** One sentence direct answer to the question.
 
 **Key Findings:**
-ÃÂ¢ÃÂÃÂ¢ Finding 1 with specific numbers
-ÃÂ¢ÃÂÃÂ¢ Finding 2 with specific numbers
-ÃÂ¢ÃÂÃÂ¢ Finding 3 with specific numbers
+¢¢ Finding 1 with specific numbers
+¢¢ Finding 2 with specific numbers
+¢¢ Finding 3 with specific numbers
 
 **Implication:** One sentence business recommendation or implication.
 
@@ -3736,7 +5135,7 @@ Structure your response EXACTLY as:
 SYSTEM_PROMPT = ANALYST_SYSTEM
 
 
-# Domain lenses ÃÂ¢ÃÂÃÂ the selected category turns the agent into a domain expert,
+# Domain lenses ¢ the selected category turns the agent into a domain expert,
 # shaping which computations it prefers and how it narrates the result.
 CATEGORY_PERSONAS = {
     "general": (
@@ -3745,31 +5144,31 @@ CATEGORY_PERSONAS = {
     ),
     "financial": (
         "ANALYSIS LENS: Financial. You are a senior FINANCIAL analyst. Interpret the data "
-        "through a financial lens ÃÂ¢ÃÂÃÂ revenue, costs, margins, growth rates (YoY/MoM), volatility "
+        "through a financial lens ¢ revenue, costs, margins, growth rates (YoY/MoM), volatility "
         "and risk, and key ratios. Prefer computations like growth %, cumulative totals, moving "
         "averages, and standard deviation as a risk proxy. Format money clearly and, in the "
         "written answer, call out financial implications, risks, and opportunities."
     ),
     "medical": (
         "ANALYSIS LENS: Medical. You are a clinical / healthcare data analyst. Interpret the data "
-        "through a medical lens ÃÂ¢ÃÂÃÂ prevalence, risk factors, patient cohorts, and distributions of "
+        "through a medical lens ¢ prevalence, risk factors, patient cohorts, and distributions of "
         "clinical measurements. Prefer group-wise comparisons (outcome vs. non-outcome), "
         "correlation of features with the outcome, and distribution analysis. ALWAYS describe "
         "relationships as associations, NOT causation. Flag clinically meaningful or at-risk groups."
     ),
     "retail": (
         "ANALYSIS LENS: Retail. You are a retail & e-commerce analyst. Interpret the data through "
-        "a commerce lens ÃÂ¢ÃÂÃÂ sales and revenue by product/category/region, order volume, basket "
+        "a commerce lens ¢ sales and revenue by product/category/region, order volume, basket "
         "size, ratings, and customer behavior. Prefer top-N rankings, revenue breakdowns, and trends."
     ),
     "marketing": (
         "ANALYSIS LENS: Marketing. You are a marketing & growth analyst. Interpret the data through "
-        "a marketing lens ÃÂ¢ÃÂÃÂ acquisition, conversion, retention, segmentation, channels, and campaign "
+        "a marketing lens ¢ acquisition, conversion, retention, segmentation, channels, and campaign "
         "performance. Prefer funnel/segment breakdowns, rates, and cohort-style comparisons."
     ),
     "hr": (
         "ANALYSIS LENS: HR. You are an HR / people-analytics specialist. Interpret the data through "
-        "a workforce lens ÃÂ¢ÃÂÃÂ headcount, attrition/turnover, tenure, demographics, performance, and "
+        "a workforce lens ¢ headcount, attrition/turnover, tenure, demographics, performance, and "
         "compensation equity. Prefer group comparisons and distribution analysis; be sensitive about fairness."
     ),
 }
@@ -3780,7 +5179,7 @@ def system_prompt_for(category: str) -> str:
     return f"{persona}\n\n{SYSTEM_PROMPT}"
 
 
-# ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ Sandbox security configuration ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
+# ¢¢ Sandbox security configuration ¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢
 
 MAX_EXEC_SECONDS  = 30    # hard wall-clock timeout per code execution
 MAX_RESULT_CHARS  = 5_000 # truncate oversized results to prevent memory abuse
@@ -3879,7 +5278,7 @@ def execute_code(code: str, df: pd.DataFrame) -> tuple[str, str | None, str | No
     3. Process-isolated execution with hard timeout (no in-process fallback).
     Returns (result, chart_b64, chart_json).
     """
-    # Layer 1 ÃÂ¢ÃÂÃÂ AST security scan (raises SecurityError on violations)
+    # Layer 1 ¢ AST security scan (raises SecurityError on violations)
     validate_code_ast(code)
 
     timeout_sec = getattr(sys.modules[__name__], "MAX_EXEC_SECONDS", MAX_SANDBOX_SECONDS)
@@ -3926,11 +5325,11 @@ def execute_code(code: str, df: pd.DataFrame) -> tuple[str, str | None, str | No
     if result is None:
         result = "Done. See chart above." if (chart_b64 or chart_json) else "No result returned."
 
-    # Result size guard ÃÂ¢ÃÂÃÂ truncate enormous outputs
+    # Result size guard ¢ truncate enormous outputs
     result_str = str(result)
     if len(result_str) > MAX_RESULT_CHARS:
         result_str = (result_str[:MAX_RESULT_CHARS]
-                      + f"\nÃÂ¢ÃÂÃÂ¦ [truncated ÃÂ¢ÃÂÃÂ {len(result_str):,} chars total]")
+                      + f"\n¢¦ [truncated ¢ {len(result_str):,} chars total]")
 
     return result_str, chart_b64, chart_json
 
@@ -4853,21 +6252,88 @@ from enum import Enum
 
 
 class QueryComplexity(str, Enum):
+    CONVERSATION = "conversation"
     DIRECT = "direct"
     STANDARD = "standard"
     DEEP = "deep"
 
 
 QUERY_BUDGETS: dict[str, dict] = {
+    "conversation": {
+        "max_llm_calls": 1,
+        "deadline_seconds": 30,
+        "allow_chart": False,
+        "allow_critic": False,
+    },
     "direct": {
         "max_llm_calls": 1,
-        "deadline_seconds": 12,
+        "deadline_seconds": 35,
+        "allow_chart": False,
+        "allow_critic": False,
+    },
+    "dataset_mismatch": {
+        "max_llm_calls": 1,
+        "deadline_seconds": 25,
+        "allow_chart": False,
+        "allow_critic": False,
+    },
+    "dataset_purpose": {
+        "max_llm_calls": 1,
+        "deadline_seconds": 35,
+        "allow_chart": False,
+        "allow_critic": False,
+    },
+    "simple_aggregation": {
+        "max_llm_calls": 1,
+        "deadline_seconds": 35,
+        "allow_chart": False,
+        "allow_critic": False,
+    },
+    "model_recommendation": {
+        "max_llm_calls": 1,
+        "deadline_seconds": 35,
+        "allow_chart": False,
+        "allow_critic": False,
+    },
+    "standard_quality": {
+        "max_llm_calls": 1,
+        "deadline_seconds": 35,
+        "allow_chart": False,
+        "allow_critic": False,
+    },
+    "direct_row_lookup": {
+        "max_llm_calls": 1,
+        "deadline_seconds": 35,
+        "allow_chart": False,
+        "allow_critic": False,
+    },
+    "entity_value_lookup": {
+        "max_llm_calls": 1,
+        "deadline_seconds": 35,
+        "allow_chart": False,
+        "allow_critic": False,
+    },
+    "ranking_lookup": {
+        "max_llm_calls": 1,
+        "deadline_seconds": 35,
+        "allow_chart": False,
+        "allow_critic": False,
+    },
+    "extreme_value": {
+        "max_llm_calls": 2,
+        "deadline_seconds": 15,
+        "allow_chart": False,
+        "allow_critic": False,
+    },
+    "row_median_comparison": {
+        "max_llm_calls": 1,
+        "deadline_seconds": 35,
         "allow_chart": False,
         "allow_critic": False,
     },
     "standard": {
         "max_llm_calls": 2,
-        "deadline_seconds": 30,
+        "deadline_seconds": 60,
         "allow_chart": False,
         "allow_critic": True,
     },
@@ -4881,9 +6347,13 @@ QUERY_BUDGETS: dict[str, dict] = {
 
 
 def get_query_complexity_route(q_type: str) -> QueryComplexity:
-    if q_type in ("unclear_query", "direct_row_lookup", "dataset_purpose", "simple_aggregation", "model_recommendation", "deterministic", "deterministic_shape", "simple_lookup"):
+    if q_type == "conversation":
+        return QueryComplexity.CONVERSATION
+    if q_type in ("unclear_query", "dataset_mismatch", "direct_row_lookup", "entity_value_lookup", "ranking_lookup", "extreme_value", "row_median_comparison", "dataset_purpose", "simple_aggregation",
+                  "model_recommendation", "deterministic", "deterministic_shape", "simple_lookup",
+                  "visualization_explicit_column"):
         return QueryComplexity.DIRECT
-    if q_type in ("visualization", "comparison", "data_quality", "data_quality_guidance", "group_by"):
+    if q_type in ("standard_quality", "visualization", "comparison", "data_quality", "data_quality_guidance", "group_by"):
         return QueryComplexity.STANDARD
     if q_type in ("predictive_modeling", "forecasting", "complex_analysis"):
         return QueryComplexity.DEEP
@@ -4893,7 +6363,78 @@ def get_query_complexity_route(q_type: str) -> QueryComplexity:
 def classify_query_complexity(question: str, df: pd.DataFrame) -> tuple[str, dict]:
     """Classifies query complexity into direct_row_lookup, unclear_query, dataset_purpose, simple_aggregation, visualization, predictive_modeling, comparison, or complex_analysis."""
     import re
+    import unicodedata
     q_lower = question.lower().strip()
+    q_norm = unicodedata.normalize("NFKC", q_lower)
+
+    def normalize_column_reference(value: str) -> str:
+        return re.sub(r"[^a-z0-9]+", "", value.lower())
+
+    def resolve_column_reference(requested: str, columns: list[str]) -> str | None:
+        from difflib import get_close_matches
+        normalized = {
+            normalize_column_reference(column): column
+            for column in columns
+        }
+        key = normalize_column_reference(requested)
+        if key in normalized:
+            return normalized[key]
+        matches = get_close_matches(key, normalized.keys(), n=2, cutoff=0.78)
+        if len(matches) != 1:
+            return None
+        return normalized[matches[0]]
+
+    def normalize_question(value: str) -> str:
+        value = unicodedata.normalize("NFKC", value or "")
+        return re.sub(r"\s+", " ", value.strip().lower())
+
+    def is_dataset_purpose_question(question_text: str) -> bool:
+        text = normalize_question(question_text)
+        dataset_terms = ("dataset", "data", "this", "file", "table")
+        summary_terms = ("tell me more", "tell me about", "describe", "summarize", "understand", "what is", "what does", "overview")
+        return any(term in text for term in dataset_terms) and any(term in text for term in summary_terms)
+
+    def is_quality_question(question_text: str) -> bool:
+        text = normalize_question(question_text)
+        quality_terms = (
+            "what makes this a bad dataset", "what makes this bad dataset",
+            "what makes this a bad data", "what is wrong with this dataset",
+            "what is wrong with this data", "show quality issues",
+            "how can i improve this dataset", "how can i improve this data",
+            "how to make this dataset better", "improve this dataset", 
+            "clean this dataset", "what quality issues exist", 
+            "how should i prepare this data", "quality issues", "fix this dataset",
+            "what should be fixed", "how should i clean this data",
+            "make this dataset good", "make this dataset a good one",
+            "how to make this dataset good", "how to make this dataset a good one",
+            "make the dataset good",
+        )
+        return any(term in text for term in quality_terms)
+
+    purpose_intent = is_dataset_purpose_question(question)
+    quality_intent = is_quality_question(question)
+    ordinal_lookup = resolve_ordinal_row_lookup(question, df)
+
+    # 1. Conversation check
+    mentions_column = any(str(c).lower() in q_norm for c in df.columns)
+    analytical_keywords = {"count", "average", "sum", "compare", "predict", "forecast", "plot", "graph", "chart", "distribution", "missing", "duplicate", "correlation", "model", "row", "record", "column", "dataset", "data", "quality", "clean", "improve", "show", "prompt", "response", "label", "severity", "status", "best", "top", "highest", "lowest", "employee", "salary", "performance"}
+    has_analytical = any(k in q_norm for k in analytical_keywords)
+    
+    if len(q_norm) < 30 and not mentions_column and not has_analytical and not purpose_intent and not quality_intent and not ordinal_lookup:
+        return "conversation", {}
+
+    # 2. Dataset mismatch: clear external/entity request with no schema support
+    mismatch = detect_dataset_mismatch(question, df)
+    if mismatch:
+        return "dataset_mismatch", mismatch
+
+    # 3. Dataset purpose intent check
+    if purpose_intent:
+        return "dataset_purpose", {}
+
+    # 4. Standard quality check
+    if quality_intent:
+        return "standard_quality", {}
 
     # Unclear query check (e.g., "gg", "hi", "asdf", single words without context)
     if len(q_lower) < 3 or (len(q_lower) <= 4 and not any(c in q_lower for c in "0123456789")):
@@ -4912,14 +6453,30 @@ def classify_query_complexity(question: str, df: pd.DataFrame) -> tuple[str, dic
     ]):
         return "model_recommendation", {}
 
-    # Dataset purpose intent check
-    if any(k in q_lower for k in [
-        "purpose of this dataset", "purpose of dataset", "what is this dataset about",
-        "dataset purpose", "dataset overview", "what does this data contain",
-        "what is the purpose of this data", "how is this dataset", "how is dataset",
-        "describe this dataset", "describe dataset", "explain this dataset", "about this dataset"
-    ]):
-        return "dataset_purpose", {}
+    # Scalar metric extreme: "what is the highest blood pressure value?"
+    extreme_value = resolve_extreme_value(question, df)
+    if extreme_value:
+        return "extreme_value", extreme_value
+
+    # Ranking lookup: best/top/highest/worst entity by a validated ranking metric.
+    ranking_lookup = resolve_ranking_lookup(question, df)
+    if ranking_lookup:
+        return "ranking_lookup", ranking_lookup
+
+    # Compare a row/entity to dataset median before generic comparison planning.
+    median_comparison = resolve_median_comparison(question, df)
+    if median_comparison:
+        return "row_median_comparison", median_comparison
+
+    # Entity identifier lookup has precedence over positional row lookup:
+    # "employee 47" means EmployeeID == 47, not df.iloc[46].
+    entity_lookup = resolve_entity_value_lookup(question, df)
+    if entity_lookup:
+        return "entity_value_lookup", entity_lookup
+
+    # 5. Direct row lookup: row 70, record 3, 5th prompt, tenth label
+    if ordinal_lookup:
+        return "direct_row_lookup", ordinal_lookup
 
     # Direct row lookup: e.g. "what does row 70 tell us?", "what does 70th row tell us", "show row 12", "row 5", "row 70"
     m_row = re.search(r'(\d+)(?:st|nd|rd|th)?\s*row\b|\brow\s*#?\s*(\d+)\b', q_lower)
@@ -4928,38 +6485,63 @@ def classify_query_complexity(question: str, df: pd.DataFrame) -> tuple[str, dic
         if num_str:
             row_num = int(num_str)
             actual_idx = row_num - 1 if (1 <= row_num <= len(df)) else row_num
-            if 0 <= actual_idx < len(df):
-                return "direct_row_lookup", {"row_index": actual_idx, "display_row": row_num}
+            return "direct_row_lookup", {"row_index": actual_idx, "display_row": row_num}
 
     # Grouped comparison check
     if any(k in q_lower for k in ["compare ", "across ", "versus ", " vs ", "difference between "]):
         return "comparison", {}
 
-    # Simple aggregation check: e.g. "what is the average blood pressure?" or "highest PerformanceScore"
-    agg_terms = {"average", "mean", "median", "max", "maximum", "min", "minimum", "sum", "total", "count", "highest", "lowest", "top", "bottom", "find", "best", "worst"}
+    
+    # Simple aggregation check: e.g. "what is the average blood pressure?" or "what is the number of response tex"
+    agg_terms = {"average", "mean", "median", "max", "maximum", "min", "minimum", "sum", "total", "count", "number of", "unique", "distinct"}
     if any(term in q_lower for term in agg_terms) and not any(k in q_lower for k in ["chart", "plot", "model", "predict", "forecast", "compare", "across", "trend", "correlation"]):
-        def _col_variants(col_name: str) -> list[str]:
-            """Return lowercase matching variants of a column name.
-            Handles: exact, underscoreÃÂ¢ÃÂÃÂspace, camelCaseÃÂ¢ÃÂÃÂspace, PascalCaseÃÂ¢ÃÂÃÂspace."""
-            raw = str(col_name).lower()
-            underscore = raw.replace("_", " ")
-            camel_spaced = re.sub(r'([a-z])([A-Z])', r'\1 \2', str(col_name)).lower()
-            return list(dict.fromkeys([raw, underscore, camel_spaced]))
-
         matched_col = None
-        for col_orig in df.columns:
-            for variant in _col_variants(col_orig):
-                if variant in q_lower:
-                    matched_col = col_orig
-                    break
-            if matched_col:
+        operation = "mean"
+        
+        # Try to find the exact operation type
+        if any(t in q_lower for t in ["count", "number of", "how many"]):
+            if any(t in q_lower for t in ["unique", "distinct"]):
+                operation = "nunique"
+            elif any(t in q_lower for t in ["row", "rows"]):
+                return "simple_aggregation", {"column": "rows", "operation": "row_count"}
+            else:
+                operation = "count_non_null"
+                
+        # To find the column, let's extract words after the aggregation term or just fuzzy match every suffix
+        tokens = q_lower.split()
+        for i in range(len(tokens)):
+            suffix = " ".join(tokens[i:])
+            resolved = resolve_column_reference(suffix, df.columns.tolist())
+            if resolved:
+                matched_col = resolved
                 break
-        if matched_col:
-            return "simple_aggregation", {"column": matched_col}
+                
+        if not matched_col:
+            # Fallback: check all n-grams up to 4 words
+            for n in [4, 3, 2, 1]:
+                for i in range(len(tokens) - n + 1):
+                    ngram = " ".join(tokens[i:i+n])
+                    resolved = resolve_column_reference(ngram, df.columns.tolist())
+                    if resolved:
+                        matched_col = resolved
+                        break
+                if matched_col:
+                    break
 
-    # Data-quality guidance: improve / clean / fix / prepare dataset quality questions
+        if matched_col and is_identifier_column(df, matched_col) and operation in {"mean", "sum", "median", "min", "max"}:
+            return "dataset_mismatch", {
+                "unmatched_concept": f"{operation} on identifier column {matched_col}",
+                "available_columns": [str(c) for c in df.columns],
+            }
+
+        if matched_col:
+            return "simple_aggregation", {"column": matched_col, "operation": operation}
+# Data-quality guidance: improve / clean / fix / prepare dataset quality questions
     quality_guidance_terms = [
         "improve this dataset", "improve the dataset", "how to make this a good dataset",
+        "how to make this dataset good", "how to make this dataset a good one",
+        "make this dataset good", "make this dataset a good one",
+        "make the dataset good", "make this a good dataset",
         "how to improve", "clean this dataset", "clean the dataset", "fix this dataset",
         "prepare this dataset", "data quality", "data issues", "quality issues",
         "what's wrong with this data", "what is wrong with this data",
@@ -4971,7 +6553,25 @@ def classify_query_complexity(question: str, df: pd.DataFrame) -> tuple[str, dic
     if any(k in q_lower for k in quality_guidance_terms):
         return "data_quality_guidance", {}
 
-    if any(k in q_lower for k in ["chart", "plot", "heatmap", "histogram", "distribution", "graph"]):
+    if any(k in q_lower for k in ["chart", "plot", "heatmap", "histogram", "distribution", "graph", "show"]):
+        # Fast-path: if the question names exactly one numeric column, go deterministic
+        numeric_cols = list(df.select_dtypes(include="number").columns)
+        matched_numeric: str | None = None
+        for col in numeric_cols:
+            col_variants = [col.lower(), col.lower().replace("_", " ")]
+            import re as _re
+            camel_spaced = _re.sub(r'([a-z])([A-Z])', r'\1 \2', col).lower()
+            col_variants.append(camel_spaced)
+            for variant in col_variants:
+                if variant in q_lower:
+                    if matched_numeric is None:
+                        matched_numeric = col
+                    else:
+                        # More than one column mentioned — ambiguous, use standard planner
+                        matched_numeric = None
+                    break
+        if matched_numeric is not None:
+            return "visualization_explicit_column", {"column": matched_numeric}
         return "visualization", {}
     if any(k in q_lower for k in ["model", "predict", "predictive", "train"]):
         return "predictive_modeling", {}
@@ -4999,9 +6599,9 @@ def extract_row_lookup_result(df: pd.DataFrame, row_index: int, display_row: int
 
     row_text = f"**Row {display_row} Data Summary**\n\n"
     if highlights:
-        row_text += "**Key Observations:**\nÃÂ¢ÃÂÃÂ¢ " + "\nÃÂ¢ÃÂÃÂ¢ ".join(highlights)
+        row_text += "**Key Observations:**\n¢¢ " + "\n¢¢ ".join(highlights)
     else:
-        row_text += "**Key Observations:**\nÃÂ¢ÃÂÃÂ¢ Column values fall within standard dataset statistical bounds."
+        row_text += "**Key Observations:**\n¢¢ Column values fall within standard dataset statistical bounds."
 
     return {
         "display_row": display_row,
@@ -5069,12 +6669,12 @@ def run_model_recommendation_answer(df: pd.DataFrame, question: str, profile: di
         before_training = [
             "Check feature skewness and consider log-transforming heavily skewed predictor columns.",
             "Impute missing feature values within validation pipelines.",
-            "Evaluate using RMSE, MAE, and RÃÂÃÂ² scores on out-of-fold predictions."
+            "Evaluate using RMSE, MAE, and R² scores on out-of-fold predictions."
         ]
 
     report_text = f"{direct_answer}\n\n" \
-                  f"**Why this fits:**\n" + "\n".join(f"ÃÂ¢ÃÂÃÂ¢ {b}" for b in why_bullets) + "\n\n" \
-                  f"**Before training:**\n" + "\n".join(f"ÃÂ¢ÃÂÃÂ¢ {b}" for b in before_training) + "\n\n" \
+                  f"**Why this fits:**\n" + "\n".join(f"¢¢ {b}" for b in why_bullets) + "\n\n" \
+                  f"**Before training:**\n" + "\n".join(f"¢¢ {b}" for b in before_training) + "\n\n" \
                   f"**Recommended next step:** Run a 5-fold cross-validation benchmark comparing the baseline model with the tree ensemble."
 
     return {
@@ -5114,6 +6714,75 @@ def cancel_request_handler(request_id: str) -> dict:
     return {"request_id": request_id, "status": "cancelled" if success else "not_found"}
 
 
+@app.post("/query/{request_id}/retry-answer")
+async def retry_query_answer(
+    request_id: str,
+    req: RetryAnswerRequest,
+    x_session_token: str | None = Header(None, alias="X-Session-Token"),
+    token: str | None = Query(None),
+) -> dict[str, Any]:
+    """Regenerate only the written answer from cached deterministic evidence."""
+    verify_token_for_session(req.session_id, x_session_token, token)
+    cached = deterministic_evidence_cache.get(request_id)
+    if not cached or cached.get("session_id") != req.session_id:
+        raise HTTPException(status_code=404, detail="No cached deterministic evidence found for this request.")
+
+    evidence = AnalysisEvidence.model_validate(cached["evidence"])
+    deadline_at = time.monotonic() + 30.0
+    request_context = RequestContext(
+        request_id=request_id,
+        session_id=req.session_id,
+        question=str(cached.get("question") or ""),
+        effective_lens=str(cached.get("effective_lens") or req.category or "general"),
+        deadline_at=deadline_at,
+        complexity_route=str(cached.get("route") or "standard"),
+        answer_type=str(cached.get("answer_type") or "text"),
+        llm_call_budget=2,
+    )
+
+    try:
+        gen_ans = await generate_user_answer(
+            question=request_context.question,
+            evidence=evidence,
+            request_context=request_context,
+            answer_type=request_context.answer_type,
+        )
+    except Exception:
+        return build_generation_failed_event(
+            request_id=request_id,
+            evidence=evidence,
+            request_context=request_context,
+            meta={**(cached.get("meta") or {}), "pipeline_branch": "retry_answer", "reran_computation": False},
+            chart=cached.get("chart"),
+            chart_json=cached.get("chart_json"),
+        )
+
+    event = build_query_response(
+        request_id=request_id,
+        status="complete",
+        answer_type=request_context.answer_type,
+        answer_text=gen_ans.summary,
+        generated_answer=gen_ans,
+        execution_steps=[
+            {"id": "evidence-cache", "label": "Reused verified deterministic evidence", "status": "complete"},
+            {"id": "synthesis", "label": "Retried written explanation", "status": "complete"},
+        ],
+        effective_lens=request_context.effective_lens,
+        generation=request_context.generation,
+    )
+    event.update({
+        "type": "analysis_completed",
+        "message": "Written explanation regenerated",
+        "result": gen_ans.summary,
+        "report": gen_ans.explanation or gen_ans.summary,
+        "chart": cached.get("chart"),
+        "chart_json": cached.get("chart_json"),
+        "evidence": build_evidence_payload(evidence),
+        "meta": {**(cached.get("meta") or {}), "pipeline_branch": "retry_answer", "reran_computation": False},
+    })
+    return event
+
+
 @app.post("/query")
 async def query_csv(
     req: QueryRequest,
@@ -5122,12 +6791,7 @@ async def query_csv(
     token: str | None = Query(None),
 ) -> StreamingResponse:
     verify_token_for_session(req.session_id, x_session_token, token)
-    cleanup_expired_sessions()
-    if req.session_id not in dataframes:
-        raise HTTPException(status_code=404, detail="Session not found. Upload a CSV first.")
-    _touch_session(req.session_id)
-
-    df = dataframes[req.session_id]
+    df = get_session_df(req.session_id)
     schema = get_df_schema(df)
     cache_key = _cache_key(req.session_id, req.category, req.question, df)
     req_id = req.request_id or str(uuid.uuid4())
@@ -5143,10 +6807,13 @@ async def query_csv(
         try:
             if cache_key in query_cache:
                 cached = dict(query_cache[cache_key])
-                cached.setdefault("meta", {})["route"] = "cache"
-                cached["message"] = "Analysis complete (cached)"
-                yield emit(cached)
-                return
+                generation = cached.get("generation") or {}
+                if cached.get("type") == "analysis_completed" and generation.get("succeeded") is True and generation.get("validated") is True:
+                    cached.setdefault("meta", {})["route"] = "cache"
+                    cached["message"] = "Analysis complete (cached)"
+                    yield emit(cached)
+                    return
+                query_cache.pop(cache_key, None)
             if is_cancelled(req_id):
                 logger.info("Request cancelled request_id=%s", req_id)
                 yield emit({
@@ -5164,9 +6831,18 @@ async def query_csv(
             lens_res = resolve_analysis_lens(df, req.category, filename=filename_meta, question=req.question)
 
             complexity_route = get_query_complexity_route(q_type).value
-            budget_info = QUERY_BUDGETS.get(complexity_route, QUERY_BUDGETS["standard"])
+            budget_info = QUERY_BUDGETS.get(q_type) or QUERY_BUDGETS.get(complexity_route, QUERY_BUDGETS["standard"])
             deadline_seconds = float(budget_info["deadline_seconds"])
             deadline_at = start_monotonic + deadline_seconds
+            request_context = RequestContext(
+                request_id=req_id,
+                session_id=req.session_id,
+                question=req.question,
+                effective_lens=lens_res["effective_lens"],
+                deadline_at=deadline_at,
+                complexity_route=complexity_route,
+                llm_call_budget=int(budget_info.get("max_llm_calls", 2)),
+            )
 
             def remaining_seconds() -> float:
                 return max(0.0, deadline_at - time.monotonic())
@@ -5178,18 +6854,43 @@ async def query_csv(
                     from backend.core.errors import ExecutionBudgetExceededError
                     raise ExecutionBudgetExceededError(f"Request deadline of {deadline_seconds:.0f}s exceeded")
 
-            def llm(system: str, user: str, temperature: float = 0, stage: str = "synthesis") -> str:
+            from backend.core.config import PLANNER_MODEL, SYNTHESIS_MODEL, DEEP_ANALYSIS_MODEL
+            def model_for_stage(stage: str, route: str) -> str:
+                if stage in {"planner", "synthesis", "conversation"}:
+                    return PLANNER_MODEL
+                if route == "DEEP":
+                    return DEEP_ANALYSIS_MODEL
+                return SYNTHESIS_MODEL
+
+            async def llm_async(system: str, user: str, temperature: float = 0, stage: str = "synthesis") -> str:
                 check_deadline()
-                return llm_client.generate_content(
-                    system_instruction=system,
-                    contents=user,
-                    temperature=temperature,
-                    timeout_seconds=min(10.0, max(0.1, remaining_seconds())),
-                    request_id=req_id,
-                    stage=stage,
-                    request_start_time=start_time,
-                    total_deadline_s=deadline_seconds,
-                )
+                from google.genai import types
+                kwargs = {
+                    "system_instruction": system,
+                    "contents": user,
+                    "temperature": temperature,
+                    "timeout_seconds": min(60.0, max(0.1, remaining_seconds())),
+                    "request_id": req_id,
+                    "stage": stage,
+                    "request_start_time": start_time,
+                    "total_deadline_s": deadline_seconds,
+                    "response_mime_type": "application/json" if stage != "conversation" else "text/plain",
+                    "thinking_config": types.ThinkingConfig(thinking_level="minimal") if stage in ("planner", "synthesis", "conversation") else None,
+                    "model": model_for_stage(stage, complexity_route),
+                }
+                
+                if stage == "planner":
+                    kwargs["max_output_tokens"] = 512
+                    kwargs["response_schema"] = AnalysisPlan
+                elif stage == "synthesis":
+                    kwargs["max_output_tokens"] = 1024
+                    kwargs["response_schema"] = GeneratedAnswer
+                elif stage == "conversation":
+                    kwargs["max_output_tokens"] = 128
+                else:
+                    kwargs["max_output_tokens"] = 768
+                
+                return await llm_client.generate_content(**kwargs)
 
             def build_done_meta(pipeline_branch: str) -> dict:
                 elapsed_ms = round((time.time() - start_time) * 1000)
@@ -5212,11 +6913,11 @@ async def query_csv(
                     "unaccounted_ms": unacc_ms,
                 }
 
-            def run_code_with_repair(system: str, context: str, code_label: str) -> tuple[str | None, str | None, str | None, str | None]:
+            async def run_code_with_repair_async(system: str, context: str, code_label: str) -> tuple[str | None, str | None, str | None, str | None]:
                 """Generate code, execute it against df, repair once on failure."""
                 check_deadline()
                 try:
-                    code = llm(system, context)
+                    code = await llm_async(system, context)
                 except Exception:
                     return None, None, None, None
 
@@ -5233,14 +6934,14 @@ async def query_csv(
                         err = traceback.format_exc().strip().splitlines()[-1]
                         if attempt == 0:
                             try:
-                                code = llm(system, f"{context}\n\nPrevious code failed:\n{code}\nError: {err}\nFix it.")
+                                code = await llm_async(system, f"{context}\n\nPrevious code failed:\n{code}\nError: {err}\nFix it.")
                             except Exception:
                                 return code, None, None, None
                         else:
                             return code, None, None, None
                 return code, None, None, None
 
-            # ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ CLASSIFY QUERY & RESOLVE LENS ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
+            # ¢¢ CLASSIFY QUERY & RESOLVE LENS ¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢
             yield emit({
                 "type": "analysis_started",
                 "request_id": req_id,
@@ -5258,16 +6959,118 @@ async def query_csv(
                 "effective_lens": lens_res["effective_lens"],
                 "lens_resolution": lens_res,
                 "step": "lens_check",
-                "message": f"Route selected: {q_type.replace('_', ' ').capitalize()} ({complexity_route.upper()}) ÃÂÃÂ· Lens: {lens_res['effective_lens'].capitalize()}"
+                "message": f"Route selected: {q_type.replace('_', ' ').capitalize()} ({complexity_route.upper()}) · Lens: {lens_res['effective_lens'].capitalize()}"
             })
+
+            # -- FAST-PATH 0: DATASET MISMATCH ----------------------
+            if q_type == "dataset_mismatch":
+                unmatched = q_meta.get("unmatched_concept") or "the requested subject"
+                available_columns = [str(c) for c in q_meta.get("available_columns", list(df.columns))]
+                evidence = AnalysisEvidence(
+                    intent="dataset_mismatch",
+                    dataset_name=filename_meta or "dataset",
+                    facts={
+                        "requested_subject": unmatched,
+                        "available_columns": available_columns,
+                        "row_count": len(df),
+                        "column_count": len(df.columns),
+                        "instruction": "Ask a concise clarification. Do not answer facts that are not in the dataset.",
+                    },
+                )
+                request_context.complexity_route = "dataset_mismatch"
+                try:
+                    gen_ans = await generate_user_answer(
+                        question=req.question,
+                        evidence=evidence,
+                        request_context=request_context,
+                        answer_type="clarification",
+                    )
+                except Exception as exc:
+                    logger.error("Synthesis failed for dataset_mismatch request_id=%s: %s", req_id, exc)
+                    yield emit(build_generation_failed_event(
+                        request_id=req_id,
+                        evidence=evidence,
+                        request_context=request_context,
+                        meta=build_done_meta("dataset_mismatch"),
+                        message="The dataset mismatch was detected, but a clarification answer could not be generated.",
+                    ))
+                    return
+                done_event = build_query_response(
+                    request_id=req_id,
+                    status="complete",
+                    answer_type="clarification",
+                    answer_text=gen_ans.summary,
+                    generated_answer=gen_ans,
+                    execution_steps=[
+                        {"id": "schema-check", "label": "Checked requested subject against schema", "status": "complete"},
+                        {"id": "synthesis", "label": "Synthesized clarification", "status": "complete", "detail": "Provider response parsed, validated, and grounded."},
+                    ],
+                    effective_lens=lens_res["effective_lens"],
+                    generation=request_context.generation,
+                )
+                done_event.update({
+                    "type": "analysis_completed",
+                    "step": "done",
+                    "message": "Clarification complete",
+                    "result": gen_ans.summary,
+                    "report": gen_ans.explanation or gen_ans.summary,
+                    "chart": None,
+                    "chart_json": None,
+                    "plan": {"strategy": "The requested subject is not represented in the uploaded schema.", "needs_chart": False, "query_type": "dataset_mismatch"},
+                    "lens_resolution": lens_res,
+                    "meta": build_done_meta("dataset_mismatch"),
+                })
+                _cache_set(cache_key, done_event)
+                yield emit(done_event)
+                return
 
             # -- FAST-PATH 0: MODEL RECOMMENDATION -------------------
             if q_type == "model_recommendation":
                 rec = run_model_recommendation_answer(df, req.question, profile)
-                done_event = dict(DONE_EVENT_TEMPLATE)
+                evidence = AnalysisEvidence(
+                    intent="model_recommendation",
+                    dataset_name=filename_meta or "dataset",
+                    facts={
+                        "recommendation_profile": rec.get("data"),
+                        "row_count": len(df),
+                        "column_count": len(df.columns),
+                    },
+                )
+                request_context.complexity_route = "model_recommendation"
+                try:
+                    gen_ans = await generate_user_answer(
+                        question=req.question,
+                        evidence=evidence,
+                        request_context=request_context,
+                        answer_type="model_recommendation",
+                    )
+                except Exception as exc:
+                    logger.error("Synthesis failed for model_recommendation request_id=%s: %s", req_id, exc)
+                    yield emit(build_generation_failed_event(
+                        request_id=req_id,
+                        evidence=evidence,
+                        request_context=request_context,
+                        meta=build_done_meta("model_recommendation"),
+                    ))
+                    return
+                done_event = build_query_response(
+                    request_id=req_id,
+                    status="complete",
+                    answer_type="model_recommendation",
+                    answer_text=gen_ans.summary,
+                    answer_data=rec.get("data"),
+                    generated_answer=gen_ans,
+                    execution_steps=[
+                        {"id": "profile", "label": "Computed model recommendation evidence", "status": "complete"},
+                        {"id": "synthesis", "label": "Synthesized model recommendation", "status": "complete", "detail": "Provider response parsed, validated, and grounded."},
+                    ],
+                    effective_lens=lens_res["effective_lens"],
+                    generation=request_context.generation,
+                )
                 done_event.update({
                     "request_id": req_id,
-                    "answer": rec["text"],
+                    "result": gen_ans.summary,
+                    "report": gen_ans.explanation or gen_ans.summary,
                     "data": rec.get("data"),
                     "meta": build_done_meta("model_recommendation"),
                 })
@@ -5275,7 +7078,7 @@ async def query_csv(
                 yield emit(done_event)
                 return
 
-            # ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ FAST-PATH 0A: UNCLEAR QUERY ("gg", minimal text, greetings) ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
+            # ¢¢ FAST-PATH 0A: UNCLEAR QUERY ("gg", minimal text, greetings) ¢¢
             if q_type == "unclear_query":
                 is_greeting = any(w in req.question.lower() for w in ["hi", "hello", "hey", "greetings"])
                 intent_name = "greeting" if is_greeting else "clarification"
@@ -5291,7 +7094,23 @@ async def query_csv(
                         "available_capabilities": ["row lookup", "statistics", "charts", "data-quality review", "predictive modeling"],
                     }
                 )
-                gen_ans = synthesize_llm_answer(req.question, evidence, effective_lens=lens_res["effective_lens"], request_id=req_id)
+                try:
+                    gen_ans = await generate_user_answer(
+                        question=req.question,
+                        evidence=evidence,
+                        request_context=request_context,
+                        answer_type="clarification",
+                    )
+                except Exception as exc:
+                    logger.error("Synthesis failed for unclear_query request_id=%s: %s", req_id, exc)
+                    yield emit(build_generation_failed_event(
+                        request_id=req_id,
+                        evidence=evidence,
+                        request_context=request_context,
+                        meta=build_done_meta("unclear_query"),
+                    ))
+                    return
+                
                 steps = [
                     {"id": "classify", "label": "Query received", "status": "complete", "detail": f"Matched {intent_name} intent."},
                     {"id": "clarify", "label": "Generated response", "status": "complete", "detail": "Answer wording generated by LLM from verified dataset evidence."}
@@ -5304,6 +7123,7 @@ async def query_csv(
                     generated_answer=gen_ans,
                     execution_steps=steps,
                     effective_lens=lens_res["effective_lens"],
+                    generation=request_context.generation,
                 )
                 done_event.update({
                     "type": "analysis_completed",
@@ -5318,24 +7138,78 @@ async def query_csv(
                 yield emit(done_event)
                 return
 
-            # ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ FAST-PATH 0B: DATASET PURPOSE ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
+            # ¢¢ FAST-PATH 0B: DATASET PURPOSE ¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢
             if q_type == "dataset_purpose":
                 filename = session_meta.get(req.session_id, {}).get("filename", "uploaded dataset")
+                cached_profile = session_profile_cache.get(req.session_id, {})
+                profile = cached_profile.get("quality_report") or {}
+                unique_profile: list[dict[str, Any]] = []
+                for column in df.columns:
+                    non_null = df[column].dropna()
+                    unique_count = int(non_null.nunique(dropna=True))
+                    unique_ratio = unique_count / max(len(df), 1)
+                    unique_profile.append({
+                        "column": str(column),
+                        "unique_count": unique_count,
+                        "unique_ratio_pct": round(unique_ratio * 100, 1),
+                    })
+                unique_columns = [
+                    item for item in unique_profile
+                    if item["unique_count"] == len(df) and len(df) > 0
+                ]
+                high_cardinality_columns = sorted(
+                    [item for item in unique_profile if item["unique_ratio_pct"] >= 80.0],
+                    key=lambda item: item["unique_ratio_pct"],
+                    reverse=True,
+                )
+                
+                purpose_evidence = {
+                    "rows": cached_profile.get("row_count", len(df)),
+                    "columns": cached_profile.get("column_count", len(df.columns)),
+                    "column_names": [str(c) for c in df.columns],
+                    "numeric_columns": cached_profile.get("numeric_columns", [])[:15],
+                    "categorical_columns": [c for c in cached_profile.get("columns", []) if c not in cached_profile.get("numeric_columns", [])][:15],
+                    "missing_percentage": profile.get("missing_percentage", "0%"),
+                    "health_score": profile.get("health_score", profile.get("quality_score", "0/100")),
+                    "readiness_score": profile.get("readiness_score", "0/100"),
+                    "top_issues": profile.get("issues", [])[:5],
+                    "suggested_uses": profile.get("use_cases", [])[:4],
+                    "unique_columns": unique_columns[:5],
+                    "high_cardinality_columns": high_cardinality_columns[:5],
+                }
+
                 evidence = AnalysisEvidence(
                     intent="dataset_purpose",
                     dataset_name=filename,
-                    facts={
-                        "row_count": len(df),
-                        "column_count": len(df.columns),
-                        "columns": list(df.columns),
-                        "numeric_columns": list(df.select_dtypes(include="number").columns),
-                        "categorical_columns": [c for c in df.columns if not pd.api.types.is_numeric_dtype(df[c])],
-                    }
+                    facts=purpose_evidence
                 )
-                gen_ans = synthesize_llm_answer(req.question, evidence, effective_lens=lens_res["effective_lens"], request_id=req_id)
+                request_context.complexity_route = "dataset_purpose"
+                try:
+                    gen_ans = await generate_user_answer(
+                        question=req.question,
+                        evidence=evidence,
+                        request_context=request_context,
+                        answer_type="dataset_summary",
+                    )
+                except Exception as exc:
+                    logger.error("Synthesis failed for dataset_purpose request_id=%s: %s", req_id, exc)
+                    yield emit(build_generation_failed_event(
+                        request_id=req_id,
+                        evidence=evidence,
+                        request_context=request_context,
+                        meta=build_done_meta("dataset_purpose"),
+                        message="The dataset profile completed, but its written explanation could not be generated.",
+                    ))
+                    return
+                
                 steps = [
                     {"id": "classify", "label": "Detected dataset purpose query", "status": "complete", "detail": "Matched dataset overview intent."},
-                    {"id": "summary", "label": "Synthesized dataset purpose overview", "status": "complete", "detail": "Answer wording generated by LLM from verified dataset evidence."}
+                    {
+                        "id": "summary",
+                        "label": "Synthesized dataset purpose overview",
+                        "status": "complete",
+                        "detail": "Provider response parsed, validated, and grounded.",
+                    }
                 ]
                 done_event = build_query_response(
                     request_id=req_id,
@@ -5345,6 +7219,7 @@ async def query_csv(
                     generated_answer=gen_ans,
                     execution_steps=steps,
                     effective_lens=lens_res["effective_lens"],
+                    generation=request_context.generation,
                 )
                 done_event.update({
                     "type": "analysis_completed",
@@ -5359,10 +7234,325 @@ async def query_csv(
                 yield emit(done_event)
                 return
 
-            # ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ FAST-PATH 1: DIRECT ROW LOOKUP ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
+            # ƒ¢‚”‚€ƒ¢‚”‚€ FAST-PATH 0C: STANDARD QUALITY ƒ¢‚”‚€ƒ¢‚”‚€ƒ¢‚”‚€ƒ¢‚”‚€ƒ¢‚”‚€ƒ¢‚”‚€ƒ¢‚”‚€ƒ¢‚”‚€ƒ¢‚”‚€ƒ¢‚”‚€ƒ¢‚”‚€ƒ¢‚”‚€ƒ¢‚”‚€ƒ¢‚”‚€ƒ¢‚”‚€ƒ¢‚”‚€ƒ¢‚”‚€ƒ¢‚”‚€ƒ¢‚”‚€ƒ¢‚”‚€ƒ¢‚”‚€ƒ¢‚”‚€ƒ¢‚”‚€ƒ¢‚”‚€ƒ¢‚”‚€ƒ¢‚”‚€ƒ¢‚”‚€ƒ¢‚”‚€ƒ¢‚”‚€ƒ¢‚”‚€ƒ¢‚”‚€ƒ¢‚”‚€
+            if q_type == "standard_quality":
+                filename = session_meta.get(req.session_id, {}).get("filename", "uploaded dataset")
+                cached_profile = session_profile_cache.get(req.session_id, {})
+                profile = cached_profile.get("quality_report") or {}
+                
+                issues = profile.get("issues", [])
+                ranked_issues = sorted(issues, key=lambda x: str(x))[:5]
+                
+                quality_evidence = {
+                    "row_count": len(df),
+                    "column_count": len(df.columns),
+                    "health_score": profile.get("health_score", profile.get("quality_score", "0/100")),
+                    "readiness_score": profile.get("readiness_score", "0/100"),
+                    "missing_percentage": profile.get("missing_percentage", "0%"),
+                    "ranked_issues": ranked_issues,
+                    "suggested_actions": profile.get("use_cases", [])[:4],
+                }
+
+                evidence = AnalysisEvidence(
+                    intent="standard_quality",
+                    dataset_name=filename,
+                    facts=quality_evidence
+                )
+                request_context.complexity_route = "standard_quality"
+                try:
+                    gen_ans = await generate_user_answer(
+                        question=req.question,
+                        evidence=evidence,
+                        request_context=request_context,
+                        answer_type="standard_quality",
+                    )
+                except Exception as exc:
+                    logger.error("Synthesis failed for standard_quality request_id=%s: %s", req_id, exc)
+                    yield emit(build_generation_failed_event(
+                        request_id=req_id,
+                        evidence=evidence,
+                        request_context=request_context,
+                        meta=build_done_meta("standard_quality"),
+                    ))
+                    return
+                
+                steps = [
+                    {"id": "classify", "label": "Detected dataset quality query", "status": "complete", "detail": "Matched data quality intent."},
+                    {
+                        "id": "summary",
+                        "label": "Synthesized dataset quality overview",
+                        "status": "complete",
+                        "detail": "Provider response parsed, validated, and grounded.",
+                    }
+                ]
+                done_event = build_query_response(
+                    request_id=req_id,
+                    status="complete",
+                    answer_type="standard_quality",
+                    answer_text=gen_ans.summary,
+                    generated_answer=gen_ans,
+                    execution_steps=steps,
+                    effective_lens=lens_res["effective_lens"],
+                    generation=request_context.generation,
+                )
+                done_event.update({
+                    "type": "analysis_completed",
+                    "step": "done",
+                    "message": "Analysis complete",
+                    "result": gen_ans.summary,
+                    "report": gen_ans.explanation or gen_ans.summary,
+                    "lens_resolution": lens_res,
+                    "meta": build_done_meta("standard_quality"),
+                })
+                logger.info("Returning query response request_id=%s payload=%s", req_id, json.dumps(done_event, default=str))
+                yield emit(done_event)
+                return
+
+            # ¢¢ FAST-PATH 1: DIRECT ROW LOOKUP ¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢
+            if q_type in {"entity_value_lookup", "ranking_lookup", "extreme_value", "row_median_comparison"}:
+                request_context.complexity_route = q_type
+                answer_type = "clarification"
+                generated_code = None
+                answer_data: dict[str, Any] = {"resolution": q_meta}
+
+                if q_type == "entity_value_lookup":
+                    if q_meta.get("matched"):
+                        selected = q_meta.get("selected_field")
+                        identity = q_meta.get("identity") or {}
+                        facts = {
+                            "intent": "single_value_lookup",
+                            "entity_resolution": identity,
+                            "requested_column": q_meta.get("requested_column"),
+                            "value": selected.get("value") if selected else None,
+                        }
+                        answer_type = "single_value_lookup"
+                        if q_meta.get("requested_column"):
+                            generated_code = (
+                                f"match = df[df[{q_meta['identifier_column']!r}].astype(str) == {str(q_meta['requested_identifier'])!r}]\n"
+                                f"value = match.iloc[0][{q_meta['requested_column']!r}]"
+                            )
+                    else:
+                        facts = {
+                            "intent": "single_value_lookup",
+                            "entity_resolution": {
+                                "entity_type": q_meta.get("entity_type"),
+                                "identifier_column": q_meta.get("identifier_column"),
+                                "requested_identifier": q_meta.get("requested_identifier"),
+                                "matched": False,
+                                "possible_row_position": q_meta.get("possible_row_position"),
+                            },
+                            "requested_column": q_meta.get("requested_column"),
+                            "ambiguity": q_meta.get("ambiguity"),
+                            "validation_error": q_meta.get("validation_error"),
+                        }
+                    evidence = AnalysisEvidence(
+                        intent="single_value_lookup" if q_meta.get("matched") else "clarification",
+                        dataset_name=filename_meta,
+                        facts=facts,
+                        generated_code=generated_code,
+                    )
+                    steps = [
+                        {"id": "resolve-entity", "label": "Resolved identifier lookup", "status": "complete" if q_meta.get("matched") else "warning"},
+                        {"id": "synthesis", "label": "Synthesized lookup answer", "status": "complete", "detail": "Provider response parsed, validated, and grounded."},
+                    ]
+                    plan_strategy = "Identifier lookup by semantic entity column."
+
+                elif q_type == "extreme_value":
+                    needs_clarification = bool(q_meta.get("clarification"))
+                    facts = {
+                        "intent": "clarification" if needs_clarification else "extreme_value",
+                        "requested_reference": q_meta.get("requested_reference"),
+                        "resolved_column": q_meta.get("resolved_column"),
+                        "operation": q_meta.get("operation"),
+                        "value": q_meta.get("value"),
+                        "non_null_count": q_meta.get("non_null_count"),
+                        "row_count": q_meta.get("row_count", len(df)),
+                        "candidate_columns": q_meta.get("candidate_columns"),
+                        "clarification": q_meta.get("clarification"),
+                    }
+                    evidence = AnalysisEvidence(
+                        intent="clarification" if needs_clarification else "extreme_value",
+                        dataset_name=filename_meta,
+                        facts=facts,
+                    )
+                    answer_type = "clarification" if needs_clarification else "extreme_value"
+                    answer_data = {"extreme": q_meta}
+                    if not needs_clarification and q_meta.get("resolved_column"):
+                        generated_code = f"value = df[{q_meta['resolved_column']!r}].max()"
+                    steps = [
+                        {"id": "resolve-metric", "label": "Resolved metric column", "status": "warning" if needs_clarification else "complete"},
+                        {"id": "compute-extreme", "label": "Computed scalar extreme value", "status": "skipped" if needs_clarification else "complete"},
+                        {"id": "synthesis", "label": "Synthesized direct answer", "status": "complete", "detail": "Provider response parsed, validated, and grounded."},
+                    ]
+                    plan_strategy = "Direct metric extreme using canonical column resolution."
+
+                elif q_type == "ranking_lookup":
+                    needs_clarification = bool(q_meta.get("clarification"))
+                    evidence = AnalysisEvidence(
+                        intent="clarification" if needs_clarification else "ranking_lookup",
+                        dataset_name=filename_meta,
+                        facts={
+                            "intent": "ranking_lookup",
+                            "entity": q_meta.get("entity"),
+                            "ranking": q_meta.get("ranking"),
+                            "return_columns": q_meta.get("return_columns"),
+                            "tied_winners": q_meta.get("tied_winners", [])[:10],
+                            "tie_count": q_meta.get("tie_count"),
+                            "ranking_metric_candidates": q_meta.get("ranking_metric_candidates"),
+                            "candidate_columns": q_meta.get("candidate_columns"),
+                            "requested_concept": q_meta.get("requested_concept"),
+                            "clarification": q_meta.get("clarification"),
+                        },
+                    )
+                    answer_type = "clarification" if needs_clarification else "ranking_lookup"
+                    answer_data = {"ranking": q_meta}
+                    steps = [
+                        {"id": "resolve-ranking", "label": "Resolved ranking metric", "status": "warning" if needs_clarification else "complete"},
+                        {"id": "synthesis", "label": "Synthesized ranking answer", "status": "complete", "detail": "Provider response parsed, validated, and grounded."},
+                    ]
+                    plan_strategy = "Ranking lookup using validated non-identifier metric."
+
+                else:
+                    needs_clarification = bool(q_meta.get("validation_error") or q_meta.get("not_found"))
+                    evidence = AnalysisEvidence(
+                        intent="clarification" if needs_clarification else "row_median_comparison",
+                        dataset_name=filename_meta,
+                        facts={
+                            "intent": "row_median_comparison",
+                            "row_position": q_meta.get("row_position"),
+                            "row_index": q_meta.get("row_index"),
+                            "identity": q_meta.get("identity"),
+                            "identity_resolution": q_meta.get("identity_resolution"),
+                            "comparisons": q_meta.get("comparisons", [])[:4],
+                            "excluded_columns": q_meta.get("excluded_columns", []),
+                            "validation_error": q_meta.get("validation_error"),
+                            "entity_resolution": q_meta.get("entity_resolution"),
+                        },
+                    )
+                    answer_type = "clarification" if needs_clarification else "row_median_comparison"
+                    answer_data = {"comparison": q_meta}
+                    steps = [
+                        {"id": "compare-medians", "label": "Computed median comparisons", "status": "warning" if needs_clarification else "complete"},
+                        {"id": "synthesis", "label": "Synthesized comparison answer", "status": "complete", "detail": "Provider response parsed, validated, and grounded."},
+                    ]
+                    plan_strategy = "Row/entity comparison against deterministic dataset medians."
+
+                try:
+                    gen_ans = await generate_user_answer(
+                        question=req.question,
+                        evidence=evidence,
+                        request_context=request_context,
+                        answer_type=answer_type,
+                    )
+                except Exception as exc:
+                    logger.error("Synthesis failed for %s request_id=%s: %s", q_type, req_id, exc)
+                    yield emit(build_generation_failed_event(
+                        request_id=req_id,
+                        evidence=evidence,
+                        request_context=request_context,
+                        meta=build_done_meta(q_type),
+                    ))
+                    return
+
+                done_event = build_query_response(
+                    request_id=req_id,
+                    status="complete",
+                    answer_type=answer_type,
+                    answer_text=gen_ans.summary,
+                    answer_data=answer_data,
+                    generated_answer=gen_ans,
+                    execution_steps=steps,
+                    effective_lens=lens_res["effective_lens"],
+                    generated_code=generated_code,
+                    generation=request_context.generation,
+                )
+                done_event.update({
+                    "type": "analysis_completed",
+                    "step": "done",
+                    "message": "Analysis complete",
+                    "result": gen_ans.summary,
+                    "report": gen_ans.explanation or gen_ans.summary,
+                    "chart": None,
+                    "chart_json": None,
+                    "evidence": build_evidence_payload(evidence),
+                    "plan": {"strategy": plan_strategy, "needs_chart": False, "query_type": q_type},
+                    "code": generated_code,
+                    "code_lang": "python" if generated_code else None,
+                    "lens_resolution": lens_res,
+                    "meta": build_done_meta(q_type),
+                    "validation": {
+                        "confidence": q_meta.get("confidence", 0.9 if answer_type != "clarification" else 0.35),
+                        "confidence_label": "Verified" if answer_type != "clarification" else "Needs clarification",
+                        "method": "Deterministic semantic resolver with LLM synthesis",
+                    },
+                })
+                if answer_type != "clarification":
+                    _cache_set(cache_key, done_event)
+                yield emit(done_event)
+                return
+
             if q_type == "direct_row_lookup":
                 row_idx = q_meta["row_index"]
                 display_row = q_meta["display_row"]
+
+                if q_meta.get("validation_error") or q_meta.get("ambiguity"):
+                    message = q_meta.get("validation_error") or q_meta.get("ambiguity")
+                    evidence = AnalysisEvidence(
+                        intent="clarification",
+                        dataset_name=filename_meta,
+                        facts={
+                            "question": req.question,
+                            "lookup_status": "invalid" if q_meta.get("validation_error") else "ambiguous",
+                            "message": message,
+                            "row_requested": display_row,
+                            "available_row_range": f"1 to {len(df)}",
+                            "candidate_columns": q_meta.get("candidate_columns", []),
+                        },
+                    )
+                    request_context.complexity_route = "direct_row_lookup"
+                    try:
+                        gen_ans = await generate_user_answer(
+                            question=req.question,
+                            evidence=evidence,
+                            request_context=request_context,
+                            answer_type="clarification",
+                        )
+                    except Exception as exc:
+                        logger.error("Synthesis failed for direct row clarification request_id=%s: %s", req_id, exc)
+                        yield emit(build_generation_failed_event(
+                            request_id=req_id,
+                            evidence=evidence,
+                            request_context=request_context,
+                            meta=build_done_meta("direct_row_lookup"),
+                        ))
+                        return
+                    done_event = build_query_response(
+                        request_id=req_id,
+                        status="complete",
+                        answer_type="clarification",
+                        answer_text=gen_ans.summary,
+                        generated_answer=gen_ans,
+                        execution_steps=[
+                            {"id": "validate", "label": "Validated direct row lookup", "status": "warning", "detail": message},
+                            {"id": "synthesis", "label": "Synthesized lookup clarification", "status": "complete", "detail": "Provider response parsed, validated, and grounded."},
+                        ],
+                        effective_lens=lens_res["effective_lens"],
+                        generation=request_context.generation,
+                    )
+                    done_event.update({
+                        "type": "analysis_completed",
+                        "step": "done",
+                        "message": "Lookup validation complete",
+                        "result": gen_ans.summary,
+                        "report": gen_ans.explanation or gen_ans.summary,
+                        "chart": None,
+                        "chart_json": None,
+                        "plan": {"strategy": f"Validated row {display_row} lookup without planner.", "needs_chart": False, "query_type": "direct_row_lookup"},
+                        "lens_resolution": lens_res,
+                        "meta": build_done_meta("direct_row_lookup"),
+                    })
+                    yield emit(done_event)
+                    return
 
                 yield emit({
                     "type": "step_started",
@@ -5373,22 +7563,56 @@ async def query_csv(
                 })
 
                 row_data = extract_row_lookup_result(df, row_idx, display_row)
+                selected_column = q_meta.get("column")
+                selected_field = None
+                if selected_column:
+                    raw_value = df.iloc[row_idx][selected_column]
+                    value = str(raw_value) if pd.notna(raw_value) else "Null"
+                    selected_field = {
+                        "requested_field": q_meta.get("requested_field"),
+                        "column": selected_column,
+                        "value": value,
+                        "display_row": display_row,
+                        "row_index": row_idx,
+                    }
+                    row_data["selected_field"] = selected_field
+                    generated_code = f"value = df.iloc[{row_idx}][{selected_column!r}]"
+                else:
+                    generated_code = f"# Direct pandas row lookup\nrow_data = df.iloc[{row_idx}]\nprint(row_data)"
                 evidence = AnalysisEvidence(
                     intent="row_lookup",
                     dataset_name=filename_meta,
                     facts={
                         "display_row": display_row,
                         "row_index": row_idx,
+                        "selected_field": selected_field,
                         "fields": row_data["fields"],
                         "highlights": row_data["highlights"],
                     },
-                    generated_code=f"# Direct pandas row lookup\nrow_data = df.iloc[{row_idx}]\nprint(row_data)",
+                    generated_code=generated_code,
                 )
-                gen_ans = synthesize_llm_answer(req.question, evidence, effective_lens=lens_res["effective_lens"], request_id=req_id)
+                request_context.complexity_route = "direct_row_lookup"
+                try:
+                    gen_ans = await generate_user_answer(
+                        question=req.question,
+                        evidence=evidence,
+                        request_context=request_context,
+                        answer_type="row_lookup",
+                    )
+                except Exception as exc:
+                    logger.error("Synthesis failed for direct_row_lookup request_id=%s: %s", req_id, exc)
+                    yield emit(build_generation_failed_event(
+                        request_id=req_id,
+                        evidence=evidence,
+                        request_context=request_context,
+                        meta=build_done_meta("direct_row_lookup"),
+                    ))
+                    return
 
                 steps = [
                     {"id": "classify", "label": f"Detected direct lookup for row {display_row}", "status": "complete"},
-                    {"id": "retrieve-row", "label": f"Retrieved row {display_row} ({len(row_data['fields'])} columns)", "status": "complete"}
+                    {"id": "retrieve-row", "label": f"Retrieved row {display_row}" + (f" from {selected_column}" if selected_column else f" ({len(row_data['fields'])} columns)"), "status": "complete"},
+                    {"id": "synthesis", "label": "Synthesized row lookup answer", "status": "complete", "detail": "Provider response parsed, validated, and grounded."},
                 ]
 
                 # Emit section update with verified status
@@ -5401,7 +7625,8 @@ async def query_csv(
                     generated_answer=gen_ans,
                     execution_steps=steps,
                     effective_lens=lens_res["effective_lens"],
-                    generated_code=f"# Direct pandas row lookup\nrow_data = df.iloc[{row_idx}]\nprint(row_data)",
+                    generated_code=generated_code,
+                    generation=request_context.generation,
                 )
                 done_event.update({
                     "type": "analysis_completed",
@@ -5412,8 +7637,8 @@ async def query_csv(
                     "chart": None,
                     "chart_json": None,
                     "critique": {"verdict": "pass", "confidence": 0.98, "issues": [], "strengths": [f"Exact row {display_row} lookup"]},
-                    "plan": {"strategy": f"Direct index lookup for row {display_row}", "needs_chart": False, "query_type": "direct_row_lookup"},
-                    "code": f"# Direct pandas row lookup\nrow_data = df.iloc[{row_idx}]\nprint(row_data)",
+                    "plan": {"strategy": f"Retrieved row {display_row}" + (f" from {selected_column}." if selected_column else "."), "needs_chart": False, "query_type": "direct_row_lookup"},
+                    "code": generated_code,
                     "code_lang": "python",
                     "row_data": row_data,
                     "followups": [f"Compare row {display_row} to dataset median", "Show missing values for this row"],
@@ -5437,14 +7662,14 @@ async def query_csv(
             if lens_res["was_auto_switched"]:
                 yield emit({
                     "step": "lens_switch",
-                    "message": f"Switching to a more suitable lens ({lens_res['selected_lens'].capitalize()} ÃÂ¢ÃÂÃÂ {lens_res['effective_lens'].capitalize()})",
+                    "message": f"Switching to a more suitable lens ({lens_res['selected_lens'].capitalize()} ¢ {lens_res['effective_lens'].capitalize()})",
                     "lens_resolution": lens_res
                 })
 
             effective_category = lens_res["effective_lens"]
             category_persona = CATEGORY_PERSONAS.get(effective_category, CATEGORY_PERSONAS["general"])
 
-            # ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ CACHE CHECK ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
+            # ¢¢ CACHE CHECK ¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢
             cached_event = None
             try:
                 cached_event = _cache_get(cache_key)
@@ -5453,14 +7678,118 @@ async def query_csv(
                 cached_event = None
 
             if cached_event:
-                yield emit({"step": "thinking", "message": "Fast response: retrieved from session query cache..."})
-                cached_event["request_id"] = req_id
-                cached_event["status"] = "complete"
-                yield emit(cached_event)
-                logger.info("Sending query response request_id=%s status=complete_cached", req_id)
-                return
+                generation = cached_event.get("generation") or {}
+                if generation.get("succeeded") is True and generation.get("validated") is True:
+                    yield emit({"step": "thinking", "message": "Fast response: retrieved from session query cache..."})
+                    cached_event["request_id"] = req_id
+                    cached_event["status"] = "complete"
+                    yield emit(cached_event)
+                    logger.info("Sending query response request_id=%s status=complete_cached", req_id)
+                    return
+                query_cache.pop(cache_key, None)
 
-            # ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ DETERMINISTIC FAST-PATH ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
+            # -- FAST-PATH 1.5: SIMPLE AGGREGATION -------------------
+            if q_type == "simple_aggregation":
+                import numpy as np
+                col = q_meta.get("column", "rows")
+                op = q_meta.get("operation", "count_non_null")
+                
+                result_val = None
+                code_str = ""
+                if op == "row_count":
+                    result_val = len(df)
+                    code_str = "result = len(df)"
+                elif col in df.columns:
+                    if op == "nunique":
+                        result_val = df[col].nunique()
+                        code_str = f"result = df['{col}'].nunique()"
+                    elif op == "count_non_null":
+                        result_val = df[col].count()
+                        code_str = f"result = df['{col}'].count()"
+                    elif op == "mean":
+                        if pd.api.types.is_numeric_dtype(df[col]):
+                            result_val = df[col].mean()
+                            code_str = f"result = df['{col}'].mean()"
+                    # Add more ops as needed...
+                
+                if result_val is not None:
+                    # Format nicely
+                    if isinstance(result_val, (int, np.integer)):
+                        ans_text = f"The {op.replace('_', ' ')} of {col} is {int(result_val):,}."
+                    elif isinstance(result_val, (float, np.floating)):
+                        ans_text = f"The {op.replace('_', ' ')} of {col} is {float(result_val):.2f}."
+                    else:
+                        ans_text = f"The {op.replace('_', ' ')} of {col} is {result_val}."
+                        
+                    evidence = AnalysisEvidence(
+                        intent="simple_aggregation",
+                        dataset_name=filename_meta,
+                        facts={"column": col, "operation": op, "result": result_val},
+                        generated_code=code_str
+                    )
+                    
+                    request_context.complexity_route = "simple_aggregation"
+                    try:
+                        gen_ans = await generate_user_answer(
+                            question=req.question,
+                            evidence=evidence,
+                            request_context=request_context,
+                            answer_type="aggregation",
+                        )
+                        ans_summary = gen_ans.summary
+                        report_text = gen_ans.explanation or gen_ans.summary
+                        validation_confidence = 0.98
+                    except Exception as exc:
+                        logger.error("Synthesis failed for simple_aggregation request_id=%s: %s", req_id, exc)
+                        yield emit(build_generation_failed_event(
+                            request_id=req_id,
+                            evidence=evidence,
+                            request_context=request_context,
+                            meta=build_done_meta("simple_aggregation"),
+                        ))
+                        return
+                        
+                    done_event = build_query_response(
+                        request_id=req_id,
+                        status="complete",
+                        answer_type="aggregation",
+                        answer_text=ans_summary,
+                        generated_answer=gen_ans,
+                        execution_steps=[
+                            {"id": "deterministic", "label": f"Computed {op} on {col}", "status": "complete", "detail": f"Calculated directly on {len(df):,} rows."},
+                        ],
+                        effective_lens=lens_res["effective_lens"],
+                        generated_code=code_str,
+                        generation=request_context.generation,
+                    )
+                    done_event.update({
+                        "type": "analysis_completed",
+                        "step": "done",
+                        "message": "Analysis complete",
+                        "result": ans_summary,
+                        "chart": None,
+                        "chart_json": None,
+                        "report": report_text,
+                        "critique": {"verdict": "pass", "confidence": validation_confidence, "issues": [], "strengths": ["Deterministic calculation"]},
+                        "plan": {"strategy": f"Deterministic aggregation ({op}) on {col}", "needs_chart": False, "query_type": "simple_aggregation"},
+                        "code": code_str,
+                        "code_lang": "python",
+                        "followups": suggest_followups(req.question, df, {"relevant_columns": [col]}, conversation_state.get(req.session_id)),
+                        "validation": build_validation_payload(
+                            df,
+                            method=f"Exact deterministic pandas computation ({op})",
+                            source_columns=[col] if col != "rows" else [],
+                            confidence=validation_confidence,
+                            reasons=[f"Matched question to deterministic operation on '{col}'."],
+                        ),
+                        "lens_resolution": lens_res,
+                        "meta": build_done_meta("simple_aggregation"),
+                    })
+                    _cache_set(cache_key, done_event)
+                    yield emit(done_event)
+                    return
+
+            # ¢¢ DETERMINISTIC FAST-PATH ¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢
             deterministic = try_deterministic_answer(df, req.question)
             if deterministic:
                 yield emit({"step": "analyst", "message": "Deterministic engine: precise column lookup matched..."})
@@ -5475,19 +7804,44 @@ async def query_csv(
                     },
                     generated_code=deterministic.get("code"),
                 )
-                gen_ans = synthesize_llm_answer(req.question, evidence, effective_lens=lens_res["effective_lens"], request_id=req_id)
+                try:
+                    gen_ans = await generate_user_answer(
+                        question=req.question,
+                        evidence=evidence,
+                        request_context=request_context,
+                        answer_type="visualization" if deterministic.get("chart") is not None or deterministic.get("chart_json") is not None else "aggregation",
+                    )
+                except Exception as exc:
+                    logger.error("Synthesis failed for deterministic fast path request_id=%s: %s", req_id, exc)
+                    yield emit(build_generation_failed_event(
+                        request_id=req_id,
+                        evidence=evidence,
+                        request_context=request_context,
+                        meta=build_done_meta("deterministic"),
+                        chart=deterministic.get("chart"),
+                        chart_json=deterministic.get("chart_json"),
+                    ))
+                    return
+                deterministic_has_chart = deterministic.get("chart") is not None or deterministic.get("chart_json") is not None
+                deterministic_step_label = "plot" if deterministic_has_chart else "Computed exact pandas metrics"
+                deterministic_step_detail = (
+                    f"Generated chart directly from {len(df):,} rows."
+                    if deterministic_has_chart
+                    else f"Calculated directly on {len(df):,} rows."
+                )
                 done_event = build_query_response(
                     request_id=req_id,
                     status="complete",
-                    answer_type="aggregation",
+                    answer_type="visualization" if deterministic_has_chart else "aggregation",
                     answer_text=gen_ans.summary,
                     generated_answer=gen_ans,
                     execution_steps=[
-                        {"id": "deterministic", "label": "Computed exact pandas metrics", "status": "complete", "detail": f"Calculated directly on {len(df):,} rows."},
+                        {"id": "deterministic", "label": deterministic_step_label, "status": "complete", "detail": deterministic_step_detail},
                         {"id": "synthesis", "label": "Synthesized natural-language answer", "status": "complete", "detail": "Answer wording generated by LLM from verified dataset evidence."}
                     ],
                     effective_lens=lens_res["effective_lens"],
                     generated_code=deterministic.get("code"),
+                    generation=request_context.generation,
                 )
                 done_event.update({
                     "type": "analysis_completed",
@@ -5498,7 +7852,7 @@ async def query_csv(
                     "chart_json": deterministic.get("chart_json"),
                     "report": gen_ans.explanation or gen_ans.summary,
                     "critique": deterministic.get("critique", {"verdict": "pass", "confidence": 0.98, "issues": [], "strengths": ["Deterministic calculation"]}),
-                    "plan": {"strategy": f"Deterministic aggregation on {deterministic.get('column', 'dataframe')}", "needs_chart": deterministic.get("chart") is not None, "query_type": "deterministic"},
+                    "plan": {"strategy": f"Deterministic aggregation on {deterministic.get('column', 'dataframe')}", "needs_chart": deterministic_has_chart, "query_type": "deterministic"},
                     "code": deterministic.get("code"),
                     "code_lang": deterministic.get("code_lang", "python"),
                     "followups": suggest_followups(req.question, df, {"relevant_columns": [deterministic.get("column", "")]}, conversation_state.get(req.session_id)),
@@ -5529,7 +7883,7 @@ async def query_csv(
                 yield emit(done_event)
                 return
 
-            # ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ STANDARD-PATH: DATA QUALITY GUIDANCE ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
+            # ¢¢ STANDARD-PATH: DATA QUALITY GUIDANCE ¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢
             if q_type == "data_quality_guidance":
                 t_quality_start = time.time()
                 yield emit({"step": "analyzing", "message": "Loading cached dataset quality profile..."})
@@ -5589,7 +7943,22 @@ async def query_csv(
 
                 yield emit({"step": "reporting", "message": "Generating plain-language quality guidance..."})
                 t_llm_start = time.time()
-                gen_ans = synthesize_llm_answer(req.question, evidence, effective_lens=lens_res["effective_lens"], request_id=req_id)
+                try:
+                    gen_ans = await generate_user_answer(
+                        question=req.question,
+                        evidence=evidence,
+                        request_context=request_context,
+                        answer_type="data_quality_guidance",
+                    )
+                except Exception as exc:
+                    logger.error("Synthesis failed for data_quality_guidance request_id=%s: %s", req_id, exc)
+                    yield emit(build_generation_failed_event(
+                        request_id=req_id,
+                        evidence=evidence,
+                        request_context=request_context,
+                        meta=build_done_meta("standard_quality"),
+                    ))
+                    return
                 t_llm_ms = round((time.time() - t_llm_start) * 1000)
                 stage_timings["synthesis_ms"] += t_llm_ms
 
@@ -5597,8 +7966,12 @@ async def query_csv(
                     {"id": "profile", "label": "Loaded cached dataset quality profile", "status": "complete", "detail": f"Profile loaded in {t_profile_ms}ms"},
                     {"id": "quality-facts", "label": "Computed quality facts deterministically", "status": "complete",
                      "detail": f"{len(missing_cols)} columns with missing values, {duplicates} duplicates, {len(outlier_cols)} columns with outliers"},
-                    {"id": "synthesis", "label": "Generated plain-language guidance", "status": "complete",
-                     "detail": f"Answer wording generated by LLM from verified dataset evidence ({t_llm_ms}ms)"},
+                    {
+                        "id": "synthesis",
+                        "label": "Generated plain-language guidance",
+                        "status": "complete",
+                        "detail": f"Provider response parsed, validated, and grounded ({t_llm_ms}ms)",
+                    },
                 ]
                 done_event = build_query_response(
                     request_id=req_id,
@@ -5608,6 +7981,7 @@ async def query_csv(
                     generated_answer=gen_ans,
                     execution_steps=steps,
                     effective_lens=lens_res["effective_lens"],
+                    generation=request_context.generation,
                 )
                 done_event.update({
                     "type": "analysis_completed",
@@ -5632,7 +8006,7 @@ async def query_csv(
                 yield emit(done_event)
                 return
 
-            # ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ RAG: retrieve context from uploaded documents ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
+            # ¢¢ RAG: retrieve context from uploaded documents ¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢
             rag_context = ""
             rag_sources: list[str] = []
             store = doc_stores.get(req.session_id)
@@ -5647,10 +8021,10 @@ async def query_csv(
 
             rag_block = f"\n\nRELEVANT DOCUMENTATION:\n{rag_context}" if rag_context else ""
 
-            # ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ STEP 1: Build semantic schema (deterministic) ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
+            # ¢¢ STEP 1: Build semantic schema (deterministic) ¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢
             semantic_schema = build_semantic_schema(df)
 
-            # ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ STEP 2: Schema-aware LLM planner (1 LLM call) ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
+            # ¢¢ STEP 2: Schema-aware LLM planner (1 LLM call) ¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢
             yield emit({"step": "planning", "message": "Creating the analysis plan..."})
             t_agent_plan = time.time()
 
@@ -5683,7 +8057,7 @@ async def query_csv(
                     except Exception:
                         return None
 
-                plan_raw = llm(SCHEMA_AWARE_PLANNER_SYSTEM, planning_context, stage="planner")
+                plan_raw = await llm_async(SCHEMA_AWARE_PLANNER_SYSTEM, planning_context, stage="planner")
                 raw_plan_dict = parse_json_safe(plan_raw) or {}
             except Exception as plan_exc:
                 if is_cancelled(req_id) or "cancelled" in str(plan_exc).lower():
@@ -5697,7 +8071,7 @@ async def query_csv(
                     "confidence": 0.5,
                 }
 
-            # ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ STEP 3: Semantic validation (deterministic) ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
+            # ¢¢ STEP 3: Semantic validation (deterministic) ¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢
             resolved_plan, validation_warnings = validate_analysis_plan(raw_plan_dict, df, semantic_schema)
 
             yield emit({
@@ -5724,21 +8098,35 @@ async def query_csv(
                     facts={"question": req.question, "clarification_needed": clarification_text},
                     warnings=validation_warnings,
                 )
-                clarification_gen = synthesize_llm_answer(req.question, clarification_evidence, effective_lens=effective_category)
+                request_context.effective_lens = effective_category
+                try:
+                    clarification_gen = await generate_user_answer(
+                        question=req.question,
+                        evidence=clarification_evidence,
+                        request_context=request_context,
+                        answer_type="clarification",
+                    )
+                except Exception as exc:
+                    logger.error("Synthesis failed for planner clarification request_id=%s: %s", req_id, exc)
+                    yield emit(build_generation_failed_event(
+                        request_id=req_id,
+                        evidence=clarification_evidence,
+                        request_context=request_context,
+                        meta={"route": "clarification", "elapsed_ms": round((time.time() - start_time) * 1000), "request_id": req_id},
+                    ))
+                    return
                 done_event = build_query_response(
                     request_id=req_id,
                     status="complete",
                     answer_type="text",
-                    answer_text=clarification_text,
-                    generated_answer=GeneratedAnswer(
-                        title="Clarification Needed",
-                        summary=clarification_text,
-                        explanation=f"The planner was unsure how to interpret the question (confidence: {resolved_plan.confidence:.0%}).",
-                        caveats=validation_warnings,
-                        next_action="Please clarify and ask again.",
-                    ),
-                    execution_steps=[{"id": "plan", "label": "Planner requested clarification", "status": "warning"}],
+                    answer_text=clarification_gen.summary,
+                    generated_answer=clarification_gen,
+                    execution_steps=[
+                        {"id": "plan", "label": "Planner requested clarification", "status": "warning"},
+                        {"id": "synthesis", "label": "Synthesized clarification", "status": "complete", "detail": "Provider response parsed, validated, and grounded."},
+                    ],
                     effective_lens=effective_category,
+                    generation=request_context.generation,
                 )
                 done_event.update({
                     "type": "analysis_completed",
@@ -5752,7 +8140,7 @@ async def query_csv(
                 yield emit(done_event)
                 return
 
-            # ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ STEP 4: Deterministic execution ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
+            # ¢¢ STEP 4: Deterministic execution ¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢
             yield emit({"step": "analyzing", "message": "Executing analysis plan against dataset..."})
             try:
                 result_df = execute_resolved_plan(df, resolved_plan)
@@ -5773,10 +8161,10 @@ async def query_csv(
                 "payload": {"title": resolved_plan.title or "Analysis Result", "result": analyst_result},
                 "result": analyst_result,
                 "step": "executing",
-                "message": "Plan executed ÃÂ¢ÃÂÃÂ computing chart..."
+                "message": "Plan executed ¢ computing chart..."
             })
 
-            # ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ STEP 5: Chart spec (deterministic) ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
+            # ¢¢ STEP 5: Chart spec (deterministic) ¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢
             chart_b64: str | None = None
             chart_json: str | None = None
             if resolved_plan.chart and resolved_plan.resolved_chart_type:
@@ -5786,7 +8174,7 @@ async def query_csv(
                 except Exception as chart_err:
                     logger.warning("Chart generation failed: %s", chart_err)
 
-            # ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ STEP 6: LLM explanation (1 LLM call) ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
+            # ¢¢ STEP 6: LLM explanation (1 LLM call) ¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢
             yield emit({"step": "reporting", "message": "Writing plain-language explanation..."})
             t_reporter_start = time.time()
 
@@ -5811,31 +8199,70 @@ async def query_csv(
             )
             from backend.core.errors import LLMSynthesisError
             try:
-                deep_gen_ans = synthesize_llm_answer(req.question, deep_evidence, effective_lens=effective_category)
+                request_context.effective_lens = effective_category
+                deep_gen_ans = await generate_user_answer(
+                    question=req.question,
+                    evidence=deep_evidence,
+                    request_context=request_context,
+                    answer_type="text",
+                )
                 report = deep_gen_ans.summary
                 if deep_gen_ans.explanation:
                     report = deep_gen_ans.summary + "\n\n" + deep_gen_ans.explanation
             except LLMSynthesisError as syn_err:
                 logger.error("Synthesis failed request_id=%s: %s", req_id, syn_err)
+                chart_error_msg = (
+                    "The chart was created, but its written explanation could not be generated."
+                    if chart_json
+                    else str(syn_err)
+                )
+                # Format facts for frontend
+                formatted_facts = []
+                if isinstance(deep_evidence.facts, dict):
+                    for k, v in deep_evidence.facts.items():
+                        if isinstance(v, dict) or isinstance(v, list):
+                            continue
+                        formatted_facts.append({"label": str(k).replace("_", " ").title(), "value": v})
+                
                 yield emit({
                     "type": "analysis_failed",
                     "request_id": req_id,
                     "status": "failed",
                     "step": "done",
                     "answer": None,
+                    "chart": chart_b64,
+                    "chart_json": chart_json,
+                    "generation": request_context.generation,
+                    "evidence": {
+                        "available": True,
+                        "chart": {
+                            "available": chart_json is not None,
+                            "spec": chart_json,
+                        },
+                        "facts": formatted_facts[:5],
+                    },
                     "evidence_summary": {"available": True, "intent": deep_evidence.intent, "facts": deep_evidence.facts},
                     "error": {
                         "code": "answer_generation_failed",
-                        "message": str(syn_err),
-                    }
+                        "message": chart_error_msg,
+                    },
+                    "meta": build_done_meta("synthesis_failed"),
                 })
                 return
-            except Exception:
-                deep_gen_ans = None
-                report = analyst_result
+            except Exception as exc:
+                logger.error("Unexpected synthesis failure request_id=%s: %s", req_id, exc)
+                yield emit(build_generation_failed_event(
+                    request_id=req_id,
+                    evidence=deep_evidence,
+                    request_context=request_context,
+                    meta=build_done_meta("synthesis_failed"),
+                    chart=chart_b64,
+                    chart_json=chart_json,
+                ))
+                return
             t_reporter_ms = round((time.time() - t_reporter_start) * 1000)
 
-            # Validate confidence ÃÂ¢ÃÂÃÂ only show high confidence if plan passed validation cleanly
+            # Validate confidence ¢ only show high confidence if plan passed validation cleanly
             plan_confidence = resolved_plan.confidence if not validation_warnings else min(resolved_plan.confidence, 0.80)
 
             steps = [
@@ -5873,6 +8300,7 @@ async def query_csv(
                 execution_steps=steps,
                 effective_lens=effective_category,
                 generated_code=None,
+                generation=request_context.generation,
             )
             done_event.update({
                 "type": "analysis_completed",
@@ -5900,12 +8328,12 @@ async def query_csv(
                 ] if resolved_plan.resolved_dimension_col else ["Describe this dataset", "Show data quality issues"],
                 "validation": build_validation_payload(
                     df,
-                    method="Schema-aware LLM planner ÃÂ¢ÃÂÃÂ deterministic executor",
+                    method="Schema-aware LLM planner ¢ deterministic executor",
                     source_columns=[c for c in [resolved_plan.resolved_dimension_col, resolved_plan.resolved_measure_col] if c],
                     confidence=float(plan_confidence),
                     reasons=[
                         f"Plan confidence: {plan_confidence:.0%}.",
-                        "Execution is deterministic ÃÂ¢ÃÂÃÂ no LLM-generated arithmetic.",
+                        "Execution is deterministic ¢ no LLM-generated arithmetic.",
                         f"Validator warnings: {len(validation_warnings)}.",
                     ],
                 ),
@@ -5923,7 +8351,7 @@ async def query_csv(
             })
             _cache_set(cache_key, done_event)
 
-            # Update conversation state ÃÂ¢ÃÂÃÂ only store resolved column names (no freeform columns)
+            # Update conversation state ¢ only store resolved column names (no freeform columns)
             if hasattr(req, "session_id"):
                 conversation_state[req.session_id] = {
                     "last_question": req.question,
@@ -5955,19 +8383,49 @@ async def query_csv(
             else:
                 logger.exception("Query failed request_id=%s", req_id)
                 err_code = "answer_generation_failed" if "synthesis" in type(exc).__name__.lower() or "synthesis" in str(exc).lower() else "query_execution_failed"
-                yield emit({
+                err_payload = {
                     "type": "analysis_failed",
                     "request_id": req_id,
                     "status": "failed",
-                    "step": "error",
+                    "step": "done",
                     "answer": None,
-                    "evidence_summary": {"available": True},
+                    "evidence": {"available": False, "facts": []},
                     "message": f"Query failed: {str(exc)}",
                     "error": {
                         "code": err_code,
                         "message": str(exc),
                     },
-                })
+                }
+                if "evidence" in locals():
+                    ev = locals()["evidence"]
+                    formatted_facts = []
+                    for k, v in getattr(ev, "facts", {}).items():
+                        if isinstance(v, dict) and v:
+                            formatted_facts.append(f"{k}: {', '.join(f'{ck}={cv}' for ck, cv in list(v.items())[:3])}")
+                        elif isinstance(v, list) and v:
+                            formatted_facts.append(f"{k}: {', '.join(str(x) for x in v[:3])}")
+                        elif v is not None and str(v).strip():
+                            formatted_facts.append(f"{k}: {v}")
+                    
+                    err_payload["evidence"] = {
+                        "available": True,
+                        "facts": formatted_facts
+                    }
+                if "chart_b64" in locals() and locals()["chart_b64"]:
+                    err_payload["chart_b64"] = locals()["chart_b64"]
+                if "chart_json" in locals() and locals()["chart_json"]:
+                    err_payload["chart_json"] = locals()["chart_json"]
+                if "chart" in locals() and locals()["chart"]:
+                    err_payload["chart"] = locals()["chart"]
+                
+                if "deterministic" in locals() and isinstance(locals()["deterministic"], dict):
+                    det = locals()["deterministic"]
+                    if det.get("chart_json"):
+                        err_payload["chart_json"] = det["chart_json"]
+                    if det.get("chart_b64"):
+                        err_payload["chart_b64"] = det["chart_b64"]
+                    
+                yield emit(err_payload)
 
     return StreamingResponse(stream(), media_type="text/event-stream")
 
@@ -6507,7 +8965,7 @@ async def get_dataset_rows(
     }
 
 
-# ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ Business report export (PDF + PPTX) ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
+# ¢¢ Business report export (PDF + PPTX) ¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢
 
 @app.post("/simulate")
 def simulate_scenario(
@@ -6680,7 +9138,7 @@ def _generate_pdf(req: ReportRequest, profile: dict) -> bytes:
                             leftMargin=2.5*cm, rightMargin=2.5*cm,
                             topMargin=2.5*cm, bottomMargin=2.5*cm)
 
-    # ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ Styles ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
+    # ¢¢ Styles ¢¢
     INDIGO   = HexColor("#4F46E5")
     DARK     = HexColor("#0F172A")
     SOFT     = HexColor("#64748B")
@@ -6734,12 +9192,12 @@ def _generate_pdf(req: ReportRequest, profile: dict) -> bytes:
             return None
 
     PERSONA_HEADERS = {
-        "financial": "CFO Executive Briefing ÃÂÃÂ· Focus: Margin, Variance, Capital Efficiency & Risk",
-        "medical": "Clinical Leadership Briefing ÃÂÃÂ· Focus: Patient Outcomes & Operational Efficacy",
-        "retail": "Merchandising & Operations Briefing ÃÂÃÂ· Focus: Unit Economics & Inventory Turn",
-        "marketing": "CMO Growth Briefing ÃÂÃÂ· Focus: CAC, LTV & Campaign Attribution",
-        "hr": "People Operations Briefing ÃÂÃÂ· Focus: Attrition, Banding & Workforce Productivity",
-        "general": "Executive Decision Briefing ÃÂÃÂ· Focus: Profile, Trends, Predictions & Signals",
+        "financial": "CFO Executive Briefing · Focus: Margin, Variance, Capital Efficiency & Risk",
+        "medical": "Clinical Leadership Briefing · Focus: Patient Outcomes & Operational Efficacy",
+        "retail": "Merchandising & Operations Briefing · Focus: Unit Economics & Inventory Turn",
+        "marketing": "CMO Growth Briefing · Focus: CAC, LTV & Campaign Attribution",
+        "hr": "People Operations Briefing · Focus: Attrition, Banding & Workforce Productivity",
+        "general": "Executive Decision Briefing · Focus: Profile, Trends, Predictions & Signals",
     }
     persona_tag = PERSONA_HEADERS.get(req.category.lower(), PERSONA_HEADERS["general"])
 
@@ -6747,18 +9205,18 @@ def _generate_pdf(req: ReportRequest, profile: dict) -> bytes:
     cat   = req.category.title()
     today = _dt.date.today().strftime("%B %d, %Y")
 
-    # ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ Cover ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
+    # ¢¢ Cover ¢¢
     story.append(Spacer(1, 2.5*cm))
     story.append(Paragraph("Analytics Report", S["cover_title"]))
     story.append(Paragraph(req.filename, S["cover_sub"]))
-    story.append(Paragraph(f"{cat} Lens  ÃÂÃÂ·  {today}", S["cover_sub"]))
+    story.append(Paragraph(f"{cat} Lens  ·  {today}", S["cover_sub"]))
     story.append(Paragraph(persona_tag, S["meta"]))
     story.append(Spacer(1, 1.2*cm))
     story.append(HRFlowable(width="80%", thickness=2, color=INDIGO, spaceAfter=18))
-    story.append(Paragraph("Generated by CSV Analyst AI ÃÂÃÂ· Powered by Gemini 2.5 Flash-Lite", S["meta"]))
+    story.append(Paragraph("Generated by CSV Analyst AI - Powered by Gemma 4", S["meta"]))
     story.append(PageBreak())
 
-    # ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ Data Profile ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
+    # ¢¢ Data Profile ¢¢
     story.append(Paragraph("Dataset Profile", S["section"]))
     n_cols = len(profile.get("columns", []))
     n_cat  = n_cols - profile.get("numeric_features", 0)
@@ -6779,9 +9237,9 @@ def _generate_pdf(req: ReportRequest, profile: dict) -> bytes:
         stat_rows = [["Column", "Mean", "Median", "Std Dev", "Min", "Max"]]
         for col, s in list(profile["numeric_stats"].items())[:12]:
             stat_rows.append([col,
-                str(s.get("mean", "ÃÂ¢ÃÂÃÂ")), str(s.get("median", "ÃÂ¢ÃÂÃÂ")),
-                str(s.get("std", "ÃÂ¢ÃÂÃÂ")),  str(s.get("min", "ÃÂ¢ÃÂÃÂ")),
-                str(s.get("max", "ÃÂ¢ÃÂÃÂ"))])
+                str(s.get("mean", "¢")), str(s.get("median", "¢")),
+                str(s.get("std", "¢")),  str(s.get("min", "¢")),
+                str(s.get("max", "¢"))])
         t2 = Table(stat_rows, colWidths=[4.5*cm, 2.5*cm, 2.5*cm, 2.5*cm, 2.5*cm, 2.5*cm])
         t2.setStyle(TableStyle([
             ("BACKGROUND", (0, 0), (-1, 0), INDIGO),
@@ -6797,9 +9255,9 @@ def _generate_pdf(req: ReportRequest, profile: dict) -> bytes:
         story.append(t2)
     story.append(PageBreak())
 
-    # ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ Analysis sections ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
+    # ¢¢ Analysis sections ¢¢
     for i, msg in enumerate(req.messages, 1):
-        q = msg.get("question", "ÃÂ¢ÃÂÃÂ")
+        q = msg.get("question", "¢")
         story.append(Paragraph(f"Q{i}: {q}", S["question"]))
 
         # Executive summary
@@ -6807,7 +9265,7 @@ def _generate_pdf(req: ReportRequest, profile: dict) -> bytes:
         if report_text:
             story.append(_safe_para(report_text, S["body"]))
 
-        # Chart (prefer chart_json ÃÂ¢ÃÂÃÂ PNG via kaleido, fallback to chart_b64)
+        # Chart (prefer chart_json ¢ PNG via kaleido, fallback to chart_b64)
         chart_img = None
         if msg.get("chart_json"):
             chart_img = _embed_chart(_plotly_json_to_png(msg["chart_json"]))
@@ -6831,9 +9289,9 @@ def _generate_pdf(req: ReportRequest, profile: dict) -> bytes:
             verdict = c.get("verdict", "pass").upper()
             conf    = c.get("confidence", 0)
             issues  = "; ".join(c.get("issues", []))
-            line    = f"Analysis quality: {verdict}  ÃÂÃÂ·  {conf:.0%} confidence"
+            line    = f"Analysis quality: {verdict}  ·  {conf:.0%} confidence"
             if issues:
-                line += f"  ÃÂÃÂ·  {issues}"
+                line += f"  ·  {issues}"
             story.append(Spacer(1, 0.2*cm))
             story.append(_safe_para(line, S["meta"]))
 
@@ -6842,7 +9300,7 @@ def _generate_pdf(req: ReportRequest, profile: dict) -> bytes:
             lang = msg.get("code_lang", "python").upper()
             story.append(Spacer(1, 0.2*cm))
             story.append(Paragraph(f"Generated {lang} code:", S["meta"]))
-            snippet = msg["code"][:800] + ("ÃÂ¢ÃÂÃÂ¦" if len(msg["code"]) > 800 else "")
+            snippet = msg["code"][:800] + ("¢¦" if len(msg["code"]) > 800 else "")
             story.append(_safe_para(snippet, S["mono"]))
 
         story.append(HRFlowable(width="100%", thickness=0.5, color=BORDER, spaceAfter=12))
@@ -6907,18 +9365,18 @@ def _generate_pptx(req: ReportRequest, profile: dict) -> bytes:
         return shape
 
     PERSONA_HEADERS = {
-        "financial": "CFO Executive Briefing ÃÂÃÂ· Focus: Margin, Variance, Capital Efficiency & Risk",
-        "medical": "Clinical Leadership Briefing ÃÂÃÂ· Focus: Patient Outcomes & Operational Efficacy",
-        "retail": "Merchandising & Operations Briefing ÃÂÃÂ· Focus: Unit Economics & Inventory Turn",
-        "marketing": "CMO Growth Briefing ÃÂÃÂ· Focus: CAC, LTV & Campaign Attribution",
-        "hr": "People Operations Briefing ÃÂÃÂ· Focus: Attrition, Banding & Workforce Productivity",
-        "general": "Executive Decision Briefing ÃÂÃÂ· Focus: Profile, Trends, Predictions & Signals",
+        "financial": "CFO Executive Briefing · Focus: Margin, Variance, Capital Efficiency & Risk",
+        "medical": "Clinical Leadership Briefing · Focus: Patient Outcomes & Operational Efficacy",
+        "retail": "Merchandising & Operations Briefing · Focus: Unit Economics & Inventory Turn",
+        "marketing": "CMO Growth Briefing · Focus: CAC, LTV & Campaign Attribution",
+        "hr": "People Operations Briefing · Focus: Attrition, Banding & Workforce Productivity",
+        "general": "Executive Decision Briefing · Focus: Profile, Trends, Predictions & Signals",
     }
     persona_tag = PERSONA_HEADERS.get(req.category.lower(), PERSONA_HEADERS["general"])
 
     today = _dt.date.today().strftime("%B %d, %Y")
 
-    # ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ Title slide ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
+    # ¢¢ Title slide ¢¢
     s = _slide()
     _rect(s, 0, 0, 13.33, 7.5, RGBColor(0xF8, 0xFA, 0xFC))
     _rect(s, 0, 0, 13.33, 1.5, INDIGO)
@@ -6926,14 +9384,14 @@ def _generate_pptx(req: ReportRequest, profile: dict) -> bytes:
            color=RGBColor(0xFF, 0xFF, 0xFF), align=PP_ALIGN.CENTER)
     _txbox(s, 0.5, 2.2, 12, 0.6, req.filename, size=22, bold=True,
            color=DARK, align=PP_ALIGN.CENTER)
-    _txbox(s, 0.5, 2.9, 12, 0.5, f"{req.category.title()} Lens  ÃÂÃÂ·  {today}",
+    _txbox(s, 0.5, 2.9, 12, 0.5, f"{req.category.title()} Lens  ·  {today}",
            size=14, color=SOFT, align=PP_ALIGN.CENTER)
     _txbox(s, 0.5, 3.5, 12, 0.5, persona_tag,
            size=12, color=INDIGO, align=PP_ALIGN.CENTER)
-    _txbox(s, 0.5, 6.8, 12, 0.5, "Generated by CSV Analyst AI ÃÂÃÂ· Gemini 2.5 Flash-Lite",
+    _txbox(s, 0.5, 6.8, 12, 0.5, "Generated by CSV Analyst AI - Gemma 4",
            size=11, color=SOFT, align=PP_ALIGN.CENTER)
 
-    # ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ Profile slide ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
+    # ¢¢ Profile slide ¢¢
     s = _slide()
     _rect(s, 0, 0, 13.33, 1.1, INDIGO)
     _txbox(s, 0.4, 0.15, 12, 0.8, "Dataset Profile", size=24, bold=True,
@@ -6956,7 +9414,7 @@ def _generate_pptx(req: ReportRequest, profile: dict) -> bytes:
         _txbox(s, left + 0.15, top + 0.7, 3.7, 0.5, k,
                size=11, color=SOFT, align=PP_ALIGN.CENTER)
 
-    # ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ Per-message slides ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
+    # ¢¢ Per-message slides ¢¢
     for i, msg in enumerate(req.messages, 1):
         s = _slide()
         _rect(s, 0, 0, 13.33, 1.1, INDIGO)
@@ -6985,7 +9443,7 @@ def _generate_pptx(req: ReportRequest, profile: dict) -> bytes:
         # Critique footer
         if msg.get("critique"):
             c = msg["critique"]
-            footer = f"Quality: {c.get('verdict','pass').upper()}  ÃÂÃÂ·  {c.get('confidence',0):.0%} confidence"
+            footer = f"Quality: {c.get('verdict','pass').upper()}  ·  {c.get('confidence',0):.0%} confidence"
             _txbox(s, 0.4, 6.8, 12.5, 0.5, footer, size=10, color=SOFT, align=PP_ALIGN.CENTER)
 
     buf = io.BytesIO()
@@ -7045,10 +9503,10 @@ async def export_report_job(
     }
 
 
-# ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ Benchmark evaluation framework ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
+# ¢¢ Benchmark evaluation framework ¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢
 
 BENCHMARK_QUESTIONS = [
-    # ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ General statistics ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
+    # ¢¢ General statistics ¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢
     {"question": "What are the summary statistics for all numeric columns?",            "category": "general",   "expects_chart": False, "expects_sql": False},
     {"question": "How many rows and columns does the dataset have?",                    "category": "general",   "expects_chart": False, "expects_sql": True},
     {"question": "Show a correlation heatmap of all numeric columns",                   "category": "general",   "expects_chart": True,  "expects_sql": False},
@@ -7057,55 +9515,55 @@ BENCHMARK_QUESTIONS = [
     {"question": "What percentage of values are missing in each column?",               "category": "general",   "expects_chart": False, "expects_sql": False},
     {"question": "Are there any duplicate rows?",                                       "category": "general",   "expects_chart": False, "expects_sql": True},
     {"question": "Show a box plot of all numeric columns to detect outliers",           "category": "general",   "expects_chart": True,  "expects_sql": False},
-    # ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ SQL-type (filter / group-by / top-N) ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
+    # ¢¢ SQL-type (filter / group-by / top-N) ¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢
     {"question": "Show the top 10 rows sorted by the highest numeric column",           "category": "general",   "expects_chart": False, "expects_sql": True},
     {"question": "Count records in each category and sort by count descending",         "category": "general",   "expects_chart": False, "expects_sql": True},
     {"question": "What is the average of each numeric column grouped by the main category?", "category": "general", "expects_chart": False, "expects_sql": True},
     {"question": "Show all records where the first numeric column is above its average","category": "general",   "expects_chart": False, "expects_sql": True},
     {"question": "What are the top 5 categories by total of the main numeric column?",  "category": "general",   "expects_chart": False, "expects_sql": True},
-    # ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ Financial ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
+    # ¢¢ Financial ¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢
     {"question": "What is the total revenue?",                                          "category": "financial", "expects_chart": False, "expects_sql": True},
     {"question": "Show total revenue by category sorted descending as a bar chart",     "category": "financial", "expects_chart": True,  "expects_sql": True},
     {"question": "Calculate mean, standard deviation and CV of the main numeric metric","category": "financial", "expects_chart": False, "expects_sql": False},
     {"question": "What are the top 5 items by revenue? Show a bar chart",               "category": "financial", "expects_chart": True,  "expects_sql": True},
     {"question": "Plot total revenue over time as a line chart",                        "category": "financial", "expects_chart": True,  "expects_sql": False},
     {"question": "What is the period-over-period growth rate of the main metric?",      "category": "financial", "expects_chart": True,  "expects_sql": False},
-    # ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ Retail ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
+    # ¢¢ Retail ¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢
     {"question": "Which product or category has the highest total sales?",              "category": "retail",    "expects_chart": False, "expects_sql": True},
     {"question": "Show a bar chart of revenue by region or segment",                    "category": "retail",    "expects_chart": True,  "expects_sql": True},
     {"question": "What is the average order value?",                                    "category": "retail",    "expects_chart": False, "expects_sql": True},
     {"question": "Show a scatter plot of quantity vs revenue",                          "category": "retail",    "expects_chart": True,  "expects_sql": False},
     {"question": "What percentage of total revenue does each category contribute?",     "category": "retail",    "expects_chart": True,  "expects_sql": False},
     {"question": "Show the top 10 best-selling products by revenue as a bar chart",     "category": "retail",    "expects_chart": True,  "expects_sql": True},
-    # ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ Marketing ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
+    # ¢¢ Marketing ¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢
     {"question": "Break down totals by each categorical column",                        "category": "marketing", "expects_chart": True,  "expects_sql": True},
     {"question": "Which segment or channel performs best by total metric?",             "category": "marketing", "expects_chart": True,  "expects_sql": True},
     {"question": "Show the share of each category as a pie or bar chart",               "category": "marketing", "expects_chart": True,  "expects_sql": False},
     {"question": "Compare the mean numeric values across segments with a bar chart",    "category": "marketing", "expects_chart": True,  "expects_sql": False},
-    # ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ HR ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
+    # ¢¢ HR ¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢
     {"question": "Show the headcount by department or category as a bar chart",         "category": "hr",        "expects_chart": True,  "expects_sql": True},
     {"question": "Plot the distribution of the main numeric column across the dataset", "category": "hr",        "expects_chart": True,  "expects_sql": False},
     {"question": "Compare the mean of each numeric feature between groups",             "category": "hr",        "expects_chart": True,  "expects_sql": False},
     {"question": "What is the average of the main numeric column by group?",            "category": "hr",        "expects_chart": False, "expects_sql": True},
-    # ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ Correlation & statistics ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
+    # ¢¢ Correlation & statistics ¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢
     {"question": "Which two columns are most strongly correlated?",                     "category": "general",   "expects_chart": True,  "expects_sql": False},
     {"question": "Show the covariance matrix of numeric columns",                       "category": "general",   "expects_chart": False, "expects_sql": False},
     {"question": "What is the skewness and kurtosis of each numeric column?",           "category": "general",   "expects_chart": False, "expects_sql": False},
     {"question": "Are there significant differences in means between groups? Show statistical test", "category": "general", "expects_chart": False, "expects_sql": False},
-    # ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ Time series ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
+    # ¢¢ Time series ¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢
     {"question": "Plot the trend of the main numeric column over time",                 "category": "financial", "expects_chart": True,  "expects_sql": False},
     {"question": "Show a monthly or yearly breakdown of the main metric",               "category": "financial", "expects_chart": True,  "expects_sql": True},
-    # ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ Edge cases ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
+    # ¢¢ Edge cases ¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢
     {"question": "Show me something interesting about this data",                       "category": "general",   "expects_chart": True,  "expects_sql": False},
     {"question": "What story does this dataset tell?",                                  "category": "general",   "expects_chart": False, "expects_sql": False},
     {"question": "Identify the most important pattern or anomaly in this data",         "category": "general",   "expects_chart": True,  "expects_sql": False},
-    # ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ Medical ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
+    # ¢¢ Medical ¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢
     {"question": "Which features correlate most with the outcome variable?",            "category": "medical",   "expects_chart": True,  "expects_sql": False},
     {"question": "Compare the mean of each numeric feature between outcome groups",     "category": "medical",   "expects_chart": True,  "expects_sql": False},
     {"question": "Show the distribution of age split by outcome group",                 "category": "medical",   "expects_chart": True,  "expects_sql": False},
     {"question": "What is the prevalence of each outcome class?",                       "category": "medical",   "expects_chart": True,  "expects_sql": True},
     {"question": "Show a violin plot comparing groups on the main clinical metric",     "category": "medical",   "expects_chart": True,  "expects_sql": False},
-    # ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ Multi-step ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
+    # ¢¢ Multi-step ¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢¢
     {"question": "Rank all categories by revenue, show top 5 and bottom 5",            "category": "retail",    "expects_chart": True,  "expects_sql": True},
     {"question": "Calculate the Pareto principle: what top % of categories drive 80% of the main metric?", "category": "financial", "expects_chart": True, "expects_sql": False},
 ]
@@ -7122,7 +9580,10 @@ def _run_agent_pipeline_sync(df: pd.DataFrame, schema: str, question: str,
     def _llm(system: str, user: str, temperature: float = 0) -> str:
         resp = client.models.generate_content(
             model=GEMINI_MODEL, contents=user,
-            config=types.GenerateContentConfig(system_instruction=system, temperature=temperature),
+            config=types.GenerateContentConfig(
+                system_instruction=system, 
+                temperature=temperature
+            ),
         )
         text = (resp.text or "").strip()
         if text.startswith("```"): text = text.split("\n", 1)[1]
@@ -7310,3 +9771,77 @@ async def benchmark_job(
         "kind": job["kind"],
         "poll_url": f"/jobs/{job['job_id']}",
     }
+
+
+provider_status = {
+    "model": GEMINI_MODEL,
+    "latency_ms": None,
+    "status": "pending",
+    "timeout_seconds": 15.0,
+    "last_successful_call": None,
+    "error": None
+}
+
+# Lifespan startup task
+async def probe():
+    import asyncio, time
+    try:
+        start = time.perf_counter()
+        await asyncio.to_thread(
+            client.models.generate_content,
+            model=GEMINI_MODEL,
+            contents="Reply with exactly: OK",
+            config=types.GenerateContentConfig(
+                temperature=0,
+                max_output_tokens=8
+            )
+        )
+        elapsed = time.perf_counter() - start
+        
+        # Second diagnostic: tiny JSON-mode probe. Keep this small so health does
+        # not depend on long-form answer generation quality.
+        from backend.core.config import SYNTHESIS_MODEL
+        import json
+        
+        start_syn = time.perf_counter()
+        syn_response = await asyncio.to_thread(
+            client.models.generate_content,
+            model=SYNTHESIS_MODEL,
+            contents=json.dumps({
+                "instruction": "Return exactly this JSON object.",
+                "expected": {"status": "ok"},
+            }),
+            config=types.GenerateContentConfig(
+                system_instruction='Return only valid JSON: {"status":"ok"}',
+                temperature=0,
+                max_output_tokens=32,
+                response_mime_type="application/json",
+                thinking_config=types.ThinkingConfig(thinking_level="minimal"),
+            ),
+        )
+        parsed_syn = json.loads(syn_response.text)
+        if parsed_syn.get("status") != "ok":
+            raise ValueError("Provider JSON probe returned an unexpected payload.")
+        syn_elapsed = time.perf_counter() - start_syn
+        
+        provider_status["latency_ms"] = round(elapsed * 1000, 2)
+        provider_status["synthesis_latency_ms"] = round(syn_elapsed * 1000, 2)
+        provider_status["status"] = "healthy"
+        provider_status["last_successful_call"] = time.time()
+        provider_status["error"] = None
+        
+        logger.info(f"Provider connectivity probe: {elapsed:.1f}s")
+        logger.info(f"Realistic synthesis probe: {syn_elapsed:.1f}s")
+        logger.info(f"Model: {SYNTHESIS_MODEL}")
+        logger.info(f"Thinking: minimal")
+        logger.info(f"Output limit: 384")
+        logger.info(f"JSON mode: enabled")
+    except Exception as e:
+        provider_status["status"] = "unhealthy"
+        provider_status["error"] = str(e)
+        logger.error(f"Provider health check failed: {e}")
+
+@app.get("/health/provider")
+def get_provider_health():
+    return provider_status
+

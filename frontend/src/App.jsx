@@ -2735,6 +2735,10 @@ const PARTIAL_RESULT_EVENT_TYPES = new Set([
   'answer_partial',
 ])
 
+const TERMINAL_PARTIAL_EVENT_TYPES = new Set([
+  'analysis_partial',
+])
+
 const SUCCESS_EVENT_TYPES = new Set([
   'analysis_completed',
   'completed',
@@ -2755,6 +2759,9 @@ function classifyStreamEvent(event) {
   }
   if (FAILURE_EVENT_TYPES.has(type)) {
     return 'terminal-failure'
+  }
+  if (TERMINAL_PARTIAL_EVENT_TYPES.has(type)) {
+    return 'terminal-partial'
   }
   if (PARTIAL_RESULT_EVENT_TYPES.has(type)) {
     return 'partial-result'
@@ -2827,6 +2834,7 @@ function normalizeApiError(error) {
 function normalizeStreamStatus(event) {
   const eventClass = classifyStreamEvent(event)
   if (eventClass === 'terminal-success') return 'complete'
+  if (eventClass === 'terminal-partial') return 'partial'
   if (eventClass === 'terminal-failure') return 'failed'
   if (eventClass === 'partial-result') return 'partial'
   return 'running'
@@ -3205,22 +3213,42 @@ function AnalysisAnswer({ msg, isError }) {
   const summary = toDisplayText(msg?.answer?.summary)
   const explanation = toDisplayText(msg?.answer?.explanation)
   const legacyText = toDisplayText(msg?.answerText || msg?.report || msg?.result)
+  const evidenceFacts = Array.isArray(msg?.evidence?.facts) ? msg.evidence.facts : []
+  const hasEvidence = Boolean(msg?.evidence?.available) && evidenceFacts.length > 0
+  const evidenceBlock = hasEvidence ? (
+    <div className="analysis-evidence" style={{ padding: '16px', background: '#F8FAFC', borderRadius: '8px', border: '1px solid #E2E8F0' }}>
+      <h4 style={{ margin: '0 0 12px 0', fontSize: '14px', color: '#334155', fontWeight: 600 }}>Verified Dataset Evidence</h4>
+      <ul style={{ margin: 0, paddingLeft: '20px', color: '#475569', fontSize: '14px', lineHeight: '1.5' }}>
+        {evidenceFacts.map((fact, i) => {
+          const label = fact && typeof fact === 'object' ? fact.label : ''
+          const value = fact && typeof fact === 'object' ? fact.value : fact
+          return <li key={i}>{label ? `${label}: ${toDisplayText(value)}` : toDisplayText(value)}</li>
+        })}
+      </ul>
+    </div>
+  ) : null
+  const generationWarning = msg?.warning?.message || msg?.rawResponse?.warning?.message || msg?.debugPayload?.warning?.message
 
   if (msg?.status === 'failed' || isError) {
     return (
-      <div className="analysis-error-state" style={{ padding: '12px', background: '#FEF2F2', borderRadius: '8px', border: '1px solid #FCA5A5' }} role="alert">
-        <strong style={{ color: 'var(--accent-red, #EF4444)', display: 'block', marginBottom: '4px' }}>Analysis failed</strong>
-        <p style={{ color: 'var(--accent-red, #EF4444)', margin: 0 }}>
-          {errorMessage || legacyText || 'The analysis could not be completed.'}
-        </p>
-        {import.meta.env.DEV && (msg.rawResponse || msg.debugPayload) && (
-          <details className="debug-payload-details" style={{ marginTop: '8px', fontSize: '11px' }}>
-            <summary style={{ cursor: 'pointer', color: 'var(--text-muted)' }}>Raw API response debug payload</summary>
-            <pre style={{ background: '#F8FAFC', padding: '8px', borderRadius: '6px', overflow: 'auto', maxHeight: '200px', marginTop: '4px' }}>
-              {JSON.stringify(msg.rawResponse || msg.debugPayload, null, 2)}
-            </pre>
-          </details>
-        )}
+      <div className="analysis-error-state" style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
+        {evidenceBlock}
+        <div style={{ padding: '12px', background: '#FEF2F2', borderRadius: '8px', border: '1px solid #FCA5A5' }} role="alert">
+          <strong style={{ color: 'var(--accent-red, #EF4444)', display: 'block', marginBottom: '4px' }}>
+            {hasEvidence ? 'Answer Generation Failed' : 'Analysis failed'}
+          </strong>
+          <p style={{ color: 'var(--accent-red, #EF4444)', margin: 0, fontSize: hasEvidence ? '13px' : 'inherit' }}>
+            {errorMessage || legacyText || 'The analysis could not be completed.'}
+          </p>
+          {import.meta.env.DEV && (msg.rawResponse || msg.debugPayload) && (
+            <details className="debug-payload-details" style={{ marginTop: '8px', fontSize: '11px' }}>
+              <summary style={{ cursor: 'pointer', color: 'var(--text-muted)' }}>Raw API response debug payload</summary>
+              <pre style={{ background: '#F8FAFC', padding: '8px', borderRadius: '6px', overflow: 'auto', maxHeight: '200px', marginTop: '4px' }}>
+                {JSON.stringify(msg.rawResponse || msg.debugPayload, null, 2)}
+              </pre>
+            </details>
+          )}
+        </div>
       </div>
     )
   }
@@ -3235,17 +3263,28 @@ function AnalysisAnswer({ msg, isError }) {
 
   const ansObj = msg.answer && typeof msg.answer === 'object' ? msg.answer : null
   if (ansObj && (ansObj.summary || ansObj.title || ansObj.explanation)) {
-    return <StructuredAnswerSection answer={ansObj} />
+    return (
+      <>
+        {evidenceBlock}
+        <StructuredAnswerSection answer={ansObj} />
+      </>
+    )
   }
 
   const rowData = msg.answerData || msg.row_data
   if (rowData && (rowData.fields || rowData.values)) {
-    return <RowTableSection rowData={rowData} />
+    return (
+      <>
+        {evidenceBlock}
+        <RowTableSection rowData={rowData} />
+      </>
+    )
   }
 
   if (summary || explanation) {
     return (
       <div className="analysis-answer">
+        {evidenceBlock}
         {summary && <p>{summary}</p>}
         {explanation && <p>{explanation}</p>}
       </div>
@@ -3253,23 +3292,54 @@ function AnalysisAnswer({ msg, isError }) {
   }
 
   if (typeof msg.answerText === 'string' && msg.answerText.trim()) {
-    return <ReportFormatter content={msg.answerText} />
+    return (
+      <>
+        {evidenceBlock}
+        <ReportFormatter content={msg.answerText} />
+      </>
+    )
   }
 
   if (typeof msg.report === 'string' && msg.report.trim()) {
-    return <ReportFormatter content={msg.report} />
+    return (
+      <>
+        {evidenceBlock}
+        <ReportFormatter content={msg.report} />
+      </>
+    )
   }
 
   if (typeof msg.result === 'string' && msg.result.trim()) {
-    return <ReportFormatter content={msg.result} />
+    return (
+      <>
+        {evidenceBlock}
+        <ReportFormatter content={msg.result} />
+      </>
+    )
   }
 
   if (msg.answerData !== undefined && msg.answerData !== null) {
     return (
-      <div className="generic-structured-result" style={{ background: '#F8FAFC', padding: '12px', borderRadius: '8px' }}>
-        <pre style={{ margin: 0, fontSize: '12px', fontFamily: 'monospace', color: '#0F172A' }}>
-          {typeof msg.answerData === 'object' ? JSON.stringify(msg.answerData, null, 2) : String(msg.answerData)}
-        </pre>
+      <>
+        {evidenceBlock}
+        <div className="generic-structured-result" style={{ background: '#F8FAFC', padding: '12px', borderRadius: '8px' }}>
+          <pre style={{ margin: 0, fontSize: '12px', fontFamily: 'monospace', color: '#0F172A' }}>
+            {typeof msg.answerData === 'object' ? JSON.stringify(msg.answerData, null, 2) : String(msg.answerData)}
+          </pre>
+        </div>
+      </>
+    )
+  }
+
+  if (evidenceBlock || generationWarning) {
+    return (
+      <div className="analysis-partial-state" style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
+        {evidenceBlock}
+        {generationWarning && (
+          <div style={{ padding: '12px', background: '#FFFBEB', borderRadius: '8px', border: '1px solid #FDE68A', color: '#92400E' }} role="status">
+            {generationWarning}
+          </div>
+        )}
       </div>
     )
   }
@@ -3277,10 +3347,10 @@ function AnalysisAnswer({ msg, isError }) {
   return null
 }
 
-function ChatMessage({ msg, onAsk, onStop }) {
+function ChatMessage({ msg, onAsk, onStop, onRetryExplanation }) {
   const [showCode, setShowCode] = useState(false)
   const status = msg.status || 'running'
-  const isDone = status === 'complete' || status === 'failed' || status === 'cancelled'
+  const isDone = status === 'complete' || status === 'failed' || status === 'cancelled' || (status === 'partial' && !msg.streaming)
   const isError = status === 'failed' || msg.steps.some((s) => s.step === 'error' || s.type === 'analysis_failed')
   const isStreaming = msg.streaming && !isDone && !isError
 
@@ -3358,7 +3428,12 @@ function ChatMessage({ msg, onAsk, onStop }) {
         {status === 'partial' && (
           <>
             <AnalysisAnswer msg={msg} />
-            <InlineProgressMessage message="Initial answer available. Additional checks are still running." />
+            <InlineProgressMessage message={msg.streaming ? 'Initial answer available. Additional checks are still running.' : 'Written explanation temporarily unavailable.'} />
+            {!msg.streaming && msg.generation?.succeeded === false && (
+              <button type="button" className="ghost-btn" onClick={() => onRetryExplanation && onRetryExplanation(msg)}>
+                Retry explanation
+              </button>
+            )}
           </>
         )}
 
@@ -3457,7 +3532,7 @@ function ChatMessage({ msg, onAsk, onStop }) {
   )
 }
 
-function ChatArea({ upload, category, messages, onAsk, onStory, onInvestigate, onCleanExport, onExportContract, onExportDashboard, cleaningBusy, loading, question, setQuestion, inputRef, onStop }) {
+function ChatArea({ upload, category, messages, onAsk, onStory, onInvestigate, onCleanExport, onExportContract, onExportDashboard, cleaningBusy, loading, question, setQuestion, inputRef, onStop, onRetryExplanation }) {
   const cat = catByKey(category)
   const bottomRef = useRef()
   useEffect(() => { bottomRef.current?.scrollIntoView({ behavior: 'smooth' }) }, [messages])
@@ -3593,7 +3668,7 @@ function ChatArea({ upload, category, messages, onAsk, onStory, onInvestigate, o
         )
       ) : (
         <div className="message-list">
-          {messages.map((m) => <ChatMessage key={m.id} msg={m} onAsk={onAsk} onStop={onStop} />)}
+          {messages.map((m) => <ChatMessage key={m.id} msg={m} onAsk={onAsk} onStop={onStop} onRetryExplanation={onRetryExplanation} />)}
           <div ref={bottomRef} />
         </div>
       )}
@@ -3837,6 +3912,35 @@ function App() {
         }
       }
 
+      if (eventClass === 'terminal-partial') {
+        return {
+          ...m,
+          status: 'partial',
+          streaming: false,
+          steps: combinedSteps,
+          executionSteps: newExecutionSteps,
+          answerText: normalized.answerText?.trim() ? normalized.answerText : m.answerText,
+          answerType: normalized.answerType ?? m.answerType,
+          answerData: normalized.answerData ?? rawEvent.evidence?.table ?? m.answerData,
+          result: normalized.answerText?.trim() ? normalized.answerText : m.result,
+          report: normalized.answerText?.trim() ? normalized.answerText : m.report,
+          row_data: normalized.answerData ?? rawEvent.evidence?.table ?? m.row_data,
+          code: normalized.generatedCode ?? rawEvent.code ?? m.code,
+          code_lang: rawEvent.code_lang ?? m.code_lang,
+          chart: rawEvent.chart ?? m.chart,
+          chart_json: rawEvent.chart_json ?? m.chart_json,
+          critique: rawEvent.critique ?? m.critique,
+          validation: rawEvent.validation ?? m.validation,
+          plan: rawEvent.plan ?? m.plan,
+          followups: rawEvent.followups ?? m.followups,
+          evidence: rawEvent.evidence ?? m.evidence,
+          warning: rawEvent.warning ?? m.warning,
+          generation: rawEvent.generation ?? m.generation,
+          error: null,
+          debugPayload: import.meta.env.DEV ? rawEvent : undefined,
+        }
+      }
+
       if (eventClass === 'terminal-failure') {
         return {
           ...m,
@@ -3846,6 +3950,7 @@ function App() {
           debugPayload: import.meta.env.DEV ? rawEvent : undefined,
           steps: combinedSteps,
           executionSteps: newExecutionSteps,
+          evidence: rawEvent.evidence ?? m.evidence,
         }
       }
 
@@ -3885,6 +3990,9 @@ function App() {
           plan: rawEvent.plan ?? m.plan,
           followups: rawEvent.followups ?? m.followups,
           row_data: normalized.answerData ?? rawEvent.row_data ?? m.row_data,
+          evidence: rawEvent.evidence ?? m.evidence,
+          warning: rawEvent.warning ?? m.warning,
+          generation: rawEvent.generation ?? m.generation,
           error: null,
           debugPayload: import.meta.env.DEV ? rawEvent : undefined,
         }
@@ -3962,10 +4070,19 @@ function App() {
       if (!res.ok) {
         const errText = await res.text()
         let detail = `Query failed with status ${res.status}`
+        let parsed = null
         try {
-          const parsed = JSON.parse(errText)
+          parsed = JSON.parse(errText)
           detail = parsed.detail || detail
         } catch (_) {}
+
+        if (res.status === 404 || parsed?.error?.code === 'session_not_found' || String(detail).includes('Session not found')) {
+          setUpload(null)
+          setMessages([])
+          alert('The backend session expired or restarted. Please upload the dataset again.')
+          return
+        }
+
         throw new Error(detail)
       }
 
@@ -4014,7 +4131,7 @@ function App() {
 
             handleAnalysisStreamEvent(event, clientRequestId)
             const classification = classifyStreamEvent(event)
-            if (classification === 'terminal-success' || classification === 'terminal-failure') {
+            if (classification === 'terminal-success' || classification === 'terminal-failure' || classification === 'terminal-partial') {
               terminalReceived = true
             }
           }
@@ -4027,7 +4144,7 @@ function App() {
           if (finalEvent) {
             handleAnalysisStreamEvent(finalEvent, clientRequestId)
             const classification = classifyStreamEvent(finalEvent)
-            if (classification === 'terminal-success' || classification === 'terminal-failure') {
+            if (classification === 'terminal-success' || classification === 'terminal-failure' || classification === 'terminal-partial') {
               terminalReceived = true
             }
           }
@@ -4112,6 +4229,48 @@ function App() {
       }
     } catch (_) {}
   }, [upload, category, streamInto])
+
+  const retryExplanation = useCallback(async (msg) => {
+    if (!upload || !msg) return
+    const requestId = msg.request_id || msg.requestId || msg.id
+    if (!requestId) return
+
+    setMessages((prev) => prev.map((m) => {
+      if (String(m.id).toLowerCase() !== String(requestId).toLowerCase()) return m
+      return {
+        ...m,
+        status: 'partial',
+        streaming: true,
+        warning: { message: 'Retrying written explanation...' },
+      }
+    }))
+
+    try {
+      const res = await fetch(`${API}/query/${encodeURIComponent(requestId)}/retry-answer`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Session-Token': upload?.token || '' },
+        body: JSON.stringify({ session_id: upload.session_id, category }),
+      })
+      const raw = await res.json()
+      if (!res.ok) {
+        throw new Error(raw.detail || 'Could not retry the written explanation.')
+      }
+      handleAnalysisStreamEvent(raw, requestId)
+    } catch (e) {
+      setMessages((prev) => prev.map((m) => {
+        if (String(m.id).toLowerCase() !== String(requestId).toLowerCase()) return m
+        return {
+          ...m,
+          status: 'partial',
+          streaming: false,
+          warning: {
+            code: 'answer_generation_unavailable',
+            message: e.message || 'Written explanation is still temporarily unavailable.',
+          },
+        }
+      }))
+    }
+  }, [upload, category, handleAnalysisStreamEvent])
 
   const exportCleanedCsv = useCallback(async () => {
     if (!upload || cleaningBusy) return
@@ -4206,6 +4365,7 @@ function App() {
             question={question}
             setQuestion={setQuestion}
             inputRef={inputRef}
+            onRetryExplanation={retryExplanation}
           />
           {!rightPanelCollapsed && (
             <>

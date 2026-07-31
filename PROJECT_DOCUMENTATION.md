@@ -106,8 +106,8 @@ Backend:
 - SQLite
 - scikit-learn
 - SHAP
-- Google Gemini via `google-genai`
-- Gemini embeddings via `text-embedding-004`
+- Google Gemma 4 via the `google-genai` SDK
+- Local HashingVectorizer retrieval for attached documents
 - reportlab
 - python-pptx
 - pypdf
@@ -142,7 +142,7 @@ FastAPI Backend
   |
   |-- In-memory session store
   |-- DataFrame profile and deterministic analytics
-  |-- Gemini multi-agent pipeline
+  |-- Gemma 4 multi-agent pipeline
   |-- Sandboxed pandas/Plotly code execution
   |-- SQLite query execution
   |-- Document vector store for RAG
@@ -247,7 +247,7 @@ Frontend API calls use relative paths through the Vite proxy in local developmen
 1. User asks a question.
 2. Backend checks cache.
 3. Backend attempts deterministic answer first.
-4. If deterministic route cannot answer, backend runs the Gemini agent pipeline.
+4. If deterministic route cannot answer, backend runs the Gemma 4 agent pipeline.
 5. Response streams as Server-Sent Events.
 6. Frontend renders each step, chart, validation panel, and report.
 
@@ -347,7 +347,7 @@ This drives deterministic charting, dashboard blueprints, follow-ups, decision b
 
 ### 11.7 Deterministic Analytics
 
-Common queries are answered without calling Gemini when possible.
+Common queries are answered deterministically when possible; Gemma 4 is used for planning or grounded wording when needed.
 
 Supported examples:
 
@@ -817,7 +817,7 @@ Current statuses:
 Current controls:
 
 - Environment variables for secrets.
-- No hardcoded Gemini API key.
+- No hardcoded Gemma/Gemini API key.
 - Upload byte limit.
 - Dataframe row and column limits.
 - Session TTL cleanup.

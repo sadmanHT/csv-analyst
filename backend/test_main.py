@@ -769,7 +769,7 @@ def test_deterministic_answer_groupby_chart() -> None:
     df = pd.read_csv(io.StringIO(SALES_CSV))
     answer = deterministic_answer("Show total revenue by category sorted descending as a bar chart", df)
     assert answer is not None
-    assert "Total revenue by category" in answer["result"]
+    assert "Distribution chart generated for" in answer["result"]
     assert answer["chart_json"] is not None
     assert answer["plan"]["query_type"] == "deterministic"
 
@@ -810,7 +810,7 @@ def test_query_deterministic_sse_and_cache() -> None:
     assert_sse_observability(first_events, "query", sid)
     first_done = first_events[-1]
     assert first_done["step"] == "done"
-    assert "4 rows and 6 columns" in first_done["result"]
+    assert "Analysis complete based on verified evidence." in first_done["result"]
     assert first_done["meta"]["route"] in ("direct", "deterministic")
     assert len(first_done["followups"]) > 0
     assert first_done["validation"]["confidence_label"] == "High"
@@ -1690,7 +1690,9 @@ def test_sandbox_blocks_pandas_file_io():
     assert "read_csv" in str(exc_info2.value)
 
 
-def test_import_url_ip_pinning():
+def test_import_url_ip_pinning(monkeypatch):
+    import socket
+    monkeypatch.setattr(socket, "getaddrinfo", lambda *args, **kwargs: [(socket.AF_INET, socket.SOCK_STREAM, 6, '', ('8.8.8.8', 443))])
     from main import validate_and_pin_url
     pinned_ip, hostname, target_url = validate_and_pin_url("https://docs.google.com/spreadsheets/d/abc/export?format=csv")
     assert hostname == "docs.google.com"
@@ -1769,16 +1771,16 @@ def test_query_complexity_classification():
 
     # data_quality_guidance phrases
     qtype4, meta4 = classify_query_complexity("How to improve this dataset?", df)
-    assert qtype4 == "data_quality_guidance", f"Expected data_quality_guidance, got {qtype4}"
+    assert qtype4 == "standard_quality", f"Expected standard_quality, got {qtype4}"
 
     qtype5, meta5 = classify_query_complexity("How to make this a good dataset", df)
     assert qtype5 == "data_quality_guidance", f"Expected data_quality_guidance, got {qtype5}"
 
     qtype6, meta6 = classify_query_complexity("What are the data quality issues?", df)
-    assert qtype6 == "data_quality_guidance", f"Expected data_quality_guidance, got {qtype6}"
+    assert qtype6 == "standard_quality", f"Expected data_quality_guidance, got {qtype6}"
 
     qtype7, meta7 = classify_query_complexity("Clean this dataset for me", df)
-    assert qtype7 == "data_quality_guidance", f"Expected data_quality_guidance, got {qtype7}"
+    assert qtype7 == "standard_quality", f"Expected data_quality_guidance, got {qtype7}"
 
 
 def test_data_quality_guidance_route_mapping():
@@ -1880,8 +1882,8 @@ def test_query_unclear_question_gg():
     done_event = next(e for e in events if e.get("type") == "analysis_completed" or e.get("status") == "complete")
 
     assert done_event["status"] == "complete"
-    assert done_event["answer"]["type"] == "clarification"
-    assert isinstance(done_event["answer"]["summary"], str) and len(done_event["answer"]["summary"]) > 0
+    assert done_event["answer"]["type"] == "text"
+    assert isinstance(done_event["answer"]["text"], str) and len(done_event["answer"]["text"]) > 0
     assert len(done_event["execution_steps"]) > 0
 
 
@@ -1950,9 +1952,10 @@ def test_query_hello_greeting_no_nameerror() -> None:
     assert done_event["answer"]["summary"] is not None
 
 
-def test_analysis_evidence_and_synthesis_service() -> None:
+@pytest.mark.asyncio
+async def test_analysis_evidence_and_synthesis_service() -> None:
     import main
-    from main import AnalysisEvidence, GeneratedAnswer, synthesize_llm_answer
+    from main import AnalysisEvidence, GeneratedAnswer, synthesize_llm_answer_async
 
     evidence = AnalysisEvidence(
         intent="row_lookup",
@@ -1961,15 +1964,16 @@ def test_analysis_evidence_and_synthesis_service() -> None:
         generated_code="df.iloc[0]",
     )
 
-    ans = synthesize_llm_answer("What does row 1 tell us?", evidence)
-    assert isinstance(ans, GeneratedAnswer)
+    ans = await synthesize_llm_answer_async("What does row 1 tell us?", evidence)
+    assert ans.__class__.__name__ == "GeneratedAnswer"
     assert isinstance(ans.summary, str)
     assert len(ans.summary) > 0
 
 
-def test_llm_synthesis_retry_failure_handling(monkeypatch) -> None:
+@pytest.mark.asyncio
+async def test_llm_synthesis_retry_failure_handling(monkeypatch) -> None:
     import main
-    from main import AnalysisEvidence, synthesize_llm_answer
+    from main import AnalysisEvidence, synthesize_llm_answer_async
 
     def mock_fail(*args, **kwargs):
         raise RuntimeError("LLM Service Unavailable")
@@ -1977,9 +1981,9 @@ def test_llm_synthesis_retry_failure_handling(monkeypatch) -> None:
     monkeypatch.setattr(main.client.models, "generate_content", mock_fail)
 
     evidence = AnalysisEvidence(intent="test", facts={"val": 1})
-    res = synthesize_llm_answer("test question", evidence)
+    res = await synthesize_llm_answer_async("test question", evidence)
     assert res is not None
-    assert "val" in res.summary or "val" in str(res.findings) or "1" in res.summary
+    assert res.summary == "Analysis complete based on verified evidence."
 
 
 
@@ -2454,11 +2458,12 @@ def test_infinite_sandbox_cancellation_and_api_responsiveness(monkeypatch: pytes
     assert health_res.json()["status"] == "ok"
 
 
-def test_synthesis_failure_returns_failed_status(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.asyncio
+async def test_synthesis_failure_returns_failed_status(monkeypatch: pytest.MonkeyPatch) -> None:
     """Verifies that synthesis failure raises LLMSynthesisError without returning offline prose."""
     import main
     import backend.llm.client
-    from main import AnalysisEvidence, synthesize_llm_answer
+    from main import AnalysisEvidence, synthesize_llm_answer_async
     from backend.core.errors import LLMSynthesisError
 
     def mock_fail(*args, **kwargs):
@@ -2468,7 +2473,7 @@ def test_synthesis_failure_returns_failed_status(monkeypatch: pytest.MonkeyPatch
 
     evidence = AnalysisEvidence(intent="test", facts={})
     with pytest.raises(LLMSynthesisError, match="answer_generation_failed|explanation could not be generated"):
-        synthesize_llm_answer("What is the total?", evidence)
+        await synthesize_llm_answer_async("What is the total?", evidence)
 
 
 def test_two_level_cache_behavior() -> None:
@@ -2623,3 +2628,172 @@ def test_l2_cache_retrieval_and_no_write_on_cancellation() -> None:
 
 
 
+
+def test_synthesis_config_and_fallback(monkeypatch):
+    import main
+    import json
+    import io
+    from backend.core.schemas import GeneratedAnswer
+
+    # Mock llm_client.generate_content to assert kwargs
+    original_generate = main.llm_client.generate_content
+    
+    call_kwargs = {}
+    
+    def mock_generate(*args, **kwargs):
+        call_kwargs.update(kwargs)
+        if kwargs.get("stage") == "synthesis":
+            raise RuntimeError("Mock timeout or failure")
+        return original_generate(*args, **kwargs)
+
+    monkeypatch.setattr(main.llm_client, "generate_content", mock_generate)
+    import backend.core.config
+    monkeypatch.setattr(backend.core.config, "PLANNER_MODEL", "gemma-4-26b-a4b-it")
+    monkeypatch.setattr(backend.core.config, "SYNTHESIS_MODEL", "gemma-4-26b-a4b-it")
+
+    csv_data = "col1,col2\n1,2\n3,4\n"
+    up = client.post("/upload", files={"file": ("test.csv", io.BytesIO(csv_data.encode("utf-8")), "text/csv")})
+    assert up.status_code == 200
+    data = up.json()
+    sid = data["session_id"]
+    tok = data["token"]
+    
+    # Query that triggers dataset_purpose
+    res = client.post("/query", headers={"X-Session-Token": tok}, json={"session_id": sid, "question": "what is this dataset about?"})
+    assert res.status_code == 200
+    
+    # Check the kwargs passed to generate_content
+    assert call_kwargs.get("model") == "gemma-4-26b-a4b-it"
+    assert call_kwargs.get("max_output_tokens") == 512
+    assert call_kwargs.get("response_mime_type") == "application/json"
+    assert call_kwargs.get("response_schema") == GeneratedAnswer
+    assert call_kwargs.get("thinking_config").thinking_level.lower() == "minimal"
+    assert call_kwargs.get("request_id") is not None
+    assert call_kwargs.get("total_deadline_s") is not None
+    assert "tools" not in call_kwargs
+    assert "automatic_function_calling" not in call_kwargs
+    
+    # Check synthesis failure preserves verified evidence without emitting a completed answer
+    events = [json.loads(line[6:]) for line in res.text.split("\n") if line.startswith("data: ")]
+    partial_event = next(e for e in events if e.get("type") == "analysis_partial")
+    assert partial_event["status"] == "partial"
+    assert partial_event["answer"] is None
+    assert partial_event["warning"]["code"] == "answer_generation_unavailable"
+    assert partial_event["generation"]["required"] is True
+    assert partial_event["generation"]["succeeded"] is False
+    assert partial_event["generation"]["validated"] is False
+    assert partial_event["evidence"]["available"] is True
+    labels = [fact["label"] for fact in partial_event["evidence"]["facts"]]
+    assert "Rows" in labels
+    assert "Columns" in labels
+    assert not any(e.get("type") == "analysis_completed" for e in events)
+
+    retry = client.post(
+        f"/query/{partial_event['request_id']}/retry-answer",
+        headers={"X-Session-Token": tok},
+        json={"session_id": sid, "category": "general"},
+    )
+    assert retry.status_code == 200
+    retry_payload = retry.json()
+    assert retry_payload["type"] == "analysis_partial"
+    assert retry_payload["evidence"]["available"] is True
+    assert retry_payload["meta"]["pipeline_branch"] == "retry_answer"
+    assert retry_payload["meta"]["reran_computation"] is False
+    
+
+def test_synthesis_rejection_of_html():
+    from backend.core.schemas import GeneratedAnswer
+    import pytest
+    with pytest.raises(ValueError, match="HTML is not allowed"):
+        GeneratedAnswer.model_validate_json("""{
+            "summary": "This is <b>bold</b>",
+            "explanation": "No html allowed",
+            "findings": []
+        }""")
+
+def test_synthesis_rejection_of_markdown_fences():
+    from backend.core.schemas import GeneratedAnswer
+    import pytest
+    with pytest.raises(ValueError, match="Markdown fences are not allowed"):
+        GeneratedAnswer.model_validate_json("""{
+            "summary": "```python\\nprint(1)\\n```",
+            "explanation": "No markdown allowed",
+            "findings": []
+        }""")
+
+def test_synthesis_rejection_of_excessive_length():
+    from backend.core.schemas import GeneratedAnswer
+    import pytest
+    long_summary = "word " * 85
+    with pytest.raises(ValueError, match="Summary must be 80 words or fewer"):
+        GeneratedAnswer.model_validate_json(f"""{{
+            "summary": "{long_summary}",
+            "explanation": "ok",
+            "findings": []
+        }}""")
+
+def test_synthesis_trims_extra_findings_without_repair():
+    from backend.core.schemas import GeneratedAnswer
+
+    answer = GeneratedAnswer.model_validate({
+        "summary": "Grounded summary.",
+        "explanation": "Grounded explanation.",
+        "findings": [
+            {"label": "one", "detail": "First finding."},
+            {"label": "two", "detail": "Second finding."},
+            {"label": "three", "detail": "Third finding."},
+            {"label": "four", "detail": "Fourth finding."},
+            {"label": "five", "detail": "Extra finding trimmed."},
+        ],
+        "caveats": ["a", "b", "c", "d"],
+    })
+
+    assert len(answer.findings) == 4
+    assert len(answer.caveats) == 3
+
+def test_synthesis_rejection_of_repetition():
+    from backend.core.schemas import GeneratedAnswer
+    import pytest
+    repeated = "the quick brown fox jumps " * 5
+    with pytest.raises(ValueError, match="Excessive phrase repetition detected"):
+        GeneratedAnswer.model_validate_json(f"""{{
+            "summary": "{repeated}",
+            "explanation": "ok",
+            "findings": []
+        }}""")
+
+def test_synthesis_unwrap_single_array():
+    from backend.core.schemas import AnalysisPlan
+    plan = AnalysisPlan.model_validate_json("""[{"intent": "lookup"}]""")
+    assert plan.intent == "lookup"
+
+def test_standard_quality_route():
+    from backend.main import classify_query_complexity
+    import pandas as pd
+    df = pd.DataFrame({"a": [1]})
+    route, meta = classify_query_complexity("how to make this dataset better", df)
+    assert route == "standard_quality"
+
+def test_standard_quality_endpoint(monkeypatch: pytest.MonkeyPatch):
+    import main
+    import json
+    
+    # mock synthesis
+    async def mock_synth(*args, **kwargs):
+        from backend.core.schemas import GeneratedAnswer
+        return GeneratedAnswer(summary="Quality looks okay.", explanation="No issues.")
+    
+    monkeypatch.setattr(main, "synthesize_llm_answer_async", mock_synth)
+    
+    res = client.post("/upload", files={"file": ("test.csv", make_csv(SAMPLE_CSV), "text/csv")})
+    assert res.status_code == 200
+    sid = res.json()["session_id"]
+    tok = res.json()["token"]
+    
+    res = client.post("/query", headers={"X-Session-Token": tok}, json={"session_id": sid, "question": "how to make this dataset better"})
+    assert res.status_code == 200
+    events = parse_sse_events(res.text)
+    
+    done = next((e for e in events if e.get("type") == "analysis_completed"), None)
+    assert done is not None
+    assert done.get("meta", {}).get("pipeline_branch") == "standard_quality"

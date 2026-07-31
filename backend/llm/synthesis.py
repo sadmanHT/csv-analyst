@@ -42,6 +42,9 @@ def synthesize_llm_answer(
     evidence: AnalysisEvidence,
     effective_lens: str = "general",
     response_style: str = "plain_language",
+    request_id: str | None = None,
+    deadline_at: float | None = None,
+    complexity_route: str = "standard",
 ) -> tuple[GeneratedAnswer, LLMCallRecord]:
     """Synthesize a natural-language answer using LLM over structured evidence facts."""
     user_payload = {
@@ -55,10 +58,26 @@ def synthesize_llm_answer(
     record = LLMCallRecord()
     raw_text = ""
     try:
+        import time
+        from backend.core.schemas import ROUTE_BUDGETS
+        budget = ROUTE_BUDGETS.get(complexity_route)
+        timeout_seconds = 10.0
+        if deadline_at:
+            timeout_seconds = max(0.1, deadline_at - time.monotonic())
+        
         raw_text = llm_client.generate_content(
             system_instruction=SYNTHESIS_SYSTEM_PROMPT,
             contents=user_text,
             temperature=0.1,
+            response_mime_type="application/json",
+            response_schema=GeneratedAnswer,
+            max_output_tokens=384,
+            evidence_payload=evidence.model_dump(),
+            request_id=request_id,
+            stage="synthesis",
+            budget=budget,
+            timeout_seconds=timeout_seconds,
+            thinking_config={"thinking_level": "minimal"},
         )
     except Exception as e:
         logger.warning("LLM synthesis attempt 1 failed: %s. Retrying with trimmed payload.", e)
@@ -74,45 +93,31 @@ def synthesize_llm_answer(
                     "warnings": evidence.warnings,
                 },
             }
+            from backend.core.schemas import GeneratedAnswer
+            timeout_seconds = 10.0
+            if deadline_at:
+                timeout_seconds = max(0.1, deadline_at - time.monotonic())
             raw_text = llm_client.generate_content(
                 system_instruction=SYNTHESIS_SYSTEM_PROMPT,
                 contents=json.dumps(trimmed_payload, default=str),
                 temperature=0.1,
+                response_mime_type="application/json",
+                response_schema=GeneratedAnswer,
+                max_output_tokens=384,
+                evidence_payload=trimmed_payload["evidence"],
+                request_id=request_id,
+                stage="synthesis",
+                budget=budget,
+                timeout_seconds=timeout_seconds,
+                thinking_config={"thinking_level": "minimal"},
             )
         except Exception as e2:
             logger.error("LLM synthesis attempt 2 failed: %s", e2)
             record.succeeded = False
-            record.offline_mode = True
+            record.offline_mode = False
             record.error_detail = str(e2)
-
-            facts_summary_lines: list[str] = []
-            for k, v in list(evidence.facts.items())[:12]:
-                if isinstance(v, dict) and v:
-                    facts_summary_lines.append(f"- **{k}**: {', '.join(f'{ck}: {cv}' for ck, cv in list(v.items())[:5])}")
-                elif isinstance(v, list) and v:
-                    facts_summary_lines.append(f"- **{k}**: {', '.join(str(x) for x in v[:5])}")
-                elif v is not None and str(v).strip():
-                    facts_summary_lines.append(f"- **{k}**: {v}")
-            facts_text = "\n".join(facts_summary_lines) or "Dataset facts were computed but cannot be displayed."
-            fallback_summary = (
-                f"The analysis for '{question}' was completed using verified dataset evidence, "
-                f"but the natural-language answer generator is temporarily unavailable (network error). "
-                f"Here are the key facts computed directly from your data:\n\n{facts_text}"
-            )
-            ans = GeneratedAnswer(
-                title="Analysis Complete (Offline Mode)",
-                summary=fallback_summary,
-                explanation="The LLM synthesis step failed due to a network connectivity error. "
-                            "The figures above are computed deterministically from your dataset and are accurate.",
-                findings=[
-                    {"label": str(k).replace("_", " ").title(), "detail": str(v)[:200]}
-                    for k, v in list(evidence.facts.items())[:8]
-                    if v is not None and str(v).strip()
-                ],
-                caveats=(evidence.warnings or []) + ["Natural-language synthesis unavailable. Retry when network is restored."],
-                next_action="Retry this question or ask a simpler follow-up.",
-            )
-            return ans, record
+            from backend.core.errors import LLMSynthesisError
+            raise LLMSynthesisError("answer_generation_failed")
 
     try:
         clean = raw_text
@@ -132,13 +137,8 @@ def synthesize_llm_answer(
         )
         return ans, record
     except Exception as parse_err:
-        logger.warning("Failed to parse JSON response from LLM synthesis (%s). Using fallback wrapper.", parse_err)
-        ans = GeneratedAnswer(
-            title="Analysis Result",
-            summary=raw_text if raw_text else "Analysis complete based on verified evidence.",
-            explanation=None,
-            findings=[],
-            caveats=evidence.warnings,
-            next_action="Explore further dataset columns or ask a follow-up question.",
-        )
-        return ans, record
+        logger.warning("Failed to parse JSON response from LLM synthesis (%s).", parse_err)
+        record.succeeded = False
+        record.error_detail = str(parse_err)
+        from backend.core.errors import LLMSynthesisError
+        raise LLMSynthesisError("invalid_llm_response")

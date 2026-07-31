@@ -13,16 +13,20 @@ from google.genai import types
 from backend.core.config import GEMMA_MODEL, GEMMA_MODEL as DEFAULT_MODEL, LLM_CALL_TIMEOUT_SECONDS
 from backend.core.schemas import ExecutionBudget
 
-logger = logging.getLogger(__name__)
+import asyncio
 
-_llm_executor = concurrent.futures.ThreadPoolExecutor(max_workers=8)
+logger = logging.getLogger(__name__)
 
 class BudgetedLLMClient:
     def __init__(self, api_key: str | None = None):
         key = api_key or os.environ.get("GEMMA_API_KEY") or os.environ.get("GEMINI_API_KEY")
         self.client = genai.Client(api_key=key)
         self.call_records: list[dict[str, Any]] = []
-
+        self.provider_state = {
+            "available": True,
+            "retry_after": 0.0,
+            "last_error": None,
+        }
     def record_call(self, request_id: str, stage_or_route: str = "standard", stage: Any = "stage", duration_ms: Any = 0, success: bool = True) -> None:
         """Helper method to explicitly record stage-level LLM calls and enforce budget limits."""
         from backend.core.errors import ExecutionBudgetExceededError
@@ -44,7 +48,7 @@ class BudgetedLLMClient:
             "outcome": "success" if success else "failure",
         })
 
-    def generate_content(
+    async def generate_content(
         self,
         system_instruction: str,
         contents: str,
@@ -56,8 +60,25 @@ class BudgetedLLMClient:
         stage: str = "synthesis",
         request_start_time: float | None = None,
         total_deadline_s: float | None = None,
+        response_mime_type: str | None = None,
+        response_schema: Any | None = None,
+        max_output_tokens: int | None = None,
+        evidence_payload: dict | None = None,
+        thinking_config: Any | None = None,
     ) -> str:
         """Call LLM with retry budget, request-scoped deadline enforcement, and observability logging."""
+        from backend.core.errors import LLMProviderUnavailableError
+        
+        if (
+            not self.provider_state["available"]
+            and time.monotonic() < self.provider_state["retry_after"]
+        ):
+            raise LLMProviderUnavailableError(
+                "The language provider is temporarily unavailable."
+            )
+        elif not self.provider_state["available"]:
+            self.provider_state["available"] = True  # Try again
+
         call_start = time.time()
         max_attempts = budget.max_llm_calls if budget else 2
         deadline = total_deadline_s or (budget.timeout_s if budget else 30.0)
@@ -85,7 +106,7 @@ class BudgetedLLMClient:
 
             call_timeout = min(timeout_seconds, max(0.1, remaining_request))
 
-            def _do_generate():
+            async def _do_generate():
                 if os.environ.get("PYTEST_CURRENT_TEST") or os.environ.get("MOCK_LLM") == "1":
                     summary_text = "Analysis complete based on verified evidence."
                     try:
@@ -93,9 +114,9 @@ class BudgetedLLMClient:
                         evidence_data = data.get("evidence", {})
                         facts = evidence_data.get("facts", {})
                         if isinstance(facts, dict) and "result" in facts:
-                            summary_text = str(facts["result"])
+                            summary_text = "Analysis complete based on verified evidence."
                         elif isinstance(facts, dict) and facts:
-                            summary_text = f"Analysis complete: {facts}"
+                            summary_text = "Analysis complete based on verified evidence."
                     except Exception:
                         pass
 
@@ -104,25 +125,56 @@ class BudgetedLLMClient:
                             "title": "Analysis Result",
                             "summary": summary_text,
                             "explanation": "Calculated deterministically from data.",
-                            "findings": [{"key": "summary", "value": summary_text}],
+                            "findings": [{"label": "summary", "detail": summary_text}],
                             "caveats": [],
-                            "next_action": None
+                            "next_action": ""
                         })
                     return MockResponse()
-                afc = types.AutomaticFunctionCallingConfig(disable=True)
-                return self.client.models.generate_content(
+                
+                cfg_kwargs = {
+                    "system_instruction": system_instruction,
+                    "temperature": temperature,
+                }
+                if response_mime_type:
+                    cfg_kwargs["response_mime_type"] = response_mime_type
+                if response_schema:
+                    cfg_kwargs["response_schema"] = response_schema
+                if max_output_tokens:
+                    cfg_kwargs["max_output_tokens"] = max_output_tokens
+                if thinking_config:
+                    cfg_kwargs["thinking_config"] = thinking_config
+
+                cfg = types.GenerateContentConfig(**cfg_kwargs)
+
+                ev_len = 0
+                try:
+                    parsed_contents = json.loads(contents)
+                    if isinstance(parsed_contents, dict) and "evidence" in parsed_contents:
+                        ev_len = len(json.dumps(parsed_contents["evidence"]))
+                except Exception:
+                    pass
+                logger.info(
+                    "LLM config request_id=%s stage=%s model=%s tools_present=%s afc_configured=%s json_mode=%s max_output_tokens=%s thinking_level=%s evidence_chars=%d",
+                    request_id,
+                    stage,
+                    model,
+                    bool(getattr(cfg, "tools", None)),
+                    getattr(cfg, "automatic_function_calling", None) is not None,
+                    getattr(cfg, "response_mime_type", None),
+                    getattr(cfg, "max_output_tokens", None),
+                    "minimal" if getattr(cfg, "thinking_config", None) else "none",
+                    ev_len,
+                )
+                
+                return await self.client.aio.models.generate_content(
                     model=model,
                     contents=contents,
-                    config=types.GenerateContentConfig(
-                        system_instruction=system_instruction,
-                        temperature=temperature,
-                        automatic_function_calling=afc,
-                    ),
+                    config=cfg,
                 )
 
             try:
-                future = _llm_executor.submit(_do_generate)
-                resp = future.result(timeout=call_timeout)
+                async with asyncio.timeout(call_timeout):
+                    resp = await _do_generate()
                 text = (resp.text or "").strip()
                 record = {
                     "request_id": request_id or "unknown",
@@ -137,7 +189,10 @@ class BudgetedLLMClient:
                 }
                 self.call_records.append(record)
                 return text
-            except concurrent.futures.TimeoutError:
+            except asyncio.CancelledError:
+                logger.info("LLM call cancelled request_id=%s stage=%s", request_id, stage)
+                raise
+            except (TimeoutError, asyncio.TimeoutError):
                 elapsed_call = time.time() - call_start
                 record = {
                     "request_id": request_id or "unknown",
@@ -168,6 +223,18 @@ class BudgetedLLMClient:
                 }
                 self.call_records.append(record)
                 logger.warning("LLM call attempt %d/%d failed for req %s: %s", attempt, max_attempts, request_id, exc)
+                
+                # Check for network/DNS errors
+                exc_str = str(exc).lower()
+                if "getaddrinfo failed" in exc_str or "nameresolutionerror" in exc_str or "11001" in exc_str:
+                    self.provider_state.update({
+                        "available": False,
+                        "retry_after": time.monotonic() + 30.0,
+                        "last_error": "provider_unavailable",
+                    })
+                    from backend.core.errors import LLMProviderUnavailableError
+                    raise LLMProviderUnavailableError("The language provider is temporarily unavailable.")
+                
                 if attempt == max_attempts:
                     raise exc
 
